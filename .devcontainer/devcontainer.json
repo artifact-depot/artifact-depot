@@ -1,7 +1,11 @@
 {
 	"name": "artifact-depot",
 	"build": {
-		"dockerfile": "Dockerfile"
+		"dockerfile": "Dockerfile",
+		"args": {
+			"DOCKER_MIRROR": "",
+			"APT_MIRROR": ""
+		}
 	},
 	"customizations": {
 		"vscode": {

@@ -1,5 +1,5 @@
 ARG DOCKER_MIRROR=
-FROM ${DOCKER_MIRROR:+${DOCKER_MIRROR}/}ubuntu:24.04
+FROM ${DOCKER_MIRROR}ubuntu:24.04
 
 ARG APT_MIRROR=
 # Narrow the sources to the components and suites we actually consume

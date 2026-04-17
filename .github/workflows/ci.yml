@@ -18,7 +18,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   DEPOT_INSTRUMENT_FRONTEND: "1"
-  DOCKER_MIRROR: repository.mdh.quantum.com
+  DOCKER_MIRROR: repository.mdh.quantum.com/
   APT_MIRROR: repository.mdh.quantum.com/repository/pkgs/ubuntu
 
 jobs:

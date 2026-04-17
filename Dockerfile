@@ -1,7 +1,7 @@
 # --- Build stage ---
 ARG DOCKER_MIRROR=
-FROM ${DOCKER_MIRROR:+${DOCKER_MIRROR}/}node:24.14.0-bookworm-slim AS node
-FROM ${DOCKER_MIRROR:+${DOCKER_MIRROR}/}rust:1.94.1-bookworm AS builder
+FROM ${DOCKER_MIRROR}node:24.14.0-bookworm-slim AS node
+FROM ${DOCKER_MIRROR}rust:1.94.1-bookworm AS builder
 
 ARG TARGETARCH
 ARG APT_MIRROR=
