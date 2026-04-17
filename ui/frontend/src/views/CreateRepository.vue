@@ -135,7 +135,7 @@ async function submit() {
 
 <template>
   <section>
-    <PageHeader title="Create Repository" back-to="/repositories" />
+    <PageHeader title="Create Repository" />
 
     <p v-if="error" class="error">{{ error }}</p>
 

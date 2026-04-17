@@ -263,7 +263,7 @@ onMounted(async () => {
 
 <template>
   <section>
-    <PageHeader :title="repoName" back-to="/repositories">
+    <PageHeader :title="repoName">
       <template #badges>
         <span v-if="repo" class="badge" :class="typeClass(repo.repo_type)">{{ repo.repo_type }}</span>
         <span v-if="repo" class="badge badge-outlined">{{ repo.format }}</span>

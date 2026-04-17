@@ -161,7 +161,7 @@ onMounted(async () => {
 
 <template>
   <section>
-    <PageHeader :title="isCreate ? 'Create User' : `Edit User: ${username}`" back-to="/users" />
+    <PageHeader :title="isCreate ? 'Create User' : `Edit User: ${username}`" />
 
     <p v-if="error" class="error">{{ error }}</p>
 

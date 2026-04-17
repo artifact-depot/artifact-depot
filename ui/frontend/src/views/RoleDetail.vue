@@ -73,7 +73,7 @@ onMounted(loadRole)
 
 <template>
   <section>
-    <PageHeader :title="isCreate ? 'Create Role' : `Edit Role: ${name}`" back-to="/roles" />
+    <PageHeader :title="isCreate ? 'Create Role' : `Edit Role: ${name}`" />
 
     <p v-if="error" class="error">{{ error }}</p>
 

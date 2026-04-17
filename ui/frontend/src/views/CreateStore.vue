@@ -77,7 +77,7 @@ async function submit() {
 
 <template>
   <section>
-    <PageHeader title="Create Store" back-to="/stores" />
+    <PageHeader title="Create Store" />
 
     <p v-if="error" class="error">{{ error }}</p>
 

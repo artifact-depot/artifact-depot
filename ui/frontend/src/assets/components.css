@@ -286,18 +286,6 @@ label.checkbox-group input[type="checkbox"],
   margin: 0;
 }
 
-.back-link {
-  color: var(--color-text);
-  text-decoration: none;
-  font-size: 1.25rem;
-  font-weight: 600;
-  margin-right: 0.5rem;
-}
-
-.back-link:hover {
-  color: var(--color-primary);
-}
-
 /* ══════════════════════════════════════
    Detail card / table
    ══════════════════════════════════════ */

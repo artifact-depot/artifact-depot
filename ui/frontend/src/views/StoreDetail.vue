@@ -178,7 +178,7 @@ onMounted(async () => {
 
 <template>
   <section>
-    <PageHeader :title="storeName" back-to="/stores">
+    <PageHeader :title="storeName">
       <template #badges>
         <span v-if="store" class="badge" :class="store.store_type === 'file' ? 'badge-green' : 'badge-blue'">{{ store.store_type }}</span>
       </template>
