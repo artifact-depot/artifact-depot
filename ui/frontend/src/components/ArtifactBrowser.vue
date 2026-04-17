@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api, type Artifact, type DirInfo, type TaskInfo } from '../api'
 import BaseModal from './BaseModal.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
@@ -12,10 +13,13 @@ import { formatSize, formatDate } from '../composables/useFormatters'
 
 const props = defineProps<{ repoName: string }>()
 
+const route = useRoute()
+const router = useRouter()
+
 const dirs = ref<DirInfo[]>([])
 const artifacts = ref<Artifact[]>([])
 const loading = ref(false)
-const prefix = ref('')
+const prefix = computed(() => (route.query.path as string) || '')
 const search = ref('')
 const isSearchMode = ref(false)
 const selectedArtifact = ref<Artifact | null>(null)
@@ -136,11 +140,20 @@ function detailFilename(): string {
 }
 
 function navigateTo(newPrefix: string) {
-  prefix.value = newPrefix
   isSearchMode.value = false
   search.value = ''
   pageOffset.value = 0
-  load()
+  const query = { ...route.query }
+  if (newPrefix) {
+    query.path = newPrefix
+  } else {
+    delete query.path
+  }
+  if (query.path === route.query.path) {
+    load()
+  } else {
+    router.push({ query })
+  }
 }
 
 function doSearch() {
@@ -370,15 +383,18 @@ async function onFileSelected(event: Event) {
   }
 }
 
-onMounted(load)
-
-watch(() => props.repoName, () => {
-  prefix.value = ''
-  isSearchMode.value = false
-  search.value = ''
-  pageOffset.value = 0
-  load()
-})
+watch(
+  [() => props.repoName, () => route.query.path],
+  (newVals, oldVals) => {
+    if (oldVals && newVals[0] !== oldVals[0]) {
+      isSearchMode.value = false
+      search.value = ''
+      pageOffset.value = 0
+    }
+    load()
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
