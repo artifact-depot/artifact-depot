@@ -431,6 +431,49 @@ async fn test_head_manifest_headers_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_manifest_with_multiple_accept_headers() {
+    // Per RFC 7230 §3.2.2 and as exercised in practice by skopeo, OCI
+    // clients may send the Accept set as multiple separate header lines
+    // rather than one comma-joined value. The registry must inspect all
+    // of them — fetching only the first means a docker schema 2 manifest
+    // gets rejected as "not acceptable" even when the client actually
+    // accepts it.
+    let app = TestApp::new().await;
+    app.create_docker_repo("multi-accept").await;
+    let config_digest = app.push_docker_blob("multi-accept", b"{}").await;
+    let layer_digest = app.push_docker_blob("multi-accept", b"layer").await;
+    let manifest = TestApp::make_manifest(&config_digest, &[&layer_digest]);
+    app.push_docker_manifest("multi-accept", "latest", &manifest)
+        .await;
+
+    let token = app.admin_token();
+    // Two Accept headers: first is OCI-only (does NOT match schema 2),
+    // second includes the docker schema 2 media type. The handler must
+    // inspect both; the manifest is acceptable.
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/v2/multi-accept/manifests/latest")
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(header::ACCEPT, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::ACCEPT,
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/vnd.docker.distribution.manifest.v2+json",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_head_manifest_not_found() {
     let app = TestApp::new().await;
     app.create_docker_repo("head-miss").await;

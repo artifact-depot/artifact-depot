@@ -25,21 +25,31 @@ use super::helpers::{
 // Manifest GET/HEAD — shared implementation
 // =============================================================================
 
-/// Check if the stored content type is acceptable per the request's Accept header.
-fn is_manifest_acceptable(accept: Option<&header::HeaderValue>, content_type: &str) -> bool {
-    match accept.and_then(|v| v.to_str().ok()) {
-        None => true,
-        Some(accept) => accept.contains("*/*") || accept.contains(content_type),
+/// Check if the stored content type is acceptable per the request's Accept header(s).
+///
+/// Per RFC 7230 §3.2.2, multiple headers with the same name are equivalent to a
+/// single comma-joined value, so we must inspect all `Accept` values — skopeo
+/// (and other OCI clients) sends them as separate header lines.
+fn is_manifest_acceptable(headers: &HeaderMap, content_type: &str) -> bool {
+    let mut any = false;
+    for v in headers.get_all(header::ACCEPT) {
+        any = true;
+        if let Ok(s) = v.to_str() {
+            if s.contains("*/*") || s.contains(content_type) {
+                return true;
+            }
+        }
     }
+    !any
 }
 
 /// Wrap a manifest response with Accept header checking.
 fn manifest_response_with_accept(
     result: depot_core::error::Result<Option<(Vec<u8>, String, String)>>,
-    accept: Option<&header::HeaderValue>,
+    headers: &HeaderMap,
 ) -> Response {
     if let Ok(Some((_data, content_type, _digest))) = &result {
-        if !is_manifest_acceptable(accept, content_type) {
+        if !is_manifest_acceptable(headers, content_type) {
             return docker_error(
                 "MANIFEST_UNKNOWN",
                 "manifest content type not acceptable",
@@ -75,8 +85,6 @@ pub async fn do_get_manifest(
         Ok(c) => c,
         Err(r) => return r,
     };
-    let accept = req_headers.get(header::ACCEPT);
-
     match config.repo_type() {
         RepoType::Hosted => {
             let blobs = match resolve_blob_store(state, &config).await {
@@ -91,7 +99,7 @@ pub async fn do_get_manifest(
             if reference.starts_with("sha256:") {
                 manifest_response(store.get_manifest(reference).await)
             } else {
-                manifest_response_with_accept(store.get_manifest(reference).await, accept)
+                manifest_response_with_accept(store.get_manifest(reference).await, req_headers)
             }
         }
         RepoType::Cache => cache_get_manifest(state, &config, image, reference).await,
