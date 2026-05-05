@@ -34,6 +34,8 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const pageOffset = ref(0)
 const pageLimit = ref(100)
 const totalArtifacts = ref(0)
+const pageSizeOptions = [100, 500, 1000]
+const pageInputValue = ref('1')
 
 interface DisplayItem {
   name: string
@@ -206,15 +208,38 @@ const showingFrom = computed(() => totalArtifacts.value === 0 ? 0 : pageOffset.v
 const showingTo = computed(() => Math.min(pageOffset.value + pageLimit.value, totalArtifacts.value))
 const hasPrev = computed(() => pageOffset.value > 0)
 const hasNext = computed(() => pageOffset.value + pageLimit.value < totalArtifacts.value)
+const showPagination = computed(() =>
+  !isSearchMode.value && totalArtifacts.value > pageSizeOptions[0]
+)
 
-function prevPage() {
-  pageOffset.value = Math.max(0, pageOffset.value - pageLimit.value)
+function goToPage(n: number) {
+  const clamped = Math.min(Math.max(1, n), totalPages.value)
+  pageOffset.value = (clamped - 1) * pageLimit.value
   load()
 }
 
+function prevPage() {
+  goToPage(currentPage.value - 1)
+}
+
 function nextPage() {
-  pageOffset.value += pageLimit.value
+  goToPage(currentPage.value + 1)
+}
+
+function onPageSizeChange() {
+  pageOffset.value = 0
   load()
+}
+
+watch(currentPage, (p) => { pageInputValue.value = String(p) }, { immediate: true })
+
+function commitPageInput() {
+  const n = parseInt(pageInputValue.value, 10)
+  if (Number.isFinite(n) && n >= 1 && n <= totalPages.value && n !== currentPage.value) {
+    goToPage(n)
+  } else {
+    pageInputValue.value = String(currentPage.value)
+  }
 }
 
 function confirmDelete(path: string, e: Event) {
@@ -490,14 +515,32 @@ watch(
       </table>
     </ResponsiveTable>
 
-    <div v-if="!loading && !isSearchMode && totalArtifacts > pageLimit" class="pagination-bar">
+    <div v-if="!loading && showPagination" class="pagination-bar">
       <span class="page-info">
         Showing {{ showingFrom }}&ndash;{{ showingTo }} of {{ totalArtifacts }} artifacts
       </span>
       <div class="page-controls">
         <button class="btn btn-page" :disabled="!hasPrev" @click="prevPage">&larr; Prev</button>
-        <span class="page-number">Page {{ currentPage }} of {{ totalPages }}</span>
+        <span class="page-number">
+          Page
+          <input
+            type="text"
+            inputmode="numeric"
+            class="page-input-inline"
+            v-model="pageInputValue"
+            @keydown.enter.prevent="commitPageInput"
+            @blur="commitPageInput"
+            @focus="($event.target as HTMLInputElement).select()"
+          />
+          of {{ totalPages }}
+        </span>
         <button class="btn btn-page" :disabled="!hasNext" @click="nextPage">Next &rarr;</button>
+        <label class="page-size">
+          Per page
+          <select v-model.number="pageLimit" @change="onPageSizeChange">
+            <option v-for="n in pageSizeOptions" :key="n" :value="n">{{ n }}</option>
+          </select>
+        </label>
       </div>
     </div>
 
@@ -789,6 +832,8 @@ th {
   justify-content: space-between;
   padding: 0.75rem 0.75rem 0;
   font-size: 0.85rem;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 .page-info {
   color: var(--color-text-muted);
@@ -796,7 +841,8 @@ th {
 .page-controls {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.35rem;
+  flex-wrap: wrap;
 }
 .btn-page {
   padding: 0.3rem 0.75rem;
@@ -808,8 +854,36 @@ th {
 }
 .page-number {
   color: var(--color-text-secondary);
-  min-width: 8rem;
   text-align: center;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+}
+.page-input-inline {
+  width: 3em;
+  padding: 0.2rem 0.3rem;
+  font-size: 0.85rem;
+  text-align: center;
+  background: var(--color-input-bg, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  color: inherit;
+  font-family: inherit;
+}
+.page-input-inline:focus {
+  outline: none;
+  border-color: var(--color-blue);
+}
+.page-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: 0.5rem;
+  color: var(--color-text-muted);
+}
+.page-size select {
+  padding: 0.25rem 0.4rem;
+  font-size: 0.85rem;
 }
 .dir-delete-stats {
   color: var(--color-text-muted);
