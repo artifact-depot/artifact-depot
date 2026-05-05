@@ -20,7 +20,7 @@ if [ -f "$OUTPUT" ] && [ "$ROOT/Cargo.lock" -ot "$OUTPUT" ]; then
   exit 0
 fi
 
-command -v cargo-about >/dev/null 2>&1 || cargo install cargo-about
+command -v cargo-about >/dev/null 2>&1 || cargo install cargo-about --locked --features cli
 
 cargo about generate --workspace --format json -c "$ROOT/about.toml" \
     2>/dev/null > "$OUTPUT"
