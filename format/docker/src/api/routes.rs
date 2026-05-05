@@ -36,7 +36,9 @@ pub fn docker_port_routes(repo_name: String) -> Router<FormatState> {
         .route(
             "/v2/{ns}/{img}/blobs/{digest}",
             head(head_blob).get(get_blob),
-        );
+        )
+        .route("/v2/{name}/referrers/{digest}", get(get_referrers))
+        .route("/v2/{ns}/{img}/referrers/{digest}", get(get_referrers));
 
     // Manifest routes — 32 MiB (PUT sends JSON; HEAD/GET/DELETE have no body).
     let manifest_routes = Router::new()

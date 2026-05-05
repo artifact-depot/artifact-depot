@@ -619,6 +619,60 @@ async fn test_manifest_list_type() {
 }
 
 // ===========================================================================
+// Referrers (OCI Distribution Spec v1.1)
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_referrers_returns_empty_index() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("ref-repo").await;
+    let token = app.admin_token();
+
+    let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let req = app.auth_request(
+        Method::GET,
+        &format!("/v2/ref-repo/referrers/{digest}"),
+        &token,
+    );
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/vnd.oci.image.index.v1+json",
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("referrers response must be JSON");
+    assert_eq!(body["schemaVersion"], 2);
+    assert_eq!(body["mediaType"], "application/vnd.oci.image.index.v1+json");
+    assert_eq!(body["manifests"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_referrers_two_segment_path() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("ref-ns").await;
+    let token = app.admin_token();
+
+    let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let req = app.auth_request(
+        Method::GET,
+        &format!("/v2/ref-ns/img/referrers/{digest}"),
+        &token,
+    );
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("referrers response must be JSON");
+    assert_eq!(body["manifests"], json!([]));
+}
+
+// ===========================================================================
 // Blob upload (single-segment)
 // ===========================================================================
 

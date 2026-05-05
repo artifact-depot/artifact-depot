@@ -359,7 +359,12 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
         .route(
             "/v2/{name}/blobs/{digest}",
             head(docker::head_blob).get(docker::get_blob),
-        );
+        )
+        .route(
+            "/v2/{repo}/{image}/referrers/{digest}",
+            get(docker::get_referrers),
+        )
+        .route("/v2/{name}/referrers/{digest}", get(docker::get_referrers));
 
     // Manifest routes — 32 MiB (PUT sends JSON manifests; HEAD/GET/DELETE have no body).
     let docker_manifest_routes = Router::new()

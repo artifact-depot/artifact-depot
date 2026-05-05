@@ -204,6 +204,30 @@ pub async fn delete_manifest(
     .await
 }
 
+/// `GET /v2/{name}/referrers/{digest}` — OCI Distribution Spec v1.1 referrers API.
+///
+/// Depot does not yet track referrers (signatures/attestations), so we always
+/// return a spec-compliant empty image index. Modern Docker clients (24+) call
+/// this on every pull; without a real handler the SPA fallback would return
+/// HTML and the client fails with a JSON decode error.
+pub async fn get_referrers(_dp: DockerPath) -> Response {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [],
+    }))
+    .expect("static JSON serializes");
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.index.v1+json",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 pub async fn head_blob(
     State(state): State<FormatState>,
     Extension(user): Extension<AuthenticatedUser>,
