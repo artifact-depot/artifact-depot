@@ -990,9 +990,43 @@ async fn test_docker_catalog() {
         .await
         .unwrap();
 
+    // Push images so the catalog has names to enumerate. Per Docker V2 spec,
+    // `/v2/_catalog` returns image names (the `<name>` in `docker pull host/<name>:<tag>`)
+    // unioned across all docker repos — NOT depot's internal repo names.
+    push_oci_image(&client, "cat-docker1", "alpine", "latest").await;
+    push_oci_image(&client, "cat-docker2", "redis", "v1").await;
+
     let mut catalog = client.docker_catalog().await.unwrap();
     catalog.sort();
-    assert_eq!(catalog, vec!["cat-docker1", "cat-docker2"]);
+    assert_eq!(catalog, vec!["alpine", "redis"]);
+
+    // Depot repo names must not leak into the response.
+    assert!(!catalog.iter().any(|n| n == "cat-docker1"));
+    assert!(!catalog.iter().any(|n| n == "cat-docker2"));
+    assert!(!catalog.iter().any(|n| n == "cat-raw"));
+}
+
+/// `/repository/{repo}/v2/_catalog` returns only image names within that
+/// specific depot repo (previously returned `[<repo-name>]`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_docker_repo_catalog() {
+    let (_server, client) = setup().await;
+    client.login().await.unwrap();
+
+    make_docker_repo(&client, "rcat-a").await;
+    make_docker_repo(&client, "rcat-b").await;
+
+    push_oci_image(&client, "rcat-a", "redis", "latest").await;
+    push_oci_image(&client, "rcat-a", "alpine", "3.18").await;
+    push_oci_image(&client, "rcat-b", "ubuntu", "latest").await;
+
+    let mut catalog = client.docker_repo_catalog("rcat-a").await.unwrap();
+    catalog.sort();
+    assert_eq!(catalog, vec!["alpine", "redis"]);
+
+    let mut catalog = client.docker_repo_catalog("rcat-b").await.unwrap();
+    catalog.sort();
+    assert_eq!(catalog, vec!["ubuntu"]);
 }
 
 // ============================================================
