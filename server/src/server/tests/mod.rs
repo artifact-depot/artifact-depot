@@ -9,6 +9,7 @@ pub mod artifacts_extended;
 pub mod cleanup;
 pub mod cors;
 pub mod error_responses;
+pub mod event_stream;
 pub mod integrity_check;
 pub mod nexus_compat;
 pub mod router_coverage;

@@ -12,9 +12,10 @@
 use std::convert::Infallible;
 
 use axum::extract::{Query, State};
+use axum::http::header::{HeaderValue, CACHE_CONTROL};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Extension;
-use futures::stream::Stream;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
@@ -45,7 +46,7 @@ pub async fn event_stream(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<StreamQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Response {
     let is_admin = state.auth.backend.require_admin(&user.0).await.is_ok();
     let topics = parse_topics(params.topics.as_deref(), is_admin);
 
@@ -53,7 +54,7 @@ pub async fn event_stream(
         // Phase 1: Load the pre-materialized snapshot — O(1), no KV queries.
         let snapshot = state.bg.model.load().to_snapshot(is_admin);
         if let Ok(json) = serde_json::to_string(&snapshot) {
-            yield Ok(Event::default().event("snapshot").data(json));
+            yield Ok::<Event, Infallible>(Event::default().event("snapshot").data(json));
         }
 
         // Phase 2: Subscribe and stream deltas.
@@ -95,5 +96,16 @@ pub async fn event_stream(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    // Override the default `cache-control: no-cache` that axum's Sse sets.
+    // Firefox treats `no-cache` as "store but revalidate", so a second tab
+    // opening the same SSE URL finds the in-progress cache entry, must
+    // revalidate, and parks in `AwaitingCacheCallbacks` waiting for the
+    // first stream to finish writing — which never happens for a live SSE.
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
