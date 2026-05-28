@@ -129,14 +129,36 @@ async fn test_anonymous_admin_endpoints_denied() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_anonymous_artifact_denied() {
+async fn test_anonymous_artifact_gets_basic_challenge() {
     let app = TestApp::new().await;
-    // Create a repo as admin first.
     app.create_hosted_repo("test-repo").await;
-    // Try to access as anonymous.
     let req = app.request(Method::GET, "/repository/test-repo/file.txt");
-    let (status, _) = app.call(req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some("Basic realm=\"Artifact Depot\""),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_authenticated_artifact_denied_stays_forbidden() {
+    let app = TestApp::new().await;
+    app.create_hosted_repo("test-repo").await;
+    // Authenticated user with no roles -> denied on Read capability.
+    app.create_user_with_roles("nobody", "pass123", vec![])
+        .await;
+    let req = app.basic_auth_request(
+        Method::GET,
+        "/repository/test-repo/file.txt",
+        "nobody",
+        "pass123",
+    );
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
 
 // ===========================================================================

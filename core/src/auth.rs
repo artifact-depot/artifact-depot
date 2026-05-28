@@ -118,8 +118,7 @@ mod tests {
     #[test]
     fn test_map_permission_error_anonymous_gets_basic_challenge() {
         use axum::http::{header, StatusCode};
-        let resp =
-            map_permission_error(DepotError::Forbidden("access denied".into()), "anonymous");
+        let resp = map_permission_error(DepotError::Forbidden("access denied".into()), "anonymous");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let www_auth = resp
             .headers()

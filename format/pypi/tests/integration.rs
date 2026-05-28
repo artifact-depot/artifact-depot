@@ -1511,8 +1511,9 @@ async fn test_simple_index_requires_auth() {
     app.create_pypi_repo("pypi-auth-idx").await;
 
     let req = app.request(Method::GET, "/repository/pypi-auth-idx/simple/");
-    let (status, _) = app.call(req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1521,8 +1522,9 @@ async fn test_simple_project_requires_auth() {
     app.create_pypi_repo("pypi-auth-proj").await;
 
     let req = app.request(Method::GET, "/repository/pypi-auth-proj/simple/some-pkg/");
-    let (status, _) = app.call(req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1534,8 +1536,9 @@ async fn test_download_requires_auth() {
         Method::GET,
         "/repository/pypi-auth-dl/packages/pkg/1.0.0/pkg-1.0.0.tar.gz",
     );
-    let (status, _) = app.call(req).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_some());
 }
 
 // ===========================================================================
