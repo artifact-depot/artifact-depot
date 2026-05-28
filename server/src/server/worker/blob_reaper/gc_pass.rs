@@ -389,11 +389,9 @@ pub async fn gc_pass(
                         }
                     }
                     if !expired_entries.is_empty() && !dry_run {
-                        let del_keys: Vec<(&str, &str)> = expired_entries
-                            .iter()
-                            .map(|(sk, _)| (pk.as_str(), *sk))
-                            .collect();
-                        kv.delete_batch(keys::TABLE_ARTIFACTS, &del_keys).await?;
+                        let paths: Vec<&str> = expired_entries.iter().map(|(sk, _)| *sk).collect();
+                        service::delete_artifacts_paired_batch(kv.as_ref(), &repo_name, &paths)
+                            .await?;
                         local_expired += expired_entries.len() as u64;
                         let mut batch_bytes = 0i64;
                         for &(sk, size) in &expired_entries {

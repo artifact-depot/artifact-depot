@@ -159,10 +159,9 @@ pub(super) async fn docker_gc(
     }
 
     // Delete blob ref artifacts whose digest is not in the layer BF.
-    let mut blob_del_pks: Vec<String> = Vec::new();
     let mut blob_del_sks: Vec<&str> = Vec::new();
     let mut blob_del_sizes: Vec<u64> = Vec::new();
-    for (sk, shard, created_at, size) in &blob_refs {
+    for (sk, _shard, created_at, size) in &blob_refs {
         // Skip recently created records to avoid racing concurrent manifest pushes.
         if *created_at > grace_cutoff {
             continue;
@@ -179,18 +178,13 @@ pub(super) async fn docker_gc(
         };
 
         if !layer_bf.check(digest.as_bytes()) {
-            blob_del_pks.push(keys::artifact_shard_pk(repo_name, *shard));
             blob_del_sks.push(sk);
             blob_del_sizes.push(*size);
         }
     }
-    if !blob_del_pks.is_empty() && !dry_run {
-        let del_keys: Vec<(&str, &str)> = blob_del_pks
-            .iter()
-            .zip(blob_del_sks.iter())
-            .map(|(pk, sk)| (pk.as_str(), *sk))
-            .collect();
-        kv.delete_batch(keys::TABLE_ARTIFACTS, &del_keys).await?;
+    if !blob_del_sks.is_empty() && !dry_run {
+        depot_core::service::delete_artifacts_paired_batch(kv.as_ref(), repo_name, &blob_del_sks)
+            .await?;
         deleted += blob_del_sks.len() as u64;
         let mut batch_bytes = 0i64;
         for (&sk, &size) in blob_del_sks.iter().zip(blob_del_sizes.iter()) {
@@ -226,10 +220,9 @@ pub(super) async fn docker_gc(
             tag_bf.set(digest.as_bytes());
         }
 
-        let mut manifest_del_pks: Vec<String> = Vec::new();
         let mut manifest_del_sks: Vec<&str> = Vec::new();
         let mut manifest_del_sizes: Vec<u64> = Vec::new();
-        for (sk, shard, record) in &manifests {
+        for (sk, _shard, record) in &manifests {
             // Skip recently created records to avoid racing concurrent tag pushes.
             if record.created_at > grace_cutoff {
                 continue;
@@ -245,18 +238,17 @@ pub(super) async fn docker_gc(
             };
 
             if !tag_bf.check(digest.as_bytes()) {
-                manifest_del_pks.push(keys::artifact_shard_pk(repo_name, *shard));
                 manifest_del_sks.push(sk);
                 manifest_del_sizes.push(record.size);
             }
         }
-        if !manifest_del_pks.is_empty() && !dry_run {
-            let del_keys: Vec<(&str, &str)> = manifest_del_pks
-                .iter()
-                .zip(manifest_del_sks.iter())
-                .map(|(pk, sk)| (pk.as_str(), *sk))
-                .collect();
-            kv.delete_batch(keys::TABLE_ARTIFACTS, &del_keys).await?;
+        if !manifest_del_sks.is_empty() && !dry_run {
+            depot_core::service::delete_artifacts_paired_batch(
+                kv.as_ref(),
+                repo_name,
+                &manifest_del_sks,
+            )
+            .await?;
             deleted += manifest_del_sks.len() as u64;
             let mut batch_bytes = 0i64;
             for (&sk, &size) in manifest_del_sks.iter().zip(manifest_del_sizes.iter()) {
