@@ -82,6 +82,20 @@ fn blob_ref_path_for(digest: &str) -> String {
     format!("_blobs/{digest}")
 }
 
+/// Returns true for artifact paths that hold Docker bookkeeping records
+/// (`_manifests/{digest}` and `_blobs/{digest}`, optionally prefixed with an
+/// image namespace). These records are reachable only via tags or manifest
+/// references and must not be aged out by a generic per-record cleanup
+/// policy — losing them while their tag/manifest survives would surface
+/// as silent `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN` 404s. `docker_gc` handles
+/// their cleanup via tag/manifest reachability instead.
+pub fn is_bookkeeping_path(path: &str) -> bool {
+    path.starts_with("_manifests/")
+        || path.starts_with("_blobs/")
+        || path.contains("/_manifests/")
+        || path.contains("/_blobs/")
+}
+
 // --- Helpers ---
 
 /// Compute sha256 digest in Docker format: "sha256:<hex>"

@@ -314,6 +314,7 @@ pub async fn gc_pass(
 
         let repo_name = repo.name.clone();
         let store_name = repo.store.clone();
+        let is_docker = repo.format() == depot_core::store::kv::ArtifactFormat::Docker;
         for shard in 0..keys::NUM_SHARDS {
             let kv = kv.clone();
             let tmpl = template.clone();
@@ -366,7 +367,11 @@ pub async fn gc_pass(
                             Err(_) => continue,
                         };
 
+                        let is_docker_bookkeeping =
+                            is_docker && depot_format_docker::store::is_bookkeeping_path(sk);
+
                         let expired = !record.internal
+                            && !is_docker_bookkeeping
                             && (max_age_cutoff
                                 .map(|c| record.created_at < c)
                                 .unwrap_or(false)
