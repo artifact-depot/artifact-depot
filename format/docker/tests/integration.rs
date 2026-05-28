@@ -388,6 +388,86 @@ async fn test_get_manifest_by_digest() {
     );
 }
 
+/// A tag whose manifest has been deleted (e.g. aged out of a cleanup
+/// policy while the tag itself survived) must not refresh its own atime on
+/// a failing lookup — otherwise repeated 404s would ratchet `last_accessed_at`
+/// forward forever and immortalize the dangling tag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dangling_tag_does_not_refresh_tag_atime() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("dangle").await;
+
+    let config_digest = app.push_docker_blob("dangle", b"{}").await;
+    let layer_digest = app.push_docker_blob("dangle", b"layer").await;
+    let manifest = TestApp::make_manifest(&config_digest, &[&layer_digest]);
+    let manifest_digest = app.push_docker_manifest("dangle", "v1.0", &manifest).await;
+
+    // Drop the manifest record so the tag dangles.
+    let manifest_path = format!("_manifests/{}", manifest_digest);
+    depot_core::service::delete_artifact(app.state.repo.kv.as_ref(), "dangle", &manifest_path)
+        .await
+        .unwrap();
+
+    let (sender, mut receiver) = depot_core::update::UpdateSender::new(64);
+    let blobs = app.state.repo.blob_store("default").await.unwrap();
+    let docker_store = depot_format_docker::store::DockerStore {
+        repo: "dangle",
+        image: None,
+        kv: app.state.repo.kv.as_ref(),
+        blobs: blobs.as_ref(),
+        updater: &sender,
+        store: "default",
+    };
+
+    let result = docker_store.get_manifest("v1.0").await.unwrap();
+    assert!(result.is_none(), "expected dangling tag to return None");
+
+    let touched = receiver.atime_rx.try_recv();
+    assert!(
+        touched.is_err(),
+        "dangling tag should not produce an atime touch, got {:?}",
+        touched.ok().map(|e| e.path)
+    );
+}
+
+/// Sanity check the positive path: a successful tag→manifest lookup still
+/// queues the tag's atime touch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_healthy_tag_refreshes_tag_atime() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("healthy").await;
+
+    let config_digest = app.push_docker_blob("healthy", b"{}").await;
+    let layer_digest = app.push_docker_blob("healthy", b"layer").await;
+    let manifest = TestApp::make_manifest(&config_digest, &[&layer_digest]);
+    app.push_docker_manifest("healthy", "v1.0", &manifest).await;
+
+    let (sender, mut receiver) = depot_core::update::UpdateSender::new(64);
+    let blobs = app.state.repo.blob_store("default").await.unwrap();
+    let docker_store = depot_format_docker::store::DockerStore {
+        repo: "healthy",
+        image: None,
+        kv: app.state.repo.kv.as_ref(),
+        blobs: blobs.as_ref(),
+        updater: &sender,
+        store: "default",
+    };
+
+    let result = docker_store.get_manifest("v1.0").await.unwrap();
+    assert!(result.is_some(), "expected healthy tag to return Some");
+
+    let mut tag_touches = 0;
+    while let Ok(event) = receiver.atime_rx.try_recv() {
+        if event.path == "_tags/v1.0" {
+            tag_touches += 1;
+        }
+    }
+    assert_eq!(
+        tag_touches, 1,
+        "healthy tag lookup should queue exactly one tag atime touch"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_manifest_not_found() {
     let app = TestApp::new().await;

@@ -381,6 +381,11 @@ impl<'a> DockerStore<'a> {
     }
 
     /// Resolve a tag to a digest, then fetch the manifest.
+    ///
+    /// The tag's `last_accessed_at` is only refreshed when the manifest is
+    /// also reachable. Touching the tag on a dangling lookup would let a
+    /// tag whose manifest has aged out be kept alive forever by its own
+    /// 404s, while the manifest stays dead.
     pub async fn get_manifest_by_tag(
         &self,
         tag: &str,
@@ -399,15 +404,11 @@ impl<'a> DockerStore<'a> {
                 )))
             }
         };
-        let digest = Some(digest);
-        let digest = match digest {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        self.updater
-            .touch(self.repo, &self.tag_path(tag), now_utc());
         match self.get_manifest_by_digest(&digest).await? {
-            Some((data, ct)) => Ok(Some((data, ct, digest))),
+            Some((data, ct)) => {
+                self.updater.touch(self.repo, &path, now_utc());
+                Ok(Some((data, ct, digest)))
+            }
             None => {
                 tracing::warn!(
                     repo = self.repo,
