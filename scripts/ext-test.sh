@@ -220,7 +220,8 @@ TOML
 
   docker-auth)
     # Verify that Docker and containerd can pull images that require
-    # authentication.  Tests both the GET (Docker/Basic) and POST
+    # authentication, and that the OCI v1.1 referrers endpoint returns a
+    # valid empty image index.  Tests both the GET (Docker/Basic) and POST
     # (containerd/OAuth2) token flows, with an NGINX reverse proxy
     # doing HTTPS termination in front of an HTTP-only depot.
     for cmd in docker ctr containerd nginx openssl; do
@@ -459,9 +460,43 @@ NGINX
       exit 1
     fi
 
-    # --- Test 2: containerd ctr pull ---
+    # --- Test 2: OCI v1.1 referrers API ---
+    # Querying an unreferenced digest must return a valid *empty* OCI image
+    # index -- not a 404, and not the SPA fallback HTML. The HTML-fallback
+    # regression surfaces in real clients (docker 24+) as "failed to decode
+    # referrers index: invalid character '<'", so assert both the
+    # Content-Type and that the body parses as schemaVersion 2 with an empty
+    # manifests array. Pure curl + python3 against the existing proxy, so it
+    # needs no docker/containerd and runs before the dockerd-gated tests.
     echo ""
-    echo "=== Test 2: containerd (ctr) pull with auth ==="
+    echo "=== Test 2: OCI v1.1 referrers API ==="
+    PROBE_DIGEST="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    REF_HEADERS="$TMP_DIR/referrers-headers.txt"
+    REF_BODY="$TMP_DIR/referrers-body.json"
+    HTTP_CODE=$(curl -sk -o "$REF_BODY" -D "$REF_HEADERS" -w "%{http_code}" \
+      -H "Authorization: Bearer $DOCKER_TOKEN" \
+      "$BASE/v2/docker-auth-test/testimg/referrers/$PROBE_DIGEST")
+    if [ "$HTTP_CODE" != "200" ]; then
+      echo "  FAIL: referrers returned HTTP $HTTP_CODE"
+      head -c 200 "$REF_BODY"; echo
+      exit 1
+    fi
+    if grep -qi 'content-type:.*application/vnd\.oci\.image\.index\.v1+json' "$REF_HEADERS"; then
+      echo "  PASS: referrers Content-Type is OCI image index"
+    else
+      echo "  FAIL: referrers Content-Type wrong: $(grep -i '^content-type:' "$REF_HEADERS" | tr -d '\r')"
+      exit 1
+    fi
+    if python3 -c "import json,sys; d=json.load(open('$REF_BODY')); sys.exit(0 if d.get('schemaVersion')==2 and d.get('manifests')==[] else 1)" 2>/dev/null; then
+      echo "  PASS: referrers body is a valid empty OCI image index"
+    else
+      echo "  FAIL: referrers body invalid: $(head -c 200 "$REF_BODY")"
+      exit 1
+    fi
+
+    # --- Test 3: containerd ctr pull ---
+    echo ""
+    echo "=== Test 3: containerd (ctr) pull with auth ==="
     CTR_ROOT="$TMP_DIR/containerd"
     CTR_STATE="$TMP_DIR/containerd-state"
     CTR_SOCK="$TMP_DIR/containerd.sock"
@@ -513,9 +548,9 @@ CTR_TOML
       exit 1
     fi
 
-    # --- Test 3: docker pull ---
+    # --- Test 4: docker pull ---
     echo ""
-    echo "=== Test 3: docker pull with auth ==="
+    echo "=== Test 4: docker pull with auth ==="
     # Docker daemon's `insecure-registries` only covers the registry's
     # /v2/ API path; OAuth token requests (the realm URL returned in
     # WWW-Authenticate) still go through normal TLS verification. Install
