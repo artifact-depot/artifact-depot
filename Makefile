@@ -43,7 +43,7 @@ lint-fmt:
 
 lint-clippy:
 	@echo "Running clippy..."
-	@output=$$(cargo clippy -- -D warnings 2>&1) || { echo "$$output"; exit 1; }
+	@output=$$(cargo clippy --all-targets -- -D warnings 2>&1) || { echo "$$output"; exit 1; }
 
 # Third-party license notices (parallelizable with make -j)
 notices-cargo:

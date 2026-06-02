@@ -93,7 +93,7 @@ jobs:
 
       - name: Lint - cargo clippy
         if: success() || failure()
-        run: docker exec dev cargo clippy -- -D warnings
+        run: docker exec dev cargo clippy --all-targets -- -D warnings
 
       - name: Lint - npm license-checker
         if: success() || failure()

@@ -493,7 +493,7 @@ async fn scanner_converges_to_completed_after_update_summary_then_mark_completed
             }
             _ => None,
         })
-        .last();
+        .next_back();
 
     assert_eq!(
         last_status_for_task,
