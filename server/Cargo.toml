@@ -69,7 +69,11 @@ tokio-stream = "0.1"
 futures = "0.3"
 mime_guess = "2"
 tempfile = "3"
-jsonwebtoken = "9"
+# v10 made the crypto backend a selectable provider; the default features no
+# longer bundle one, so a provider feature must be enabled explicitly or every
+# sign/verify call panics at runtime. rust_crypto is pure-Rust (hmac+sha2 for
+# our HS256 tokens) and avoids a C/aws-lc-rs build dependency.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 ldap3 = { version = "0.11", optional = true }
 metrics = "0.24"
