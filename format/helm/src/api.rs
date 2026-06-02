@@ -730,15 +730,12 @@ fn merge_index_entries(merged: &mut BTreeMap<String, Vec<serde_yml::Value>>, ind
     let Some(entries) = yaml.get("entries").and_then(|e| e.as_mapping()) else {
         return;
     };
-    for (key, versions) in entries {
-        let Some(chart_name) = key.as_str() else {
-            continue;
-        };
+    for (chart_name, versions) in entries {
         let Some(versions) = versions.as_sequence() else {
             continue;
         };
 
-        let entry = merged.entry(chart_name.to_string()).or_default();
+        let entry = merged.entry(chart_name.clone()).or_default();
 
         for ver in versions {
             let ver_str = ver.get("version").and_then(|v| v.as_str()).unwrap_or("");
@@ -761,28 +758,16 @@ fn serialize_merged_index(
     entries: &BTreeMap<String, Vec<serde_yml::Value>>,
 ) -> Result<String, DepotError> {
     let mut index = serde_yml::Mapping::new();
-    index.insert(
-        serde_yml::Value::String("apiVersion".to_string()),
-        serde_yml::Value::String("v1".to_string()),
-    );
+    index.insert("apiVersion", serde_yml::Value::String("v1".to_string()));
 
     let mut entries_map = serde_yml::Mapping::new();
     for (name, versions) in entries {
-        entries_map.insert(
-            serde_yml::Value::String(name.clone()),
-            serde_yml::Value::Sequence(versions.clone()),
-        );
+        entries_map.insert(name.clone(), serde_yml::Value::Sequence(versions.clone()));
     }
-    index.insert(
-        serde_yml::Value::String("entries".to_string()),
-        serde_yml::Value::Mapping(entries_map),
-    );
+    index.insert("entries", serde_yml::Value::Mapping(entries_map));
 
     let generated = chrono::Utc::now().to_rfc3339();
-    index.insert(
-        serde_yml::Value::String("generated".to_string()),
-        serde_yml::Value::String(generated),
-    );
+    index.insert("generated", serde_yml::Value::String(generated));
 
     serde_yml::to_string(&serde_yml::Value::Mapping(index)).map_err(|e| {
         tracing::error!(error = %e, "failed to serialize merged helm index");
