@@ -51,7 +51,7 @@ pub(super) fn sign_release(
     release_text: &str,
 ) -> error::Result<(String, String)> {
     use pgp::composed::{
-        CleartextSignedMessage, DetachedSignature, Deserializable, SignedSecretKey,
+        CleartextSignedMessage, Deserializable, DetachedSignature, SignedSecretKey,
     };
     use pgp::types::Password;
 

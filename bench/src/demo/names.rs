@@ -118,7 +118,11 @@ pub fn gen_release_path(rng: &mut dyn RngCore, _index: usize) -> (String, &'stat
     let group = GROUPS.choose(rng).unwrap();
     let artifact = RAW_ARTIFACTS.choose(rng).unwrap();
     let version = VERSIONS.choose(rng).unwrap();
-    let ext = if rng.random_bool(0.7) { "jar" } else { "tar.gz" };
+    let ext = if rng.random_bool(0.7) {
+        "jar"
+    } else {
+        "tar.gz"
+    };
     let path = format!(
         "{}/{}/{}/{}-{}.{}",
         group, artifact, version, artifact, version, ext
