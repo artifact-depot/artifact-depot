@@ -68,6 +68,22 @@ pub fn unauthorized_response(suppress_www_authenticate: bool) -> axum::response:
     }
 }
 
+/// Map a permission-check error to an HTTP response, issuing a Basic
+/// challenge to anonymous callers so browsers prompt for credentials.
+///
+/// For `DepotError::Forbidden` from an anonymous request, returns 401 +
+/// `WWW-Authenticate: Basic realm="Artifact Depot"`. For an authenticated
+/// caller, or for any other error kind, falls back to the default
+/// `IntoResponse` mapping (typically a plain 403 with no challenge).
+#[cfg(feature = "http")]
+pub fn map_permission_error(err: DepotError, username: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if matches!(err, DepotError::Forbidden(_)) && username == "anonymous" {
+        return unauthorized_response(false);
+    }
+    err.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +112,35 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode("nocolon");
         let header = format!("Basic {}", encoded);
         assert!(decode_basic_auth(&header).is_none());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn test_map_permission_error_anonymous_gets_basic_challenge() {
+        use axum::http::{header, StatusCode};
+        let resp = map_permission_error(DepotError::Forbidden("access denied".into()), "anonymous");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("WWW-Authenticate header present");
+        assert_eq!(www_auth, "Basic realm=\"Artifact Depot\"");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn test_map_permission_error_authenticated_gets_forbidden() {
+        use axum::http::{header, StatusCode};
+        let resp = map_permission_error(DepotError::Forbidden("access denied".into()), "alice");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn test_map_permission_error_non_forbidden_passes_through() {
+        use axum::http::StatusCode;
+        let resp = map_permission_error(DepotError::NotFound("missing".into()), "anonymous");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

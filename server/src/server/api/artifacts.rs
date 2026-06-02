@@ -26,7 +26,7 @@ use sha2::Digest as _;
 use crate::server::repo::hosted::HostedRepo;
 use crate::server::repo::{self as repo_mod, ArtifactContent, ArtifactData};
 use crate::server::AppState;
-use depot_core::auth::AuthenticatedUser;
+use depot_core::auth::{map_permission_error, AuthenticatedUser};
 use depot_core::error::DepotError;
 use depot_core::service;
 use depot_core::store::kv::ArtifactKind;
@@ -634,7 +634,7 @@ pub async fn head_artifact(
                 }
             }
         }
-        return perm_err.into_response();
+        return map_permission_error(perm_err, &user.0);
     }
     let repo_name_owned = repo_name.clone();
     let repo_config = match service::get_repo(state.repo.kv.as_ref(), &repo_name_owned).await {
@@ -672,7 +672,7 @@ pub async fn head_artifact(
         .check_permission(&user.0, &repo_name, Capability::Read)
         .await
     {
-        return e.into_response();
+        return map_permission_error(e, &user.0);
     }
 
     // Dispatch format-specific paths before falling through to raw handler.
@@ -844,7 +844,7 @@ pub async fn get_artifact(
                 }
             }
         }
-        return perm_err.into_response();
+        return map_permission_error(perm_err, &user.0);
     }
     let repo_name_owned = repo_name.clone();
     let repo_config = match service::get_repo(state.repo.kv.as_ref(), &repo_name_owned).await {
@@ -882,7 +882,7 @@ pub async fn get_artifact(
         .check_permission(&user.0, &repo_name, Capability::Read)
         .await
     {
-        return e.into_response();
+        return map_permission_error(e, &user.0);
     }
 
     // Dispatch format-specific paths before falling through to raw handler.
@@ -1087,7 +1087,7 @@ pub async fn put_artifact(
         .await
     {
         UPLOADS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
-        return perm_err.into_response();
+        return map_permission_error(perm_err, &user.0);
     }
 
     // For proxy (group) repos, route writes to the first hosted member.
@@ -1441,7 +1441,7 @@ pub async fn delete_artifact(
                 }
             }
         }
-        return perm_err.into_response();
+        return map_permission_error(perm_err, &user.0);
     }
     let repo_name_owned = repo_name.clone();
     let repo_config = match service::get_repo(state.repo.kv.as_ref(), &repo_name_owned).await {
@@ -1543,7 +1543,7 @@ pub async fn list_artifacts(
         .check_permission(&user.0, &repo_name, Capability::Read)
         .await
     {
-        return e.into_response();
+        return map_permission_error(e, &user.0);
     }
     let repo_name_owned = repo_name.clone();
     let repo_config = match service::get_repo(state.repo.kv.as_ref(), &repo_name_owned).await {
@@ -1661,7 +1661,7 @@ pub async fn start_bulk_delete(
         .check_permission(&user.0, &repo_name, Capability::Delete)
         .await
     {
-        return e.into_response();
+        return map_permission_error(e, &user.0);
     }
 
     let prefix = match normalize_artifact_path(&body.prefix) {
@@ -2028,7 +2028,7 @@ pub async fn download_archive(
         .check_permission(&user.0, &repo_name, Capability::Read)
         .await
     {
-        return e.into_response();
+        return map_permission_error(e, &user.0);
     }
 
     // Load repo
