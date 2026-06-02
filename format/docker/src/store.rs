@@ -82,6 +82,20 @@ fn blob_ref_path_for(digest: &str) -> String {
     format!("_blobs/{digest}")
 }
 
+/// Returns true for artifact paths that hold Docker bookkeeping records
+/// (`_manifests/{digest}` and `_blobs/{digest}`, optionally prefixed with an
+/// image namespace). These records are reachable only via tags or manifest
+/// references and must not be aged out by a generic per-record cleanup
+/// policy — losing them while their tag/manifest survives would surface
+/// as silent `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN` 404s. `docker_gc` handles
+/// their cleanup via tag/manifest reachability instead.
+pub fn is_bookkeeping_path(path: &str) -> bool {
+    path.starts_with("_manifests/")
+        || path.starts_with("_blobs/")
+        || path.contains("/_manifests/")
+        || path.contains("/_blobs/")
+}
+
 // --- Helpers ---
 
 /// Compute sha256 digest in Docker format: "sha256:<hex>"
@@ -381,6 +395,11 @@ impl<'a> DockerStore<'a> {
     }
 
     /// Resolve a tag to a digest, then fetch the manifest.
+    ///
+    /// The tag's `last_accessed_at` is only refreshed when the manifest is
+    /// also reachable. Touching the tag on a dangling lookup would let a
+    /// tag whose manifest has aged out be kept alive forever by its own
+    /// 404s, while the manifest stays dead.
     pub async fn get_manifest_by_tag(
         &self,
         tag: &str,
@@ -399,15 +418,11 @@ impl<'a> DockerStore<'a> {
                 )))
             }
         };
-        let digest = Some(digest);
-        let digest = match digest {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        self.updater
-            .touch(self.repo, &self.tag_path(tag), now_utc());
         match self.get_manifest_by_digest(&digest).await? {
-            Some((data, ct)) => Ok(Some((data, ct, digest))),
+            Some((data, ct)) => {
+                self.updater.touch(self.repo, &path, now_utc());
+                Ok(Some((data, ct, digest)))
+            }
             None => {
                 tracing::warn!(
                     repo = self.repo,

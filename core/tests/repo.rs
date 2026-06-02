@@ -1782,3 +1782,218 @@ async fn cache_get_with_upstream_auth_no_password() {
     let result = cache.get("token-auth.txt").await.unwrap().unwrap();
     assert_eq!(read_all(result.data).await, b"token-content");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_get_propagates_upstream_blake3_header() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (kv, blobs, _dir) = test_kv().await;
+    let http = reqwest::Client::new();
+    let mock_server = MockServer::start().await;
+
+    let body: &[u8] = b"upstream payload with checksum";
+    let expected_hash = blake3::hash(body).to_hex().to_string();
+
+    Mock::given(method("GET"))
+        .and(path("/checksummed.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.to_vec())
+                .insert_header("content-type", "application/octet-stream")
+                .insert_header("x-checksum-blake3", expected_hash.as_str()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let cache = CacheRepo {
+        name: "cache-b3".to_string(),
+        upstream_url: mock_server.uri(),
+        cache_ttl_secs: 3600,
+        kv: Arc::clone(&kv),
+        blobs: Arc::clone(&blobs),
+        store: "default".to_string(),
+        http: http.clone(),
+        upstream_auth: None,
+        inflight: InflightMap::new(),
+        updater: UpdateSender::noop(),
+        format: "raw".into(),
+    };
+
+    let result = cache.get("checksummed.bin").await.unwrap().unwrap();
+    // Preliminary record carries the upstream-claimed BLAKE3 before the body finishes,
+    // so the streaming response can emit `X-Checksum-Blake3` immediately.
+    assert_eq!(
+        result.record.content_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(read_all(result.data).await, body);
+
+    // Committed record reflects the verified hash.
+    let cached = service::get_artifact(kv.as_ref(), "cache-b3", "checksummed.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cached.content_hash.as_deref(), Some(expected_hash.as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_head_propagates_upstream_blake3_header() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (kv, blobs, _dir) = test_kv().await;
+    let http = reqwest::Client::new();
+    let mock_server = MockServer::start().await;
+
+    // Note: the hash advertised on HEAD passthrough is not verified against the
+    // body (we never fetch one), so any well-formed value flows through.
+    let advertised = "0".repeat(64);
+
+    Mock::given(method("HEAD"))
+        .and(path("/probe.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .insert_header("content-length", "1024")
+                .insert_header("x-checksum-blake3", advertised.as_str()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let cache = CacheRepo {
+        name: "cache-b3-head".to_string(),
+        upstream_url: mock_server.uri(),
+        cache_ttl_secs: 3600,
+        kv: Arc::clone(&kv),
+        blobs: Arc::clone(&blobs),
+        store: "default".to_string(),
+        http: http.clone(),
+        upstream_auth: None,
+        inflight: InflightMap::new(),
+        updater: UpdateSender::noop(),
+        format: "raw".into(),
+    };
+
+    let record = cache.head("probe.bin").await.unwrap().unwrap();
+    assert_eq!(record.content_hash.as_deref(), Some(advertised.as_str()));
+    assert_eq!(record.size, 1024);
+    // HEAD must not commit anything to the local cache.
+    assert!(
+        service::get_artifact(kv.as_ref(), "cache-b3-head", "probe.bin")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_get_rejects_upstream_blake3_mismatch() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (kv, blobs, _dir) = test_kv().await;
+    let http = reqwest::Client::new();
+    let mock_server = MockServer::start().await;
+
+    let body: &[u8] = b"upstream tells us it hashes to all zeros, but it does not";
+    let bogus_hash = "0".repeat(64);
+
+    Mock::given(method("GET"))
+        .and(path("/lying.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.to_vec())
+                .insert_header("content-type", "application/octet-stream")
+                .insert_header("x-checksum-blake3", bogus_hash.as_str()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let cache = CacheRepo {
+        name: "cache-b3-bad".to_string(),
+        upstream_url: mock_server.uri(),
+        cache_ttl_secs: 3600,
+        kv: Arc::clone(&kv),
+        blobs: Arc::clone(&blobs),
+        store: "default".to_string(),
+        http: http.clone(),
+        upstream_auth: None,
+        inflight: InflightMap::new(),
+        updater: UpdateSender::noop(),
+        format: "raw".into(),
+    };
+
+    let result = cache.get("lying.bin").await.unwrap().unwrap();
+    let mut saw_err = false;
+    if let ArtifactData::Stream(mut stream) = result.data {
+        while let Some(chunk) = stream.next().await {
+            if chunk.is_err() {
+                saw_err = true;
+            }
+        }
+    } else {
+        panic!("expected streaming body");
+    }
+    assert!(
+        saw_err,
+        "stream must surface an error when upstream BLAKE3 doesn't match the body"
+    );
+    // The mismatched blob must not be committed to the cache.
+    assert!(
+        service::get_artifact(kv.as_ref(), "cache-b3-bad", "lying.bin")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_get_ignores_malformed_upstream_blake3() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (kv, blobs, _dir) = test_kv().await;
+    let http = reqwest::Client::new();
+    let mock_server = MockServer::start().await;
+
+    let body: &[u8] = b"upstream sent garbage in the checksum header";
+
+    Mock::given(method("GET"))
+        .and(path("/junky-hdr.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.to_vec())
+                .insert_header("content-type", "application/octet-stream")
+                .insert_header("x-checksum-blake3", "not-a-blake3-hash"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let cache = CacheRepo {
+        name: "cache-b3-junk".to_string(),
+        upstream_url: mock_server.uri(),
+        cache_ttl_secs: 3600,
+        kv: Arc::clone(&kv),
+        blobs: Arc::clone(&blobs),
+        store: "default".to_string(),
+        http: http.clone(),
+        upstream_auth: None,
+        inflight: InflightMap::new(),
+        updater: UpdateSender::noop(),
+        format: "raw".into(),
+    };
+
+    let result = cache.get("junky-hdr.bin").await.unwrap().unwrap();
+    // Malformed upstream value is ignored — preliminary record has no hash yet.
+    assert!(result.record.content_hash.is_none());
+    assert_eq!(read_all(result.data).await, body);
+
+    // Committed record carries the actually-computed BLAKE3.
+    let cached = service::get_artifact(kv.as_ref(), "cache-b3-junk", "junky-hdr.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    let computed = blake3::hash(body).to_hex().to_string();
+    assert_eq!(cached.content_hash.as_deref(), Some(computed.as_str()));
+}

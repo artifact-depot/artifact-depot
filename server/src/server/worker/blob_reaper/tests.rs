@@ -1256,6 +1256,102 @@ async fn clean_repo_artifacts_basic() {
         .is_some());
 }
 
+/// Docker manifest and blob-ref records must survive a per-record age
+/// policy — they're reachable only via tags or other manifests, and
+/// expiring them while their tag/parent manifest survives surfaces as
+/// `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN` 404s. `docker_gc` handles their
+/// cleanup via reachability instead. Tags themselves remain subject to
+/// the policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expire_repo_artifacts_protects_docker_bookkeeping() {
+    let (kv, _blobs, _registry, _dir) = setup_test_env().await;
+
+    let repo = RepoConfig {
+        schema_version: CURRENT_RECORD_VERSION,
+        name: "dkr-clean".to_string(),
+        kind: RepoKind::Hosted,
+        format_config: FormatConfig::Docker {
+            listen: None,
+            cleanup_untagged_manifests: None,
+        },
+        store: "default".to_string(),
+        created_at: chrono::Utc::now(),
+        cleanup_max_unaccessed_days: None,
+        cleanup_max_age_days: Some(1),
+        deleting: false,
+    };
+    service::put_repo(kv.as_ref(), &repo).await.unwrap();
+
+    let old = chrono::Utc::now() - chrono::Duration::days(5);
+    let stub = ArtifactRecord {
+        schema_version: CURRENT_RECORD_VERSION,
+        id: String::new(),
+        size: 0,
+        content_type: "application/vnd.docker.distribution.manifest.v2+json".to_string(),
+        created_at: old,
+        updated_at: old,
+        last_accessed_at: old,
+        path: String::new(),
+        kind: ArtifactKind::DockerManifest {
+            docker_digest: "sha256:placeholder".to_string(),
+        },
+        internal: false,
+        blob_id: None,
+        content_hash: None,
+        etag: None,
+    };
+
+    let tag_path = "_tags/v1";
+    let manifest_path = "_manifests/sha256:abc";
+    let blob_path = "_blobs/sha256:def";
+    let ns_manifest = "myimage/_manifests/sha256:xyz";
+    let ns_blob = "myimage/_blobs/sha256:qrs";
+
+    let tag_rec = ArtifactRecord {
+        kind: ArtifactKind::DockerTag {
+            digest: "sha256:abc".to_string(),
+            tag: "v1".to_string(),
+        },
+        ..stub.clone()
+    };
+    service::put_artifact(kv.as_ref(), "dkr-clean", tag_path, &tag_rec)
+        .await
+        .unwrap();
+    service::put_artifact(kv.as_ref(), "dkr-clean", manifest_path, &stub)
+        .await
+        .unwrap();
+    service::put_artifact(kv.as_ref(), "dkr-clean", blob_path, &stub)
+        .await
+        .unwrap();
+    service::put_artifact(kv.as_ref(), "dkr-clean", ns_manifest, &stub)
+        .await
+        .unwrap();
+    service::put_artifact(kv.as_ref(), "dkr-clean", ns_blob, &stub)
+        .await
+        .unwrap();
+
+    super::repo_cleanup::expire_repo_artifacts(kv.clone(), &repo, None, &UpdateSender::noop())
+        .await
+        .unwrap();
+
+    assert!(
+        service::get_artifact(kv.as_ref(), "dkr-clean", tag_path)
+            .await
+            .unwrap()
+            .is_none(),
+        "tag should be expired by age policy"
+    );
+    for protected in [manifest_path, blob_path, ns_manifest, ns_blob] {
+        assert!(
+            service::get_artifact(kv.as_ref(), "dkr-clean", protected)
+                .await
+                .unwrap()
+                .is_some(),
+            "{protected} should be protected from age-based cleanup"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_repo_artifacts_scan_error() {
     let (kv, _blobs, registry, _dir) = setup_test_env().await;

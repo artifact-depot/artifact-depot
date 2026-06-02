@@ -75,6 +75,90 @@ async fn service_delete_artifact() {
         .is_none());
 }
 
+/// Check whether a path has a corresponding `TreeEntry::File` in the browse tree.
+async fn tree_file_exists(kv: &dyn KvStore, repo: &str, path: &str) -> bool {
+    let (table, pk, sk) = depot_core::store::keys::tree_entry_key(repo, path);
+    kv.get(table, pk, sk).await.unwrap().is_some()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_delete_artifacts_paired_batch_clears_both_tables() {
+    let (kv, _dir) = test_kv().await;
+    let kv_dyn: &dyn KvStore = &kv;
+
+    // Two artifacts under different parent dirs (so their tree entries land
+    // in different shards), plus a survivor we won't delete.
+    service::put_artifact(kv_dyn, "repo", "a/1", &make_record(1, 1))
+        .await
+        .unwrap();
+    service::put_artifact(kv_dyn, "repo", "b/2", &make_record(1, 1))
+        .await
+        .unwrap();
+    service::put_artifact(kv_dyn, "repo", "a/keep", &make_record(1, 1))
+        .await
+        .unwrap();
+
+    assert!(tree_file_exists(kv_dyn, "repo", "a/1").await);
+    assert!(tree_file_exists(kv_dyn, "repo", "b/2").await);
+    assert!(tree_file_exists(kv_dyn, "repo", "a/keep").await);
+
+    service::delete_artifacts_paired_batch(kv_dyn, "repo", &["a/1", "b/2"])
+        .await
+        .unwrap();
+
+    // Both the artifact record AND its paired tree entry are gone for the
+    // deleted paths — the UI would no longer list these.
+    for path in ["a/1", "b/2"] {
+        assert!(
+            service::get_artifact(kv_dyn, "repo", path)
+                .await
+                .unwrap()
+                .is_none(),
+            "{path} record should be gone"
+        );
+        assert!(
+            !tree_file_exists(kv_dyn, "repo", path).await,
+            "{path} tree entry should be gone"
+        );
+    }
+
+    // The survivor under the same parent dir is untouched in both tables.
+    assert!(service::get_artifact(kv_dyn, "repo", "a/keep")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(tree_file_exists(kv_dyn, "repo", "a/keep").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_delete_artifacts_paired_batch_empty_and_missing_are_noops() {
+    let (kv, _dir) = test_kv().await;
+    let kv_dyn: &dyn KvStore = &kv;
+    service::put_artifact(kv_dyn, "repo", "keep.txt", &make_record(1, 1))
+        .await
+        .unwrap();
+
+    // Empty list does nothing.
+    service::delete_artifacts_paired_batch(kv_dyn, "repo", &[])
+        .await
+        .unwrap();
+    assert!(service::get_artifact(kv_dyn, "repo", "keep.txt")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(tree_file_exists(kv_dyn, "repo", "keep.txt").await);
+
+    // Deleting paths that don't exist is harmless and leaves the survivor.
+    service::delete_artifacts_paired_batch(kv_dyn, "repo", &["missing.txt", "also/missing"])
+        .await
+        .unwrap();
+    assert!(service::get_artifact(kv_dyn, "repo", "keep.txt")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(tree_file_exists(kv_dyn, "repo", "keep.txt").await);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_list_search_artifacts() {
     let (kv, _dir) = test_kv().await;

@@ -155,6 +155,76 @@ pub async fn delete_artifact(
     }
 }
 
+/// Bulk-delete artifact records together with their paired browse-tree
+/// file entries — the bulk equivalent of [`delete_artifact`].
+///
+/// The UI browse listing reads from `TABLE_DIR_ENTRIES`, not
+/// `TABLE_ARTIFACTS`. Dropping only the `ArtifactRecord` leaves a stale
+/// `TreeEntry::File` behind, which surfaces as the UI listing rows whose
+/// backing record is gone. `full_scan` (the `rebuild-dir-entries` task)
+/// reconciles the two tables eventually, but it's not part of normal GC.
+///
+/// Safety:
+///
+/// * The artifact-records batch is issued first. The tree-entry batch
+///   runs only if it succeeds — we never delete a tree entry whose
+///   backing record we failed to remove.
+/// * If the artifact-records batch fails, the error is propagated and
+///   tree entries are left untouched.
+/// * Tree-entry deletion errors are logged but do not propagate. The
+///   artifact records are already gone, and `full_scan` will reconcile
+///   any leftovers on the next run.
+/// * `delete` on a non-existent key is a no-op, so duplicate paths or
+///   already-cleaned tree entries are harmless.
+#[tracing::instrument(level = "debug", skip(kv, paths), fields(repo, count = paths.len()))]
+pub async fn delete_artifacts_paired_batch(
+    kv: &dyn KvStore,
+    repo: &str,
+    paths: &[&str],
+) -> error::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let artifact_keys: Vec<(String, String)> = paths
+        .iter()
+        .map(|path| {
+            let (_, pk, sk) = keys::artifact_key(repo, path);
+            (pk.into_owned(), sk.into_owned())
+        })
+        .collect();
+    let artifact_keys_ref: Vec<(&str, &str)> = artifact_keys
+        .iter()
+        .map(|(pk, sk)| (pk.as_str(), sk.as_str()))
+        .collect();
+    kv.delete_batch(keys::TABLE_ARTIFACTS, &artifact_keys_ref)
+        .await?;
+
+    let tree_keys: Vec<(String, String)> = paths
+        .iter()
+        .map(|path| {
+            let (_, pk, sk) = keys::tree_entry_key(repo, path);
+            (pk.into_owned(), sk.into_owned())
+        })
+        .collect();
+    let tree_keys_ref: Vec<(&str, &str)> = tree_keys
+        .iter()
+        .map(|(pk, sk)| (pk.as_str(), sk.as_str()))
+        .collect();
+    if let Err(e) = kv
+        .delete_batch(keys::TABLE_DIR_ENTRIES, &tree_keys_ref)
+        .await
+    {
+        tracing::warn!(
+            repo,
+            error = %e,
+            count = paths.len(),
+            "paired tree-entry delete failed; full_scan will reconcile"
+        );
+    }
+    Ok(())
+}
+
 // --- Listing and search ---
 
 #[tracing::instrument(level = "debug", skip(kv, pagination), fields(repo))]

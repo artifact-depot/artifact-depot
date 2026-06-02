@@ -52,6 +52,7 @@ pub(super) async fn expire_repo_artifacts(
 
     let repo_name = &repo.name;
     let store_name = &repo.store;
+    let is_docker = repo.format() == depot_core::store::kv::ArtifactFormat::Docker;
     let mut js = JoinSet::new();
     for shard in 0..keys::NUM_SHARDS {
         let kv = kv.clone();
@@ -98,7 +99,11 @@ pub(super) async fn expire_repo_artifacts(
 
                     local_scanned_bytes += record.size;
 
+                    let is_docker_bookkeeping =
+                        is_docker && depot_format_docker::store::is_bookkeeping_path(sk);
+
                     let expired = !record.internal
+                        && !is_docker_bookkeeping
                         && (max_age_cutoff
                             .map(|c| record.created_at < c)
                             .unwrap_or(false)
@@ -113,11 +118,13 @@ pub(super) async fn expire_repo_artifacts(
                     }
                 }
                 if !expired_entries.is_empty() {
-                    let del_keys: Vec<(&str, &str)> = expired_entries
-                        .iter()
-                        .map(|(sk, _)| (pk.as_str(), *sk))
-                        .collect();
-                    kv.delete_batch(keys::TABLE_ARTIFACTS, &del_keys).await?;
+                    let paths: Vec<&str> = expired_entries.iter().map(|(sk, _)| *sk).collect();
+                    depot_core::service::delete_artifacts_paired_batch(
+                        kv.as_ref(),
+                        &repo_name,
+                        &paths,
+                    )
+                    .await?;
                     local_expired += expired_entries.len() as u64;
                     let mut batch_bytes = 0i64;
                     for &(sk, size) in &expired_entries {

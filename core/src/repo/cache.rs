@@ -40,6 +40,24 @@ pub struct CacheRepo {
     pub format: String,
 }
 
+/// Extract an upstream BLAKE3 content hash, if advertised via `X-Checksum-Blake3`.
+///
+/// The value must be exactly 64 lowercase hex chars to be accepted (the canonical
+/// BLAKE3 hex representation). Returns `None` for missing, malformed, or
+/// wrong-length values — callers fall back to computing the hash from the body.
+fn extract_upstream_blake3(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let val = headers.get("x-checksum-blake3")?.to_str().ok()?.trim();
+    if val.len() == 64
+        && val
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Some(val.to_string())
+    } else {
+        None
+    }
+}
+
 /// Extract an upstream ETag or synthesize one from available metadata.
 ///
 /// Checks headers in priority order:
@@ -187,13 +205,14 @@ impl CacheRepo {
             .unwrap_or(0);
 
         let etag = extract_or_synthesize_etag(resp.headers(), path, size);
+        let upstream_blake3 = extract_upstream_blake3(resp.headers());
 
         Ok(Some(ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
             kind: ArtifactKind::Raw,
             blob_id: None,
-            content_hash: None,
+            content_hash: upstream_blake3,
             etag: Some(etag),
             size,
             content_type,
@@ -319,6 +338,7 @@ impl CacheRepo {
             .to_string();
         let upstream_size = resp.content_length().unwrap_or(0);
         let upstream_etag = extract_or_synthesize_etag(resp.headers(), path, upstream_size);
+        let upstream_blake3 = extract_upstream_blake3(resp.headers());
 
         // Tee-stream via mpsc channel: the background task streams chunks from upstream,
         // caches them to blob store, and forwards each chunk through the channel.
@@ -331,12 +351,14 @@ impl CacheRepo {
         // Build a preliminary record using the upstream Content-Length (when available)
         // so the response can include a Content-Length header. The background task
         // independently records the actual size in KV once the download completes.
+        // The upstream-asserted BLAKE3 (if any) flows into the preliminary record
+        // so the streaming response emits `X-Checksum-Blake3` before the body finishes.
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
             kind: ArtifactKind::Raw,
             blob_id: Some(blob_id.clone()),
-            content_hash: None,                // filled in by background task
+            content_hash: upstream_blake3.clone(),
             etag: Some(upstream_etag.clone()), // available immediately
             size: upstream_size,               // upstream Content-Length, 0 if unknown
             content_type: content_type.clone(),
@@ -357,6 +379,7 @@ impl CacheRepo {
         let blob_id_bg = blob_id.clone();
         let updater_bg = self.updater.clone();
         let etag_bg = upstream_etag;
+        let upstream_blake3_bg = upstream_blake3;
 
         tokio::spawn(async move {
             let _guard = inflight_guard; // hold until KV commit finishes
@@ -384,6 +407,20 @@ impl CacheRepo {
                 blob_writer.finish().await?;
 
                 let content_hash = hasher.finalize().to_hex().to_string();
+
+                // If upstream advertised a BLAKE3 via X-Checksum-Blake3, verify it
+                // matches what we actually streamed. A mismatch means the upstream
+                // lied about the content (or the bytes were corrupted in transit);
+                // refuse to cache it. The client gets a stream error via the
+                // outer error path so the transfer fails detectably.
+                if let Some(claimed) = upstream_blake3_bg.as_deref() {
+                    if claimed != content_hash {
+                        return Err(DepotError::Upstream(format!(
+                            "upstream BLAKE3 mismatch for {}: claimed {}, computed {}",
+                            path_bg, claimed, content_hash
+                        )));
+                    }
+                }
 
                 // Create KV records for the blob and artifact.
                 let blob_rec = BlobRecord {

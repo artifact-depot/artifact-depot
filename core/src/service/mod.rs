@@ -22,8 +22,8 @@ mod upload;
 mod user;
 
 pub use artifact::{
-    delete_artifact, fold_all_artifacts, get_artifact, list_artifacts, put_artifact,
-    put_artifact_if_absent, search_artifacts, touch_artifact,
+    delete_artifact, delete_artifacts_paired_batch, fold_all_artifacts, get_artifact,
+    list_artifacts, put_artifact, put_artifact_if_absent, search_artifacts, touch_artifact,
 };
 pub use blob::{
     count_blobs_for_store, delete_blob, fold_all_blobs, get_blob, list_blobs_for_store, put_blob,
