@@ -37,6 +37,7 @@ pub async fn try_handle_repository_path(
     config: &RepoConfig,
     path: &str,
     query: Option<&str>,
+    origin: &str,
 ) -> Option<Response> {
     if path == "-/v1/search" {
         // Parse query string for text= and size= params
@@ -62,7 +63,7 @@ pub async fn try_handle_repository_path(
         if let [scope, pkg] = parts.as_slice() {
             // @scope/package → packument
             let package = format!("@{scope}/{pkg}");
-            return Some(get_packument_inner_from_config(state, config, &package).await);
+            return Some(get_packument_inner_from_config(state, config, &package, origin).await);
         }
         if let [scope, pkg, "-", filename] = parts.as_slice() {
             // @scope/package/-/filename → tarball download
@@ -83,7 +84,7 @@ pub async fn try_handle_repository_path(
 
     // Unscoped package → packument (must not contain '/')
     if !path.is_empty() && !path.contains('/') {
-        return Some(get_packument_inner_from_config(state, config, path).await);
+        return Some(get_packument_inner_from_config(state, config, path, origin).await);
     }
 
     None
@@ -93,11 +94,12 @@ async fn get_packument_inner_from_config(
     state: &FormatState,
     config: &RepoConfig,
     package: &str,
+    origin: &str,
 ) -> Response {
     match config.repo_type() {
-        RepoType::Hosted => hosted_packument(state, &config.name, package).await,
-        RepoType::Cache => cache_packument(state, config, package).await,
-        RepoType::Proxy => proxy_packument(state, config, package).await,
+        RepoType::Hosted => hosted_packument(state, &config.name, package, origin).await,
+        RepoType::Cache => cache_packument(state, config, package, origin).await,
+        RepoType::Proxy => proxy_packument(state, config, package, origin).await,
     }
 }
 
@@ -228,7 +230,12 @@ async fn download_tarball_inner_from_config(
     }
 }
 
-async fn hosted_packument(state: &FormatState, repo_name: &str, package: &str) -> Response {
+async fn hosted_packument(
+    state: &FormatState,
+    repo_name: &str,
+    package: &str,
+    origin: &str,
+) -> Response {
     let (blobs, blob_config) =
         match depot_core::api_helpers::resolve_repo_blob_store(state, repo_name).await {
             Ok(b) => b,
@@ -243,7 +250,7 @@ async fn hosted_packument(state: &FormatState, repo_name: &str, package: &str) -
         updater: &state.updater,
     };
 
-    let base_url = format!("/repository/{repo_name}");
+    let base_url = format!("{origin}/repository/{repo_name}");
     match store.get_packument(package, &base_url).await {
         Ok(Some(packument)) => (
             StatusCode::OK,
@@ -256,7 +263,12 @@ async fn hosted_packument(state: &FormatState, repo_name: &str, package: &str) -
     }
 }
 
-async fn cache_packument(state: &FormatState, config: &RepoConfig, package: &str) -> Response {
+async fn cache_packument(
+    state: &FormatState,
+    config: &RepoConfig,
+    package: &str,
+    origin: &str,
+) -> Response {
     let RepoKind::Cache {
         ref upstream_url,
         ref upstream_auth,
@@ -290,7 +302,7 @@ async fn cache_packument(state: &FormatState, config: &RepoConfig, package: &str
             cache_upstream_packument(state, config, package, &upstream_packument).await;
 
             // Rewrite tarball URLs and serve
-            let base_url = format!("/repository/{}", config.name);
+            let base_url = format!("{origin}/repository/{}", config.name);
             let rewritten = rewrite_packument_urls(&upstream_packument, &base_url);
             (
                 StatusCode::OK,
@@ -303,7 +315,7 @@ async fn cache_packument(state: &FormatState, config: &RepoConfig, package: &str
         Err(e) => {
             tracing::warn!(error = %e, "upstream fetch failed, serving stale cache");
             // Serve stale cache
-            let base_url = format!("/repository/{}", config.name);
+            let base_url = format!("{origin}/repository/{}", config.name);
             match store.get_packument(package, &base_url).await {
                 Ok(Some(packument)) => (
                     StatusCode::OK,
@@ -444,9 +456,24 @@ fn rewrite_packument_urls(packument: &serde_json::Value, base_url: &str) -> serd
     result
 }
 
-async fn proxy_packument(state: &FormatState, config: &RepoConfig, package: &str) -> Response {
+async fn proxy_packument(
+    state: &FormatState,
+    config: &RepoConfig,
+    package: &str,
+    origin: &str,
+) -> Response {
     let RepoKind::Proxy { ref members, .. } = config.kind else {
         return DepotError::Internal("expected proxy repo kind".into()).into_response();
+    };
+
+    // The cached merged packument is stored with a host-relative base so it can
+    // be served to any external hostname; tarball URLs are rewritten to the
+    // absolute request origin on every serve (both cache hits and fresh merges).
+    let absolute_base = format!("{origin}/repository/{}", config.name);
+    let serve_rewritten = |json: &str| -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let rewritten = rewrite_packument_urls(&value, &absolute_base);
+        serde_json::to_string(&rewritten).ok()
     };
 
     let proxy_blobs = match state.blob_store(&config.store).await {
@@ -468,10 +495,11 @@ async fn proxy_packument(state: &FormatState, config: &RepoConfig, package: &str
             None => true, // no stale flag means nothing changed
         };
         if is_fresh {
+            let body = serve_rewritten(&json).unwrap_or(json);
             return (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
-                json,
+                body,
             )
                 .into_response();
         }
@@ -543,13 +571,14 @@ async fn proxy_packument(state: &FormatState, config: &RepoConfig, package: &str
 
     let json = serde_json::to_string(&packument).unwrap_or_default();
 
-    // Cache the merged result on the proxy.
+    // Cache the merged result on the proxy (host-relative; see absolute_base above).
     let _ = proxy_store.store_cached_packument(package, &json).await;
 
+    let body = serve_rewritten(&json).unwrap_or(json);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        json,
+        body,
     )
         .into_response()
 }
@@ -582,6 +611,49 @@ pub fn extract_version_from_filename(filename: &str, package_name: &str) -> Opti
         }
     }
     None
+}
+
+/// Split an absolute `http(s)://authority/rest` URL into `(scheme, authority, path)`.
+/// Returns `None` for relative URLs.
+fn split_absolute_url(url: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, after) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = after.split_once('/').map_or(after, |(a, _)| a);
+    let path = &url[scheme.len() + 3 + authority.len()..];
+    Some((scheme, authority, path))
+}
+
+/// Decide which URL to fetch a tarball's bytes from, given the registry-reported
+/// `tarball_url` (which may be relative or absolute) and the cache's configured
+/// `upstream_url`.
+///
+/// - Relative URLs are resolved against the upstream origin.
+/// - Absolute URLs that point at the **same host** as `upstream_url` are
+///   re-pointed to the upstream's own scheme/host. This keeps caching another
+///   Artifact Depot working even when that upstream self-reports a different
+///   scheme than the cache reaches it over (e.g. a plain-HTTP depot-on-depot
+///   setup where the upstream defaults its packument origin to `https`).
+/// - Absolute URLs on a different host (a genuine CDN/registry) are used as-is.
+fn resolve_upstream_tarball_url(tarball_url: &str, upstream_url: &str) -> String {
+    let upstream_origin = match split_absolute_url(upstream_url) {
+        Some((scheme, authority, _)) => format!("{scheme}://{authority}"),
+        None => return tarball_url.to_string(),
+    };
+    match split_absolute_url(tarball_url) {
+        Some((_, authority, path)) => {
+            let upstream_authority = upstream_origin.split_once("://").map(|(_, a)| a);
+            if upstream_authority == Some(authority) {
+                // Same host — trust the upstream's scheme/host, keep the path.
+                format!("{upstream_origin}{path}")
+            } else {
+                // Different host (real CDN/registry) — use as reported.
+                tarball_url.to_string()
+            }
+        }
+        None => format!("{upstream_origin}{tarball_url}"),
+    }
 }
 
 fn npm_stream_response(
@@ -682,19 +754,8 @@ async fn cache_download(
     let tarball_url = upstream_tarball_url
         .unwrap_or_else(|| format!("{}/{name}/-/{filename}", upstream_url.trim_end_matches('/')));
 
-    // Resolve relative URLs against the upstream base
-    let url = if tarball_url.starts_with("http://") || tarball_url.starts_with("https://") {
-        tarball_url
-    } else if let Some((scheme, after_scheme)) = upstream_url.split_once("://") {
-        // Extract origin from upstream_url
-        let host = after_scheme
-            .split_once('/')
-            .map_or(after_scheme, |(h, _)| h);
-        let origin = format!("{scheme}://{host}");
-        format!("{origin}{tarball_url}")
-    } else {
-        tarball_url
-    };
+    // Resolve the URL we'll actually fetch the tarball bytes from.
+    let url = resolve_upstream_tarball_url(&tarball_url, upstream_url);
 
     {
         match npm::fetch_upstream_tarball(&state.http, &url, upstream_auth.as_ref()).await {
@@ -1006,4 +1067,60 @@ async fn search_packages(
         serde_json::to_string(&result).unwrap_or_default(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_absolute_url_parts() {
+        assert_eq!(
+            split_absolute_url("https://host:443/a/b/-/c.tgz"),
+            Some(("https", "host:443", "/a/b/-/c.tgz"))
+        );
+        // No path component.
+        assert_eq!(
+            split_absolute_url("http://host"),
+            Some(("http", "host", ""))
+        );
+        // Relative paths are not absolute URLs.
+        assert_eq!(split_absolute_url("/repository/npm/pkg"), None);
+        // Non-http schemes are rejected.
+        assert_eq!(split_absolute_url("file:///etc/passwd"), None);
+    }
+
+    #[test]
+    fn resolve_relative_against_upstream_origin() {
+        // A relative tarball path resolves against the upstream origin, dropping
+        // any path component of the upstream URL.
+        assert_eq!(
+            resolve_upstream_tarball_url("/pkg/-/pkg-1.0.0.tgz", "https://registry.npmjs.org"),
+            "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn resolve_same_host_repoints_to_upstream_scheme() {
+        // Caching another Artifact Depot reached over plain HTTP: the upstream
+        // self-reports https (its default), but the cache must fetch over the
+        // scheme it actually reaches the upstream on.
+        assert_eq!(
+            resolve_upstream_tarball_url(
+                "https://127.0.0.1:8080/repository/npm-up/pkg/-/pkg-1.0.0.tgz",
+                "http://127.0.0.1:8080/repository/npm-up"
+            ),
+            "http://127.0.0.1:8080/repository/npm-up/pkg/-/pkg-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn resolve_different_host_absolute_used_as_is() {
+        // A genuine CDN/registry on a different host is fetched as reported.
+        let cdn = "https://cdn.example.com/pkg/-/pkg-1.0.0.tgz";
+        assert_eq!(
+            resolve_upstream_tarball_url(cdn, "https://registry.npmjs.org"),
+            cdn
+        );
+    }
 }

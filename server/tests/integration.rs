@@ -2758,20 +2758,30 @@ async fn test_npm_cache_tarball_download() {
         .unwrap();
     assert!(resp.status().is_success());
 
-    // First, fetch packument to populate cache metadata
+    // First, fetch packument to populate cache metadata. The tarball URL is now
+    // absolute (npm requires it); simulate a reverse proxy forwarding to this
+    // plain-HTTP test server so the emitted origin points back at it (production
+    // sits behind a TLS-terminating proxy that forwards `https`).
+    let server_port = _server.url.rsplit(':').next().unwrap_or("80");
     let resp = http
         .get(format!("{}/repository/npm-cache-dl/dl-test", _server.url))
         .bearer_auth(&token)
+        .header("x-forwarded-proto", "http")
+        .header("x-forwarded-port", server_port)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let packument: Value = resp.json().await.unwrap();
 
-    // Extract the tarball URL from the packument
+    // Extract the tarball URL from the packument — must be a fully-qualified URL.
     let tarball_url = packument["versions"]["1.0.0"]["dist"]["tarball"]
         .as_str()
         .unwrap();
+    assert!(
+        tarball_url.starts_with("http://") || tarball_url.starts_with("https://"),
+        "tarball URL must be absolute, got: {tarball_url}"
+    );
 
     // Download tarball through cache
     let full_url = if tarball_url.starts_with("http") {
