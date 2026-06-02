@@ -993,9 +993,13 @@ async fn test_docker_gc_manifest_list_children_protected() {
             "directly tagged manifest {digest} should survive"
         );
     }
-    // Most untagged manifests should be deleted. The BF is sized for
-    // tag_digests.len() but also receives manifest list child digests,
-    // raising the effective FP rate slightly. Allow up to 10%.
+    // Most untagged manifests should be deleted. The tag bloom filter is
+    // sized for tag_digests + manifest-list child digests (everything
+    // inserted), so the effective false-positive rate stays near the
+    // nominal 1%. A handful of survivors are tolerable false positives;
+    // a 5% cap leaves headroom for random sip-key variance while still
+    // catching a regression that under-sizes the filter (which inflated
+    // the rate to ~10%).
     let mut untagged_survivors = 0usize;
     for i in 0..untagged_count {
         let digest = format!("sha256:untagged{i:04}");
@@ -1006,7 +1010,7 @@ async fn test_docker_gc_manifest_list_children_protected() {
             untagged_survivors += 1;
         }
     }
-    let max_allowed = untagged_count / 10; // 10%
+    let max_allowed = untagged_count / 20; // 5%
     assert!(
         untagged_survivors <= max_allowed,
         "too many untagged manifests survived: {untagged_survivors}/{untagged_count} (max {max_allowed})"
