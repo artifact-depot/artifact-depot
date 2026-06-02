@@ -9,7 +9,6 @@ use depot_core::error::{self, DepotError};
 pub fn generate_gpg_keypair(repo_name: &str) -> error::Result<(String, String)> {
     use pgp::composed::{KeyType, SecretKeyParamsBuilder};
     use pgp::crypto::sym::SymmetricKeyAlgorithm;
-    use pgp::types::Password;
 
     let mut rng = rand::thread_rng();
 
@@ -25,13 +24,12 @@ pub fn generate_gpg_keypair(repo_name: &str) -> error::Result<(String, String)> 
         .build()
         .map_err(|e| DepotError::BadRequest(format!("failed to build key params: {e}")))?;
 
-    let secret_key = secret_key_params
+    // pgp 0.19's generate() self-signs the key and returns a SignedSecretKey
+    // directly (the separate SecretKey::sign step from 0.18 was removed). With
+    // no passphrase set on the builder it defaults to an unprotected key.
+    let signed_key = secret_key_params
         .generate(&mut rng)
         .map_err(|e| DepotError::BadRequest(format!("failed to generate key: {e}")))?;
-
-    let signed_key = secret_key
-        .sign(&mut rng, &Password::empty())
-        .map_err(|e| DepotError::BadRequest(format!("failed to self-sign key: {e}")))?;
 
     let private_armor = signed_key
         .to_armored_string(Default::default())
