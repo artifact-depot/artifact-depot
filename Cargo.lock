@@ -868,12 +868,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2c54ff287cfc0a34f38a6b832ea1bd8e448a330b3e40a50859e6488bee07f22"
 
 [[package]]
-name = "bitfield"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d7e60934ceec538daadb9d8432424ed043a904d8e0243f3c6446bce549a46ac"
-
-[[package]]
 name = "bitfields"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -981,16 +975,6 @@ checksum = "e412e2cd0f2b2d93e02543ceae7917b3c70331573df19ee046bcbc35e45e87d7"
 dependencies = [
  "byteorder",
  "cipher",
-]
-
-[[package]]
-name = "bstr"
-version = "1.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
-dependencies = [
- "memchr",
- "serde",
 ]
 
 [[package]]
@@ -1402,7 +1386,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "digest 0.10.7",
- "fiat-crypto 0.2.9",
+ "fiat-crypto",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -1624,7 +1608,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "lzma-rs",
- "pgp 0.14.2",
+ "pgp",
  "rand 0.8.5",
  "ruzstd",
  "serde",
@@ -1999,32 +1983,11 @@ dependencies = [
 
 [[package]]
 name = "derive_more"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a9b99b9cbbe49445b21764dc0625032a89b145a2642e67603e1c936f5458d05"
-dependencies = [
- "derive_more-impl 1.0.0",
-]
-
-[[package]]
-name = "derive_more"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
 dependencies = [
- "derive_more-impl 2.1.1",
-]
-
-[[package]]
-name = "derive_more-impl"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb7330aeadfbe296029522e6c40f315320aba36fc43a5b3632f3795348f3bd22"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
- "unicode-xid",
+ "derive_more-impl",
 ]
 
 [[package]]
@@ -2193,17 +2156,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ed448-goldilocks"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87b5fa9e9e3dd5fe1369f380acd3dcdfa766dbd0a1cd5b048fb40e38a6a78e79"
-dependencies = [
- "fiat-crypto 0.1.20",
- "hex",
- "subtle",
-]
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2327,12 +2279,6 @@ dependencies = [
  "rand_core 0.6.4",
  "subtle",
 ]
-
-[[package]]
-name = "fiat-crypto"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e825f6987101665dea6ec934c09ec6d721de7bc1bf92248e1d5810c8cd636b77"
 
 [[package]]
 name = "fiat-crypto"
@@ -3144,12 +3090,6 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
-
-[[package]]
-name = "iter-read"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071ed4cc1afd86650602c7b11aa2e1ce30762a1c27193201cb5cee9c6ebb1294"
 
 [[package]]
 name = "itertools"
@@ -4041,73 +3981,6 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pgp"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1877a97fd422433220ad272eb008ec55691944b1200e9eb204e3cb2cb69d34e9"
-dependencies = [
- "aes",
- "aes-gcm",
- "aes-kw",
- "argon2",
- "base64",
- "bitfield",
- "block-padding",
- "blowfish",
- "bstr",
- "buffer-redux",
- "byteorder",
- "camellia",
- "cast5",
- "cfb-mode",
- "chrono",
- "cipher",
- "const-oid 0.9.6",
- "crc24",
- "curve25519-dalek",
- "derive_builder",
- "derive_more 1.0.0",
- "des",
- "digest 0.10.7",
- "dsa",
- "eax",
- "ecdsa 0.16.9",
- "ed25519-dalek",
- "elliptic-curve 0.13.8",
- "flate2",
- "generic-array",
- "hex",
- "hkdf",
- "idea",
- "iter-read",
- "k256",
- "log",
- "md-5 0.10.6",
- "nom 7.1.3",
- "num-bigint-dig",
- "num-traits",
- "num_enum",
- "ocb3",
- "p256 0.13.2",
- "p384",
- "p521",
- "rand 0.8.5",
- "ripemd",
- "rsa",
- "sha1 0.10.6",
- "sha1-checked",
- "sha2 0.10.9",
- "sha3",
- "signature 2.2.0",
- "smallvec",
- "thiserror 1.0.69",
- "twofish",
- "x25519-dalek",
- "x448",
- "zeroize",
-]
-
-[[package]]
-name = "pgp"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66d4a27a4d5cfd4e185ddd3eff94dee0f611c4c3e776422254237c54c336c160"
@@ -4135,7 +4008,7 @@ dependencies = [
  "curve25519-dalek",
  "cx448",
  "derive_builder",
- "derive_more 2.1.1",
+ "derive_more",
  "des",
  "digest 0.10.7",
  "dsa",
@@ -4503,12 +4376,6 @@ dependencies = [
 
 [[package]]
 name = "rand_core"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90bde5296fc891b0cef12a6d03ddccc162ce7b2aff54160af9338f8d40df6d19"
-
-[[package]]
-name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
@@ -4750,7 +4617,7 @@ dependencies = [
  "num",
  "num-derive",
  "num-traits",
- "pgp 0.18.0",
+ "pgp",
  "sha1 0.10.6",
  "sha2 0.10.9",
  "sha3",
@@ -6797,17 +6664,6 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "zeroize",
-]
-
-[[package]]
-name = "x448"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4cd07d4fae29e07089dbcacf7077cd52dce7760125ca9a4dd5a35ca603ffebb"
-dependencies = [
- "ed448-goldilocks",
- "hex",
- "rand_core 0.5.1",
 ]
 
 [[package]]
