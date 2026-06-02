@@ -480,10 +480,13 @@ async fn test_packument_tarball_url_format_unscoped() {
     let tarball_url = body["versions"]["3.0.0"]["dist"]["tarball"]
         .as_str()
         .unwrap();
-    // Unscoped: /repository/{repo}/{name}/-/{name}-{version}.tgz
+    // Must be an absolute URL — npm 7+ treats a leading-slash tarball as a
+    // local file path and every install fails with ENOENT.
+    // Unscoped: {origin}/repository/{repo}/{name}/-/{name}-{version}.tgz
+    // With no Host/X-Forwarded-Proto headers the origin defaults to https://localhost.
     assert_eq!(
         tarball_url,
-        "/repository/npm-url/url-pkg/-/url-pkg-3.0.0.tgz"
+        "https://localhost/repository/npm-url/url-pkg/-/url-pkg-3.0.0.tgz"
     );
 }
 
@@ -511,10 +514,47 @@ async fn test_packument_tarball_url_format_scoped() {
     let tarball_url = body["versions"]["1.2.3"]["dist"]["tarball"]
         .as_str()
         .unwrap();
-    // Scoped: /repository/{repo}/@scope/pkg/-/{bare_name}-{version}.tgz
+    // Scoped: {origin}/repository/{repo}/@scope/pkg/-/{bare_name}-{version}.tgz
     assert_eq!(
         tarball_url,
-        "/repository/npm-url-s/@scope/mypkg/-/mypkg-1.2.3.tgz"
+        "https://localhost/repository/npm-url-s/@scope/mypkg/-/mypkg-1.2.3.tgz"
+    );
+}
+
+/// The packument's `dist.tarball` must be a fully-qualified absolute URL rooted
+/// at the externally-reachable origin, derived from `Host`/`X-Forwarded-Proto`
+/// when behind a reverse proxy. A relative path breaks all npm/npx installs
+/// because npm 7+ interprets a leading-slash tarball as a local file path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_packument_tarball_url_honors_forwarded_headers() {
+    let app = TestApp::new().await;
+    app.create_npm_repo("npm-fwd").await;
+
+    let req = npm_publish_request(&app, "npm-fwd", "fwd-pkg", "2.1.0", b"data");
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Simulate a request arriving through a TLS-terminating reverse proxy.
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/repository/npm-fwd/fwd-pkg")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", app.admin_token()),
+        )
+        .header(header::HOST, "repository.mdh.quantum.com")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let tarball_url = body["versions"]["2.1.0"]["dist"]["tarball"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        tarball_url,
+        "https://repository.mdh.quantum.com/repository/npm-fwd/fwd-pkg/-/fwd-pkg-2.1.0.tgz"
     );
 }
 

@@ -87,6 +87,18 @@ pub fn request_scheme(headers: &HeaderMap) -> &str {
         .unwrap_or("https")
 }
 
+/// Build the external-facing origin (`scheme://host`) from request headers.
+///
+/// Combines [`request_scheme`] and [`external_host`] so callers that need a
+/// fully-qualified URL prefix (e.g. npm `dist.tarball`) get correct results
+/// behind a reverse proxy. Honors `X-Forwarded-Proto`/`X-Forwarded-Port` and
+/// the `Host` header, falling back to `uri_authority` then `localhost`.
+pub fn external_origin(headers: &HeaderMap, uri_authority: Option<&str>) -> String {
+    let scheme = request_scheme(headers);
+    let host = external_host(headers, scheme, uri_authority);
+    format!("{scheme}://{host}")
+}
+
 /// Determine the external-facing host authority from request headers.
 ///
 /// When behind a reverse proxy (e.g., AWS ALB terminating HTTPS on 443 and
