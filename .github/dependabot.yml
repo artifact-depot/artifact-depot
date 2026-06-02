@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Artifact Depot Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Dependabot configuration.
 #
 # Artifact Depot is a single Cargo workspace with one shared Cargo.lock at the
