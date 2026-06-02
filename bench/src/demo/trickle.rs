@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -41,7 +41,7 @@ const WEIGHTED_OPS: &[(Op, u32)] = &[
 
 fn pick_op(rng: &mut ChaCha8Rng) -> Op {
     let total: u32 = WEIGHTED_OPS.iter().map(|(_, w)| w).sum();
-    let mut pick = rng.gen_range(0..total);
+    let mut pick = rng.random_range(0..total);
     for (op, weight) in WEIGHTED_OPS {
         if pick < *weight {
             return *op;
@@ -127,7 +127,7 @@ pub async fn run_trickle(client: &DepotClient) -> Result<()> {
     );
 
     let has_docker = !docker_pool.is_empty();
-    let mut rng = ChaCha8Rng::from_entropy();
+    let mut rng = ChaCha8Rng::from_os_rng();
 
     let path_gens: Vec<PathGen> = vec![
         names::gen_release_path,
@@ -159,7 +159,7 @@ pub async fn run_trickle(client: &DepotClient) -> Result<()> {
 
         // Skip docker ops if no docker content exists
         if !has_docker && matches!(op, Op::DockerPull | Op::DockerHead | Op::DockerHeadBlob) {
-            tokio::time::sleep(Duration::from_secs(rng.gen_range(2..=5))).await;
+            tokio::time::sleep(Duration::from_secs(rng.random_range(2..=5))).await;
             continue;
         }
 
@@ -167,7 +167,7 @@ pub async fn run_trickle(client: &DepotClient) -> Result<()> {
         if raw_pool.is_empty()
             && matches!(op, Op::RawGet | Op::RawHead | Op::RawDelete | Op::RawList)
         {
-            tokio::time::sleep(Duration::from_secs(rng.gen_range(2..=5))).await;
+            tokio::time::sleep(Duration::from_secs(rng.random_range(2..=5))).await;
             continue;
         }
 
@@ -227,10 +227,10 @@ pub async fn run_trickle(client: &DepotClient) -> Result<()> {
 
             Op::RawDelete => {
                 if raw_pool.len() < 20 {
-                    tokio::time::sleep(Duration::from_secs(rng.gen_range(2..=5))).await;
+                    tokio::time::sleep(Duration::from_secs(rng.random_range(2..=5))).await;
                     continue;
                 }
-                let idx = rng.gen_range(0..raw_pool.len());
+                let idx = rng.random_range(0..raw_pool.len());
                 let (repo, path) = raw_pool[idx].clone();
                 match client.delete_raw(&repo, &path).await {
                     Ok(()) => {
@@ -353,6 +353,6 @@ pub async fn run_trickle(client: &DepotClient) -> Result<()> {
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(rng.gen_range(2..=5))).await;
+        tokio::time::sleep(Duration::from_secs(rng.random_range(2..=5))).await;
     }
 }

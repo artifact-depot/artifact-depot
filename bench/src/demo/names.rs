@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use rand::Rng;
 
 /// Raw repository definitions with name and artifact style.
@@ -118,7 +118,7 @@ pub fn gen_release_path(rng: &mut dyn RngCore, _index: usize) -> (String, &'stat
     let group = GROUPS.choose(rng).unwrap();
     let artifact = RAW_ARTIFACTS.choose(rng).unwrap();
     let version = VERSIONS.choose(rng).unwrap();
-    let ext = if rng.gen_bool(0.7) { "jar" } else { "tar.gz" };
+    let ext = if rng.random_bool(0.7) { "jar" } else { "tar.gz" };
     let path = format!(
         "{}/{}/{}/{}-{}.{}",
         group, artifact, version, artifact, version, ext
@@ -217,9 +217,9 @@ pub fn docker_tags(rng: &mut dyn RngCore, repo_name: &str, count: usize) -> Vec<
         }
     } else {
         for _ in 0..count {
-            let major = rng.gen_range(0u32..5);
-            let minor = rng.gen_range(0u32..20);
-            let patch = rng.gen_range(0u32..100);
+            let major = rng.random_range(0u32..5);
+            let minor = rng.random_range(0u32..20);
+            let patch = rng.random_range(0u32..100);
             tags.push(format!("{}.{}.{}", major, minor, patch));
         }
     }

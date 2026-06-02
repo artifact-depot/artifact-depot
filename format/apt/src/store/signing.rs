@@ -7,9 +7,9 @@ use depot_core::error::{self, DepotError};
 /// Generate a GPG key pair for signing APT repos.
 /// Returns (private_key_armor, public_key_armor).
 pub fn generate_gpg_keypair(repo_name: &str) -> error::Result<(String, String)> {
-    use pgp::composed::key::SecretKeyParamsBuilder;
-    use pgp::composed::KeyType;
+    use pgp::composed::{KeyType, SecretKeyParamsBuilder};
     use pgp::crypto::sym::SymmetricKeyAlgorithm;
+    use pgp::types::Password;
 
     let mut rng = rand::thread_rng();
 
@@ -30,14 +30,14 @@ pub fn generate_gpg_keypair(repo_name: &str) -> error::Result<(String, String)> 
         .map_err(|e| DepotError::BadRequest(format!("failed to generate key: {e}")))?;
 
     let signed_key = secret_key
-        .sign(&mut rng, String::new)
+        .sign(&mut rng, &Password::empty())
         .map_err(|e| DepotError::BadRequest(format!("failed to self-sign key: {e}")))?;
 
     let private_armor = signed_key
         .to_armored_string(Default::default())
         .map_err(|e| DepotError::BadRequest(format!("failed to armor private key: {e}")))?;
 
-    let public_key: pgp::composed::signed_key::SignedPublicKey = signed_key.into();
+    let public_key: pgp::composed::SignedPublicKey = signed_key.into();
     let public_armor = public_key
         .to_armored_string(Default::default())
         .map_err(|e| DepotError::BadRequest(format!("failed to armor public key: {e}")))?;
@@ -50,20 +50,23 @@ pub(super) fn sign_release(
     signing_key_armor: &str,
     release_text: &str,
 ) -> error::Result<(String, String)> {
-    use pgp::composed::cleartext::CleartextSignedMessage;
-    use pgp::composed::signed_key::SignedSecretKey;
-    use pgp::Deserializable;
+    use pgp::composed::{
+        CleartextSignedMessage, DetachedSignature, Deserializable, SignedSecretKey,
+    };
+    use pgp::types::Password;
 
     let mut rng = rand::thread_rng();
 
     let (secret_key, _) = SignedSecretKey::from_string(signing_key_armor)
         .map_err(|e| DepotError::BadRequest(format!("failed to parse signing key: {e}")))?;
 
-    // Create clearsigned InRelease using ClearTextSignedMessage
+    // Create clearsigned InRelease using ClearTextSignedMessage.
+    // SignedSecretKey derefs to the underlying signing key (SecretKeyTrait).
     let clearsigned =
-        CleartextSignedMessage::sign(&mut rng, release_text, &secret_key, String::new).map_err(
-            |e| DepotError::BadRequest(format!("failed to create clearsigned message: {e}")),
-        )?;
+        CleartextSignedMessage::sign(&mut rng, release_text, &*secret_key, &Password::empty())
+            .map_err(|e| {
+                DepotError::BadRequest(format!("failed to create clearsigned message: {e}"))
+            })?;
 
     let in_release = clearsigned
         .to_armored_string(Default::default())
@@ -73,9 +76,12 @@ pub(super) fn sign_release(
     // Re-parse for the standalone signature
     let sigs = clearsigned.signatures();
     let detached_armor = if let Some(sig) = sigs.first() {
-        sig.to_armored_string(Default::default()).map_err(|e| {
-            DepotError::BadRequest(format!("failed to armor detached signature: {e}"))
-        })?
+        // pgp 0.18 armors standalone signatures via DetachedSignature.
+        DetachedSignature::new(sig.clone())
+            .to_armored_string(Default::default())
+            .map_err(|e| {
+                DepotError::BadRequest(format!("failed to armor detached signature: {e}"))
+            })?
     } else {
         String::new()
     };
