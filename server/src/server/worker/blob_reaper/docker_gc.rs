@@ -199,12 +199,12 @@ pub(super) async fn docker_gc(
     // --- Phase B: Delete unreferenced manifests (if policy enabled) ---
 
     if repo.format_config.cleanup_untagged_manifests() {
-        let mut tag_bf = Bloom::new_for_fp_rate(tag_digests.len().max(1), 0.01);
-        for digest in &tag_digests {
-            tag_bf.set(digest.as_bytes());
-        }
-
-        // Also collect digests referenced by manifest lists (multi-arch).
+        // Collect digests referenced by manifest lists (multi-arch) before
+        // sizing the bloom filter — both these and the tag digests are
+        // inserted, so the filter must be dimensioned for their combined
+        // count to keep the false-positive rate near the nominal 1%.
+        // Sizing for tag_digests alone over-fills the filter and inflates
+        // the FP rate, leaving untagged manifests wrongly protected.
         let mut manifest_list_child_digests = Vec::new();
         for (_, _, ref record) in &manifests {
             let ct = &record.content_type;
@@ -215,6 +215,12 @@ pub(super) async fn docker_gc(
                     }
                 }
             }
+        }
+
+        let bf_capacity = (tag_digests.len() + manifest_list_child_digests.len()).max(1);
+        let mut tag_bf = Bloom::new_for_fp_rate(bf_capacity, 0.01);
+        for digest in &tag_digests {
+            tag_bf.set(digest.as_bytes());
         }
         for digest in &manifest_list_child_digests {
             tag_bf.set(digest.as_bytes());
