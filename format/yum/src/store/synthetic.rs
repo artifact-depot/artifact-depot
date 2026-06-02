@@ -18,7 +18,7 @@ pub fn build_synthetic_rpm(
         .description(format!("{summary} package"))
         .with_file_contents(
             b"#!/bin/sh\necho hello\n".to_vec(),
-            rpm::FileOptions::new("/usr/bin/hello").mode(0o755),
+            rpm::FileOptions::new("/usr/bin/hello").permissions(0o755),
         )
         .map_err(|e| DepotError::BadRequest(format!("failed to add file: {e}")))?
         .add_changelog_entry(

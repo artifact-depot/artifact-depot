@@ -105,7 +105,7 @@ pub fn parse_rpm(
         Ok(entries) => entries
             .iter()
             .map(|e| {
-                let file_type = if matches!(e.mode, rpm::FileMode::Dir { .. }) {
+                let file_type = if e.mode.file_type() == rpm::FileType::Dir {
                     "dir"
                 } else if e.flags.contains(rpm::FileFlags::GHOST) {
                     "ghost"
