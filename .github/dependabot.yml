@@ -1,0 +1,21 @@
+# Dependabot configuration.
+#
+# Artifact Depot is a single Cargo workspace with one shared Cargo.lock at the
+# root. Scoping the cargo ecosystem to "/" makes Dependabot read the whole
+# workspace (root + every member: server, core, ui, kv/*, blob/*, format/*),
+# so all member dependencies are covered by this one entry.
+#
+# We deliberately do NOT enumerate individual members (e.g. /server) as
+# separate directories: it is redundant (shared lockfile) and trips a
+# Dependabot workspace bug that aborts the run with "No Cargo.toml!".
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      cargo:
+        patterns:
+          - "*"
