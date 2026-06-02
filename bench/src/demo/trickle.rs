@@ -97,23 +97,21 @@ pub async fn run_trickle(client: &DepotClient) -> Result<()> {
         }
     }
 
-    // Discover docker repos, images, and tags
+    // Discover docker repos, images, and tags. The per-repo `_catalog`
+    // returns image names within that repo, per Docker Registry V2 semantics.
     let mut docker_pool: Vec<DockerTarget> = Vec::new();
 
     for repo in &repos {
         if repo.format == "docker" {
-            if let Ok(catalog) = client.docker_catalog().await {
-                for entry in &catalog {
-                    // Catalog entries are "repo/image" — filter to this repo
-                    if let Some(image) = entry.strip_prefix(&format!("{}/", repo.name)) {
-                        if let Ok(tags) = client.docker_list_tags(&repo.name, image).await {
-                            for tag in tags {
-                                docker_pool.push(DockerTarget {
-                                    repo: repo.name.clone(),
-                                    image: image.to_string(),
-                                    tag,
-                                });
-                            }
+            if let Ok(images) = client.docker_repo_catalog(&repo.name).await {
+                for image in &images {
+                    if let Ok(tags) = client.docker_list_tags(&repo.name, image).await {
+                        for tag in tags {
+                            docker_pool.push(DockerTarget {
+                                repo: repo.name.clone(),
+                                image: image.clone(),
+                                tag,
+                            });
                         }
                     }
                 }

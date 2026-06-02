@@ -17,9 +17,11 @@ use depot_core::format_state::FormatState;
 
 use super::blobs::{do_get_blob, do_head_blob};
 use super::manifests::{do_delete_manifest, do_get_manifest, do_head_manifest, do_put_manifest};
-use super::tags::do_list_tags;
-use super::types::{CatalogResponse, DockerPaginationParams, UploadInitParams};
+use super::tags::{do_list_tags, paginate_catalog};
+use super::types::{DockerPaginationParams, UploadInitParams};
 use super::uploads::{do_complete_upload, do_patch_upload, do_start_upload};
+
+use depot_core::store::kv::Capability;
 
 /// Maximum manifest body size (32 MiB), matching the Docker manifest route limit.
 const MANIFEST_BODY_LIMIT: usize = 32 * 1024 * 1024;
@@ -107,10 +109,7 @@ async fn dispatch(
             if *method != Method::GET {
                 return StatusCode::METHOD_NOT_ALLOWED.into_response();
             }
-            axum::Json(CatalogResponse {
-                repositories: vec![repo_name.to_string()],
-            })
-            .into_response()
+            do_repo_catalog(state, username, repo_name, query, headers, uri_authority).await
         }
 
         // /v2/{name}/tags/list
@@ -516,6 +515,48 @@ async fn do_token_exchange(state: &FormatState, req_headers: &HeaderMap) -> Resp
 
 fn not_found() -> Response {
     super::helpers::docker_error("NAME_UNKNOWN", "not found", StatusCode::NOT_FOUND)
+}
+
+/// Handle `GET /repository/{repo}/v2/_catalog` — Docker Registry V2 catalog
+/// scoped to a single depot repo. Returns the set of image names whose tag
+/// or manifest records live within `repo_name`, paginated with `n`/`last`.
+async fn do_repo_catalog(
+    state: &FormatState,
+    username: &str,
+    repo_name: &str,
+    query: Option<&str>,
+    headers: &HeaderMap,
+    uri_authority: Option<&str>,
+) -> Response {
+    if let Err(r) = super::helpers::check_docker_permission(
+        state,
+        username,
+        repo_name,
+        Capability::Read,
+        headers,
+        uri_authority,
+    )
+    .await
+    {
+        return r;
+    }
+    if let Err(r) = super::helpers::validate_docker_repo(state, repo_name).await {
+        return r;
+    }
+
+    let images = match crate::store::list_image_names(state.kv.as_ref(), repo_name).await {
+        Ok(i) => i,
+        Err(e) => {
+            return super::helpers::docker_error(
+                "UNKNOWN",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    };
+    let pagination = parse_pagination(query);
+    let link_path = format!("/repository/{}/v2/_catalog", repo_name);
+    paginate_catalog(images, &pagination, &link_path)
 }
 
 /// Extract a single query parameter value by key, percent-decoding the value.

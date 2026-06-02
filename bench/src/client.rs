@@ -993,6 +993,24 @@ impl DepotClient {
         Ok(catalog.repositories)
     }
 
+    /// `GET /repository/{repo}/v2/_catalog` — list image names within a
+    /// specific depot repo.
+    pub async fn docker_repo_catalog(&self, repo: &str) -> Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(format!("{}/repository/{}/v2/_catalog", self.base_url, repo))
+            .header("Authorization", format!("Basic {}", self.basic_auth))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("docker repo catalog failed ({}): {}", status, body);
+        }
+        let catalog: CatalogResponse = resp.json().await?;
+        Ok(catalog.repositories)
+    }
+
     pub async fn docker_pull_manifest_accept(
         &self,
         repo: &str,

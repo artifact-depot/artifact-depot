@@ -566,6 +566,66 @@ impl<'a> DockerStore<'a> {
     }
 }
 
+/// Extract the image-name portion of a docker artifact key.
+///
+/// Docker tag and manifest records live at `<image>/_tags/<tag>` and
+/// `<image>/_manifests/<digest>`. Image names may contain slashes
+/// (e.g. `qkp/quantum_leaf`), so we locate the boundary marker rather
+/// than splitting on the first `/`.
+///
+/// Returns `None` for keys with no image namespace (e.g. `_blobs/...`,
+/// or the single-image-hosted-repo shapes `_tags/<tag>` / `_manifests/<digest>`).
+fn image_from_artifact_key(sk: &str) -> Option<&str> {
+    let tag_idx = sk.find("/_tags/");
+    let manifest_idx = sk.find("/_manifests/");
+    let idx = match (tag_idx, manifest_idx) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }?;
+    let image = &sk[..idx];
+    if image.is_empty() {
+        None
+    } else {
+        Some(image)
+    }
+}
+
+/// List the distinct image names within a docker repository.
+///
+/// Implements Docker Registry V2 `_catalog` semantics by scanning the
+/// repository's artifact records and deduplicating the image-name prefix
+/// of every tag and manifest path. Returns a sorted set.
+///
+/// This is O(artifacts) per call; depot does not maintain a secondary
+/// index by image name. Fine for modestly-sized registries; large
+/// registries should consider caching the result at the call site.
+pub async fn list_image_names(
+    kv: &dyn KvStore,
+    repo: &str,
+) -> error::Result<std::collections::BTreeSet<String>> {
+    service::fold_all_artifacts(
+        kv,
+        repo,
+        "",
+        std::collections::BTreeSet::new,
+        |acc, sk, _record| {
+            if let Some(image) = image_from_artifact_key(sk) {
+                if !acc.contains(image) {
+                    acc.insert(image.to_string());
+                }
+            }
+            Ok(())
+        },
+        |mut a, b| {
+            a.extend(b);
+            a
+        },
+    )
+    .await
+}
+
 // --- Upstream Docker V2 client for cache repos ---
 
 /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
@@ -824,4 +884,47 @@ pub async fn fetch_upstream_blob_to_writer(
     let blake3_hash = blake3.finalize().to_hex().to_string();
 
     Ok(Some((docker_digest, blake3_hash, size)))
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::image_from_artifact_key;
+
+    #[test]
+    fn extracts_simple_image() {
+        assert_eq!(
+            image_from_artifact_key("ubuntu/_tags/latest"),
+            Some("ubuntu")
+        );
+        assert_eq!(
+            image_from_artifact_key("ubuntu/_manifests/sha256:abc"),
+            Some("ubuntu")
+        );
+    }
+
+    #[test]
+    fn extracts_namespaced_image() {
+        assert_eq!(
+            image_from_artifact_key("qkp/quantum_leaf/_tags/v1"),
+            Some("qkp/quantum_leaf")
+        );
+        assert_eq!(
+            image_from_artifact_key("qkp/quantum_leaf/_manifests/sha256:abc"),
+            Some("qkp/quantum_leaf")
+        );
+    }
+
+    #[test]
+    fn ignores_sentinel_only_keys() {
+        assert_eq!(image_from_artifact_key("_blobs/sha256:abc"), None);
+        assert_eq!(image_from_artifact_key("_tags/latest"), None);
+        assert_eq!(image_from_artifact_key("_manifests/sha256:abc"), None);
+        assert_eq!(image_from_artifact_key("_uploads/uuid"), None);
+    }
+
+    #[test]
+    fn ignores_unrecognized_keys() {
+        assert_eq!(image_from_artifact_key("ubuntu/something/else"), None);
+        assert_eq!(image_from_artifact_key(""), None);
+    }
 }

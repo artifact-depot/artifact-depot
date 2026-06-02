@@ -209,22 +209,233 @@ async fn test_catalog_empty() {
     assert_eq!(body["repositories"].as_array().unwrap().len(), 0);
 }
 
+/// Per Docker Registry V2 spec, `/v2/_catalog` returns image names (the
+/// `<name>` in `docker pull host/<name>:<tag>`), unioned across all docker
+/// repositories the caller can read — not depot's internal repo names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_catalog_lists_docker_repos() {
+async fn test_catalog_lists_docker_image_names() {
     let app = TestApp::new().await;
     app.create_docker_repo("docker-a").await;
     app.create_docker_repo("docker-b").await;
     app.create_hosted_repo("raw-repo").await; // non-docker, shouldn't appear
 
+    // Push images into each docker repo. The catalog enumerates by scanning
+    // tag/manifest records, so empty repos produce no entries.
+    let cfg = app.push_docker_blob_ns("docker-a", "alpine", b"{}").await;
+    let layer = app.push_docker_blob_ns("docker-a", "alpine", b"a").await;
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    app.push_docker_manifest_ns("docker-a", "alpine", "latest", &manifest)
+        .await;
+
+    let cfg = app.push_docker_blob_ns("docker-b", "redis", b"{}").await;
+    let layer = app.push_docker_blob_ns("docker-b", "redis", b"r").await;
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    app.push_docker_manifest_ns("docker-b", "redis", "v1", &manifest)
+        .await;
+
     let token = app.admin_token();
     let req = app.auth_request(Method::GET, "/v2/_catalog", &token);
     let (status, body) = app.call(req).await;
     assert_eq!(status, StatusCode::OK);
-    let repos = body["repositories"].as_array().unwrap();
-    let names: Vec<&str> = repos.iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(names.contains(&"docker-a"));
-    assert!(names.contains(&"docker-b"));
-    assert!(!names.contains(&"raw-repo"));
+    let names: Vec<&str> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+
+    assert!(names.contains(&"alpine"), "expected alpine, got {names:?}");
+    assert!(names.contains(&"redis"), "expected redis, got {names:?}");
+    // Depot repo names must NOT appear — that was the bug.
+    assert!(!names.contains(&"docker-a"), "got {names:?}");
+    assert!(!names.contains(&"docker-b"), "got {names:?}");
+    assert!(!names.contains(&"raw-repo"), "got {names:?}");
+}
+
+/// Catalog must surface namespaced (two-segment) image names — pushed via the
+/// `/repository/{repo}/v2/{ns}/{img}/...` dispatcher route — as a single
+/// `ns/img` entry, not as separate segments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_catalog_includes_namespaced_image_names() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("ns-cat").await;
+
+    // Push a two-segment image via the per-repo dispatch path so the routes
+    // match `[ns, img, "blobs", "uploads"]` and `[ns, img, "manifests", ref]`.
+    let token = app.admin_token();
+    let cfg = b"{}";
+    let cfg_digest = format!(
+        "sha256:{:x}",
+        sha2::Digest::finalize(sha2::Digest::chain_update(sha2::Sha256::default(), cfg))
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!(
+            "/repository/ns-cat/v2/qkp/quantum_leaf/blobs/uploads/?digest={}",
+            cfg_digest
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(cfg.to_vec()))
+        .unwrap();
+    let resp = app.call_resp(req).await;
+    assert!(
+        resp.status() == StatusCode::CREATED || resp.status() == StatusCode::ACCEPTED,
+        "blob push: {}",
+        resp.status()
+    );
+
+    let layer = b"l";
+    let layer_digest = format!(
+        "sha256:{:x}",
+        sha2::Digest::finalize(sha2::Digest::chain_update(sha2::Sha256::default(), layer))
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!(
+            "/repository/ns-cat/v2/qkp/quantum_leaf/blobs/uploads/?digest={}",
+            layer_digest
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(layer.to_vec()))
+        .unwrap();
+    let _ = app.call_resp(req).await;
+
+    let manifest = TestApp::make_manifest(&cfg_digest, &[&layer_digest]);
+    let body = serde_json::to_vec(&manifest).unwrap();
+    let req = axum::http::Request::builder()
+        .method(Method::PUT)
+        .uri("/repository/ns-cat/v2/qkp/quantum_leaf/manifests/v1")
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = app.auth_request(Method::GET, "/v2/_catalog", &token);
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"qkp/quantum_leaf"),
+        "expected qkp/quantum_leaf as a single entry, got {names:?}"
+    );
+    assert!(!names.contains(&"qkp"), "got {names:?}");
+}
+
+/// `/repository/{repo}/v2/_catalog` returns only the image names within that
+/// specific depot repo — previously it returned `[<repo-name>]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_repo_catalog_lists_image_names() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("repo-cat").await;
+    app.create_docker_repo("repo-other").await;
+
+    // Two images in repo-cat …
+    let cfg = app.push_docker_blob_ns("repo-cat", "redis", b"{}").await;
+    let layer = app.push_docker_blob_ns("repo-cat", "redis", b"r").await;
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    app.push_docker_manifest_ns("repo-cat", "redis", "latest", &manifest)
+        .await;
+
+    let cfg = app.push_docker_blob_ns("repo-cat", "alpine", b"{}").await;
+    let layer = app.push_docker_blob_ns("repo-cat", "alpine", b"a").await;
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    app.push_docker_manifest_ns("repo-cat", "alpine", "3.18", &manifest)
+        .await;
+
+    // … and a different image in repo-other that must NOT leak into repo-cat's catalog.
+    let cfg = app.push_docker_blob_ns("repo-other", "ubuntu", b"{}").await;
+    let layer = app.push_docker_blob_ns("repo-other", "ubuntu", b"u").await;
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    app.push_docker_manifest_ns("repo-other", "ubuntu", "latest", &manifest)
+        .await;
+
+    let token = app.admin_token();
+    let req = app.auth_request(Method::GET, "/repository/repo-cat/v2/_catalog", &token);
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+
+    assert_eq!(names, vec!["alpine", "redis"]);
+}
+
+/// Per-repo catalog must apply Docker V2 cursor pagination (`n` + `last`)
+/// and emit a `Link: …; rel="next"` header when truncated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_repo_catalog_paginates() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("repo-page").await;
+
+    for img in ["img-a", "img-b", "img-c", "img-d"] {
+        let cfg = app.push_docker_blob_ns("repo-page", img, b"{}").await;
+        let layer = app
+            .push_docker_blob_ns("repo-page", img, img.as_bytes())
+            .await;
+        let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+        app.push_docker_manifest_ns("repo-page", img, "latest", &manifest)
+            .await;
+    }
+
+    let token = app.admin_token();
+    let req = app.auth_request(Method::GET, "/repository/repo-page/v2/_catalog?n=2", &token);
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let link = resp
+        .headers()
+        .get("Link")
+        .expect("expected Link header on truncated page")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(link.contains("rel=\"next\""), "got Link: {link}");
+    assert!(link.contains("last=img-b"), "got Link: {link}");
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let names: Vec<&str> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["img-a", "img-b"]);
+
+    // Fetch the next page using the cursor.
+    let req = app.auth_request(
+        Method::GET,
+        "/repository/repo-page/v2/_catalog?n=2&last=img-b",
+        &token,
+    );
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("Link").is_none(),
+        "final page must not have Link header"
+    );
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let names: Vec<&str> = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["img-c", "img-d"]);
 }
 
 // ===========================================================================
@@ -2755,9 +2966,23 @@ async fn test_list_tags_pagination() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_catalog_pagination() {
     let app = TestApp::new().await;
-    app.create_docker_repo("cat-a").await;
-    app.create_docker_repo("cat-b").await;
-    app.create_docker_repo("cat-c").await;
+    app.create_docker_repo("cat-page-a").await;
+    app.create_docker_repo("cat-page-b").await;
+
+    // Push three images so the catalog has three entries to paginate over.
+    // Catalog is image-name-keyed per Docker V2 spec, so we need real images.
+    for (repo, image) in [
+        ("cat-page-a", "alpine"),
+        ("cat-page-a", "busybox"),
+        ("cat-page-b", "redis"),
+    ] {
+        let cfg = app.push_docker_blob_ns(repo, image, b"{}").await;
+        let layer = app.push_docker_blob_ns(repo, image, image.as_bytes()).await;
+        let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+        app.push_docker_manifest_ns(repo, image, "latest", &manifest)
+            .await;
+    }
+
     let token = app.admin_token();
 
     // First page: n=2
@@ -2787,7 +3012,7 @@ async fn test_catalog_pagination() {
     let (status, body) = app.call(req).await;
     assert_eq!(status, StatusCode::OK);
     let repos2 = body["repositories"].as_array().unwrap();
-    assert_eq!(repos2.len(), 1, "should have one remaining repo");
+    assert_eq!(repos2.len(), 1, "should have one remaining image");
 }
 
 // ===========================================================================
