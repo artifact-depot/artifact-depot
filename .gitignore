@@ -13,6 +13,12 @@
 *.swo
 *~
 
+# Claude Code local settings (per-user, not shared)
+.claude/settings.local.json
+
+# Playwright MCP runtime artifacts (console logs, page snapshots)
+.playwright-mcp/
+
 # OS
 .DS_Store
 Thumbs.db

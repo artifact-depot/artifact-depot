@@ -359,7 +359,7 @@ async fn build_full_model(
 
     let health = HealthResponse {
         status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::VERSION.to_string(),
     };
 
     Ok(MaterializedModel {

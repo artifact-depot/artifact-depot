@@ -31,3 +31,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod server;
+
+/// Full build version: the crate version plus a build counter that increments
+/// with every merge to `main` (e.g. `1.0.0+47`). Computed in `build.rs`.
+pub const VERSION: &str = env!("DEPOT_VERSION");
