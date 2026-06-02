@@ -54,7 +54,7 @@ async fn run_worker_sequential(cfg: WorkerConfig, tx: mpsc::UnboundedSender<OpRe
             }
         }
 
-        let op = pick_op(&cfg.ops, rng.gen());
+        let op = pick_op(&cfg.ops, rng.random());
         let start = Instant::now();
 
         let (bytes, success) = match op {
@@ -116,8 +116,8 @@ async fn run_worker_pipelined(cfg: WorkerConfig, tx: mpsc::UnboundedSender<OpRes
         };
 
         let idx = op_index.fetch_add(1, Ordering::Relaxed);
-        let op_pick: u32 = seed_rng.gen();
-        let request_seed: u64 = seed_rng.gen();
+        let op_pick: u32 = seed_rng.random();
+        let request_seed: u64 = seed_rng.random();
         let op = pick_op(&ops, op_pick);
         let tx = tx.clone();
         let client = client.clone();
@@ -215,7 +215,7 @@ async fn pipe_raw_download(ctx: &PipelinedRequestCtx<'_>, rng: &mut ChaCha8Rng) 
     if ctx.seeded_paths.is_empty() {
         return (0, false);
     }
-    let idx = rng.gen_range(0..ctx.seeded_paths.len());
+    let idx = rng.random_range(0..ctx.seeded_paths.len());
     let path = &ctx.seeded_paths[idx];
     match ctx.client.download_raw(ctx.repo_name, path).await {
         Ok(data) => (data.len() as u64, true),
@@ -262,7 +262,7 @@ async fn pipe_docker_pull(ctx: &PipelinedRequestCtx<'_>, rng: &mut ChaCha8Rng) -
     if ctx.seeded_tags.is_empty() {
         return (0, false);
     }
-    let idx = rng.gen_range(0..ctx.seeded_tags.len());
+    let idx = rng.random_range(0..ctx.seeded_tags.len());
     let tag = &ctx.seeded_tags[idx];
     match ctx
         .client
@@ -324,7 +324,7 @@ async fn execute_raw_download(cfg: &WorkerConfig, rng: &mut ChaCha8Rng) -> (u64,
     if cfg.seeded_paths.is_empty() {
         return (0, false);
     }
-    let idx = rng.gen_range(0..cfg.seeded_paths.len());
+    let idx = rng.random_range(0..cfg.seeded_paths.len());
     let path = &cfg.seeded_paths[idx];
     match cfg.client.download_raw(&cfg.repo_name, path).await {
         Ok(data) => (data.len() as u64, true),
@@ -366,7 +366,7 @@ async fn execute_docker_pull(cfg: &WorkerConfig, rng: &mut ChaCha8Rng) -> (u64, 
     if cfg.seeded_tags.is_empty() {
         return (0, false);
     }
-    let idx = rng.gen_range(0..cfg.seeded_tags.len());
+    let idx = rng.random_range(0..cfg.seeded_tags.len());
     let tag = &cfg.seeded_tags[idx];
     match cfg
         .client

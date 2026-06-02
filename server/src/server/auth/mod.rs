@@ -100,7 +100,7 @@ pub fn decode_claims_unverified(token: &str) -> Option<Claims> {
 /// Generate a random 32-byte per-user token secret.
 pub fn generate_token_secret() -> Vec<u8> {
     let mut buf = vec![0u8; 32];
-    rand::Rng::fill(&mut rand::thread_rng(), buf.as_mut_slice());
+    rand::Rng::fill(&mut rand::rng(), buf.as_mut_slice());
     buf
 }
 
@@ -149,9 +149,9 @@ pub async fn verify_password(password: String, hash: String) -> bool {
 }
 
 pub fn generate_random_password() -> String {
-    use rand::seq::SliceRandom;
+    use rand::seq::IndexedRandom;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..16)
         .map(|_| *CHARSET.choose(&mut rng).unwrap_or(&b'a') as char)
         .collect()

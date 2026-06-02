@@ -20,7 +20,7 @@ pub async fn push_image(
     tag: &str,
     rng: &mut (impl RngCore + ?Sized),
 ) -> Result<()> {
-    let num_layers = rng.gen_range(2u32..5);
+    let num_layers = rng.random_range(2u32..5);
 
     let mut layer_digests = Vec::new();
     let mut layer_sizes = Vec::new();
@@ -80,13 +80,13 @@ pub(crate) fn generate_layer(
 ) -> Result<Vec<u8>> {
     let mut archive = tar::Builder::new(Vec::new());
 
-    let num_files = rng.gen_range(2u32..6);
+    let num_files = rng.random_range(2u32..6);
     let dirs = ["usr/local/bin", "etc/app", "var/lib/app", "opt/service"];
     let dir = dirs[layer_index as usize % dirs.len()];
 
     for j in 0..num_files {
         let filename = format!("{}/file-{}-{}.dat", dir, layer_index, j);
-        let size = rng.gen_range(64usize..2048);
+        let size = rng.random_range(64usize..2048);
         let mut content = vec![0u8; size];
         rng.fill_bytes(&mut content);
 
