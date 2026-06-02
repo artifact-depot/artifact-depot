@@ -13,7 +13,7 @@ depot-core = { path = "../../core" }
 async-trait = "0.1"
 blake3 = "1"
 futures = "0.3"
-redb = "2"
+redb = "4"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing = "0.1"
 

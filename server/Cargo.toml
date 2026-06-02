@@ -42,7 +42,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 sha2 = "0.10"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.9"
 reqwest = { version = "0.12", features = ["rustls-tls", "json", "multipart", "stream"], default-features = false }
 
 # Server deps
@@ -50,14 +50,14 @@ axum = { version = "0.8", features = ["multipart"] }
 http-body = "1"
 http-body-util = "0.1"
 blake3 = "1"
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "logs"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace", "logs"], default-features = false }
-opentelemetry-appender-tracing = "0.31"
-tracing-opentelemetry = "0.32"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "logs"], default-features = false }
+opentelemetry-appender-tracing = "0.32"
+tracing-opentelemetry = "0.33"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -69,11 +69,11 @@ tokio-stream = "0.1"
 futures = "0.3"
 mime_guess = "2"
 tempfile = "3"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 argon2 = "0.5"
-ldap3 = { version = "0.11", optional = true }
+ldap3 = { version = "0.12", optional = true }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 
 # Used by server repo modules (apt, yum, helm)
 tar = "0.4"
@@ -85,15 +85,15 @@ rmp-serde = "1"
 aes-gcm = "0.10"
 arc-swap = "1"
 moka = { version = "0.12", features = ["sync"] }
-bloomfilter = "1"
-gethostname = "0.5"
+bloomfilter = "3"
+gethostname = "1.1"
 
 [dev-dependencies]
 depot-bench = { path = "../bench" }
 depot-test-support = { path = "../test-support" }
 # Enable test-support feature on depot-core for FailingKvStore / FailingBlobStore.
 depot-core = { path = "../core", features = ["test-support"] }
-rand_chacha = "0.3"
+rand_chacha = "0.9"
 wiremock = "0.6"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
