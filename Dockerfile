@@ -29,6 +29,13 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
 WORKDIR /src
 COPY . .
 
+# Build counter (commits on the built revision) for the `1.0.0+<counter>`
+# version string. `.git/` is excluded by .dockerignore, so the counter cannot
+# be derived from git here — CI passes it in via --build-arg. Empty arg leaves
+# build.rs to fall back to the bare crate version.
+ARG BUILD_COUNTER=
+ENV DEPOT_BUILD_COUNTER=${BUILD_COUNTER}
+
 RUN RUST_TARGET=$(cat /rust-target) \
     && cargo build --release --features dynamodb --bin depot --target "$RUST_TARGET" \
     && cp "target/$RUST_TARGET/release/depot" /depot

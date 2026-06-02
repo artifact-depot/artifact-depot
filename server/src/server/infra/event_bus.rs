@@ -289,7 +289,7 @@ impl MaterializedModel {
                 settings: Settings::default(),
                 health: HealthResponse {
                     status: "ok".to_string(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: crate::VERSION.to_string(),
                 },
             }),
             admin: Arc::new(AdminModel {

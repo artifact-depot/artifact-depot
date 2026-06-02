@@ -25,7 +25,7 @@ struct OtelGuards {
 }
 
 #[derive(Parser)]
-#[command(name = "depot", about = "Artifact Depot — artifact repository server")]
+#[command(name = "depot", about = "Artifact Depot — artifact repository server", version = depot_server::VERSION)]
 struct Cli {
     /// Path to configuration file
     #[arg(short, long, default_value = "depotd.toml")]
@@ -106,7 +106,7 @@ async fn async_main(cfg: config::Config) -> anyhow::Result<()> {
                     .unwrap_or_else(|| "depot".to_string());
 
                 let mut resource_attrs = vec![
-                    opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                    opentelemetry::KeyValue::new("service.version", depot_server::VERSION),
                     opentelemetry::KeyValue::new("service.instance.id", instance_id.clone()),
                 ];
                 if let Some(ref env) = tracing_cfg.and_then(|t| t.deployment_environment.clone()) {
