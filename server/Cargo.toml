@@ -69,7 +69,7 @@ tokio-stream = "0.1"
 futures = "0.3"
 mime_guess = "2"
 tempfile = "3"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 argon2 = "0.5"
 ldap3 = { version = "0.11", optional = true }
 metrics = "0.24"
