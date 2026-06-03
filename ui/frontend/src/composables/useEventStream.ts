@@ -32,7 +32,15 @@ export function useEventStream() {
     controller = new AbortController()
 
     try {
-      const response = await fetch('/api/v1/events/stream', {
+      // Per-connection unique URL. Firefox otherwise coalesces concurrent
+      // requests to the identical SSE URL across windows/tabs and aborts the
+      // second one (NS_BINDING_ABORTED), so a second window never receives its
+      // snapshot and parks on "Loading…". A throwaway query param makes each
+      // connection a distinct resource. The server ignores unknown query params.
+      // (Date.now()+random, not crypto.randomUUID, since the latter is only
+      // available in secure contexts and the UI is often served over plain HTTP.)
+      const cacheBust = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const response = await fetch(`/api/v1/events/stream?c=${cacheBust}`, {
         headers: {
           'Authorization': `Bearer ${token}`,
           'Accept': 'text/event-stream',
