@@ -216,6 +216,7 @@ async fn test_app_setup() -> TestAppSetup {
         rate_limiter: Arc::new(
             depot_server::server::infra::rate_limit::DynamicRateLimiter::new(None),
         ),
+        default_scheme: "https",
     };
 
     TestAppSetup {
@@ -235,12 +236,22 @@ fn sha256_digest(data: &[u8]) -> String {
 
 impl TestApp {
     pub async fn new() -> Self {
+        Self::new_with_default_scheme("https").await
+    }
+
+    /// Like [`TestApp::new`] but pins the listener's fallback scheme used when
+    /// building absolute external URLs (npm `dist.tarball`, Docker realm, …)
+    /// and no `X-Forwarded-Proto` header is present. Pass `"http"` to emulate a
+    /// client talking to depot's plain-HTTP listener.
+    pub async fn new_with_default_scheme(default_scheme: &'static str) -> Self {
         let TestAppSetup {
             dir,
             mut state,
             jwt_secret,
             admin_token_secret,
         } = test_app_setup().await;
+
+        state.default_scheme = default_scheme;
 
         // Spawn a real update worker so dir entries are maintained.
         let (update_sender, update_rx) = depot_core::update::UpdateSender::new(4096);
@@ -260,6 +271,16 @@ impl TestApp {
             state,
             _dir: dir,
         }
+    }
+
+    /// Override the configured external base URL (the Nexus-style "Base URL"
+    /// hard override) in the live cluster settings shared with the running
+    /// router. Pass `None` to clear it.
+    pub fn set_base_url(&self, base_url: Option<&str>) {
+        let cur = self.state.settings.load();
+        let mut settings = (**cur).clone();
+        settings.base_url = base_url.map(|s| s.to_string());
+        self.state.settings.store(Arc::new(settings));
     }
 
     pub fn admin_token(&self) -> String {

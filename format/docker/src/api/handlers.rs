@@ -28,12 +28,17 @@ use super::uploads::{do_complete_upload, do_patch_upload, do_start_upload};
 /// Returns 401 with Bearer challenge for anonymous users, 200 for authenticated users.
 /// Always includes `Docker-Distribution-Api-Version: registry/2.0` header.
 pub async fn v2_check(
+    State(state): State<FormatState>,
     uri: axum::http::Uri,
     req_headers: HeaderMap,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> impl IntoResponse {
     if user.0 == "anonymous" {
-        return docker_unauthorized_response(&req_headers, uri.authority().map(|a| a.as_str()));
+        return docker_unauthorized_response(
+            &state,
+            &req_headers,
+            uri.authority().map(|a| a.as_str()),
+        );
     }
 
     let mut headers = HeaderMap::new();

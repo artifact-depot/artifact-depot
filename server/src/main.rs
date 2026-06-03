@@ -494,13 +494,15 @@ async fn async_main(cfg: config::Config) -> anyhow::Result<()> {
         });
     }
 
-    let app = server::build_router(state.clone(), Some(metrics_handle));
-
     if let Some(ref https) = cfg.https {
+        // This listener terminates TLS, so absolute external URLs default to
+        // https when no X-Forwarded-Proto header is present.
+        let app = server::build_router(state.with_scheme("https"), Some(metrics_handle));
         // When TLS is enabled, optionally spawn a plain HTTP listener as a
-        // secondary (non-blocking) listener.
+        // secondary (non-blocking) listener. Requests it accepts arrive in
+        // plaintext, so that router defaults absolute external URLs to http.
         if let Some(ref http) = cfg.http {
-            let http_app = server::build_router(state.clone(), None);
+            let http_app = server::build_router(state.with_scheme("http"), None);
             let addr: std::net::SocketAddr = http.listen.parse()?;
             tracing::info!("plain HTTP listener on http://{}", addr);
             let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -537,6 +539,10 @@ async fn async_main(cfg: config::Config) -> anyhow::Result<()> {
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else if let Some(ref http) = cfg.http {
+        // Plain-HTTP-only deployment: this listener serves plaintext, so
+        // absolute external URLs default to http (overridable by a configured
+        // base_url or an X-Forwarded-Proto header from a fronting proxy).
+        let app = server::build_router(state.with_scheme("http"), Some(metrics_handle));
         let listener = tokio::net::TcpListener::bind(&http.listen).await?;
         tracing::info!("listening on http://{}", listener.local_addr()?);
         axum::serve(

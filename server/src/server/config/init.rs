@@ -306,6 +306,7 @@ mod tests {
             },
             settings: Arc::new(SettingsHandle::new(Settings::default())),
             rate_limiter: Arc::new(DynamicRateLimiter::new(None)),
+            default_scheme: "https",
         };
         (dir, state)
     }

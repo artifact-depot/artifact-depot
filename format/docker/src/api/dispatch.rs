@@ -92,7 +92,7 @@ async fn dispatch(
             if *method != Method::GET {
                 return StatusCode::METHOD_NOT_ALLOWED.into_response();
             }
-            do_v2_check(username, headers, uri_authority)
+            do_v2_check(state, username, headers, uri_authority)
         }
 
         // GET /v2/token — token exchange (clients may request this under
@@ -456,9 +456,14 @@ async fn dispatch_upload(
 
 /// Inline V2 check — produces the same response as `handlers::v2_check`
 /// without needing axum extractors.
-fn do_v2_check(username: &str, req_headers: &HeaderMap, uri_authority: Option<&str>) -> Response {
+fn do_v2_check(
+    state: &FormatState,
+    username: &str,
+    req_headers: &HeaderMap,
+    uri_authority: Option<&str>,
+) -> Response {
     if username == "anonymous" {
-        return super::helpers::docker_unauthorized_response(req_headers, uri_authority);
+        return super::helpers::docker_unauthorized_response(state, req_headers, uri_authority);
     }
 
     let mut headers = HeaderMap::new();

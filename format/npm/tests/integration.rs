@@ -558,6 +558,130 @@ async fn test_packument_tarball_url_honors_forwarded_headers() {
     );
 }
 
+/// A client talking directly to the plain-HTTP listener (no proxy, so no
+/// `X-Forwarded-Proto`) must receive `http://` tarball URLs — not the historical
+/// hardcoded `https://`. This is the reported depot-dev bug: HTTP metadata that
+/// hands back HTTPS tarballs, forcing clients onto a broken TLS endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_packument_tarball_url_http_listener_defaults_to_http() {
+    let app = TestApp::new_with_default_scheme("http").await;
+    app.create_npm_repo("npm-http").await;
+
+    let req = npm_publish_request(&app, "npm-http", "http-pkg", "1.60.0", b"data");
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Plain HTTP request: a Host header but no X-Forwarded-Proto.
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/repository/npm-http/http-pkg")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", app.admin_token()),
+        )
+        .header(header::HOST, "depot-dev.lab.mdh.quantum.com")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let tarball_url = body["versions"]["1.60.0"]["dist"]["tarball"]
+        .as_str()
+        .unwrap();
+    // TC1 (scheme is http), TC2 (absolute, has "://"), TC3 (host parity).
+    assert_eq!(
+        tarball_url,
+        "http://depot-dev.lab.mdh.quantum.com/repository/npm-http/http-pkg/-/http-pkg-1.60.0.tgz"
+    );
+
+    // TC4: the exact baked URL is fetchable. Strip the origin and GET the path
+    // back through the same app; it must return the published tarball bytes.
+    let path = tarball_url
+        .strip_prefix("http://depot-dev.lab.mdh.quantum.com")
+        .expect("baked URL must be rooted at the request host");
+    let req = app.auth_request(Method::GET, path, &app.admin_token());
+    let (status, data) = app.call_raw(req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data, b"data");
+}
+
+/// TC6: a scoped package's `dist.tarball` is rewritten the same way — absolute,
+/// on the request scheme (http here) — over the plain-HTTP listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_scoped_packument_tarball_url_http_listener_defaults_to_http() {
+    let app = TestApp::new_with_default_scheme("http").await;
+    app.create_npm_repo("npm-http-scoped").await;
+    let token = app.admin_token();
+
+    let body = build_npm_publish_body("@myorg/widget", "2.0.0", b"scoped-data");
+    let req = axum::http::Request::builder()
+        .method(Method::PUT)
+        .uri("/repository/npm-http-scoped/@myorg/widget")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Plain HTTP fetch: Host header, no X-Forwarded-Proto.
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/repository/npm-http-scoped/@myorg/widget")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::HOST, "depot-dev.lab.mdh.quantum.com")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let tarball_url = body["versions"]["2.0.0"]["dist"]["tarball"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        tarball_url,
+        "http://depot-dev.lab.mdh.quantum.com/repository/npm-http-scoped/@myorg/widget/-/widget-2.0.0.tgz"
+    );
+}
+
+/// A configured `base_url` is a hard override (Nexus "Base URL" capability):
+/// it wins even over an `X-Forwarded-Proto: https` header, so an operator can
+/// pin `http://` while a TLS certificate is being fixed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_packument_tarball_url_base_url_override_wins() {
+    let app = TestApp::new().await;
+    app.set_base_url(Some("http://depot-dev.lab.mdh.quantum.com"));
+    app.create_npm_repo("npm-base").await;
+
+    let req = npm_publish_request(&app, "npm-base", "base-pkg", "3.0.0", b"data");
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Even with proxy headers advertising https and a different host, the
+    // configured base_url overrides everything.
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/repository/npm-base/base-pkg")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", app.admin_token()),
+        )
+        .header(header::HOST, "internal.svc:8080")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let tarball_url = body["versions"]["3.0.0"]["dist"]["tarball"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        tarball_url,
+        "http://depot-dev.lab.mdh.quantum.com/repository/npm-base/base-pkg/-/base-pkg-3.0.0.tgz"
+    );
+}
+
 // ===========================================================================
 // Search
 // ===========================================================================

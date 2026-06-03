@@ -158,6 +158,7 @@ async fn app_with_cors(cors: Option<CorsConfig>) -> axum::Router {
         rate_limiter: Arc::new(crate::server::infra::rate_limit::DynamicRateLimiter::new(
             None,
         )),
+        default_scheme: "https",
     };
 
     // Leak the tempdir so it lives long enough for the router.

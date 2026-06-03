@@ -100,3 +100,15 @@ roles = ["developer"]
 max_artifact_bytes = 10737418240   # 10 GiB
 default_docker_repo = "hosted-raw"
 access_log = true
+
+# External base URL used to build absolute URLs in artifact metadata (npm
+# `dist.tarball`, Docker `WWW-Authenticate` realm, Nexus-compat asset URLs).
+# Hard override applied regardless of request headers — the equivalent of
+# Nexus's "Base URL" capability. Omit it (the default) to derive the origin
+# per-request from `X-Forwarded-Proto`/`Host`, falling back to the scheme of
+# the listener that accepted the request (http for the plain-HTTP listener,
+# https for the TLS listener). Set it to pin a canonical public URL, e.g. to
+# force http:// while a TLS certificate is being fixed. Must be a scheme +
+# host with no path, e.g. "https://depot.example.com" or
+# "https://depot.example.com:8443".
+# base_url = "https://depot.example.com"

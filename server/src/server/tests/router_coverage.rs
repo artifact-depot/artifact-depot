@@ -191,6 +191,7 @@ async fn test_router_with_default_docker_repo() {
         rate_limiter: Arc::new(crate::server::infra::rate_limit::DynamicRateLimiter::new(
             None,
         )),
+        default_scheme: "https",
     };
 
     // Build with default_docker_repo set.
@@ -340,6 +341,7 @@ async fn test_router_with_access_log() {
         rate_limiter: Arc::new(crate::server::infra::rate_limit::DynamicRateLimiter::new(
             None,
         )),
+        default_scheme: "https",
     };
 
     // Build with access_log=true.
