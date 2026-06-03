@@ -89,6 +89,10 @@ impl FormatSettings for SettingsAdapter {
     fn max_docker_chunk_count(&self) -> u32 {
         self.settings.load().max_docker_chunk_count
     }
+
+    fn base_url(&self) -> Option<String> {
+        self.settings.load().base_url.clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -129,6 +133,18 @@ impl AppState {
     pub fn format_state(&self) -> FormatState {
         FormatState::from_ref(self)
     }
+
+    /// Clone this state with a different listener [`default_scheme`]. Used by
+    /// the server to give the plain-HTTP and TLS listeners distinct fallback
+    /// schemes from a single shared `AppState`. Cheap — every heavy field is
+    /// behind an `Arc`.
+    ///
+    /// [`default_scheme`]: AppState::default_scheme
+    pub fn with_scheme(&self, default_scheme: &'static str) -> Self {
+        let mut s = self.clone();
+        s.default_scheme = default_scheme;
+        s
+    }
 }
 
 impl FromRef<AppState> for FormatState {
@@ -147,6 +163,7 @@ impl FromRef<AppState> for FormatState {
             settings: Arc::new(SettingsAdapter {
                 settings: Arc::clone(&state.settings),
             }),
+            default_scheme: state.default_scheme,
         }
     }
 }
@@ -184,6 +201,12 @@ pub struct AppState {
     pub bg: BackgroundServices,
     pub settings: Arc<SettingsHandle>,
     pub rate_limiter: Arc<DynamicRateLimiter>,
+    /// Scheme of the listener this state serves (`"http"` or `"https"`). Used
+    /// as the fallback scheme when building absolute external URLs and no
+    /// `X-Forwarded-Proto` header is present, so a direct HTTP client receives
+    /// HTTP URLs. Set per-listener via [`AppState::with_scheme`]; defaults to
+    /// `"https"`.
+    pub default_scheme: &'static str,
 }
 
 impl AppState {
@@ -302,6 +325,7 @@ impl AppState {
                 scan_trigger: Arc::new(tokio::sync::Notify::new()),
             },
             settings: Arc::new(SettingsHandle::new(settings)),
+            default_scheme: "https",
             rate_limiter,
         })
     }

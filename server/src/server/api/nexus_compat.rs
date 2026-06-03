@@ -130,8 +130,8 @@ pub struct NexusRepoItem {
 // ---------------------------------------------------------------------------
 
 /// Build the external download URL for an artifact.
-fn download_url(host: &str, scheme: &str, repo: &str, path: &str) -> String {
-    format!("{scheme}://{host}/repository/{repo}/{path}")
+fn download_url(origin: &str, repo: &str, path: &str) -> String {
+    format!("{origin}/repository/{repo}/{path}")
 }
 
 /// Convert a Nexus-style wildcard name filter to a prefix/query.
@@ -151,8 +151,6 @@ fn parse_name_filter(name: &str) -> (String, Option<String>) {
         (String::new(), Some(trimmed.to_string()))
     }
 }
-
-use super::{external_host, request_scheme};
 
 const DEFAULT_PAGE_SIZE: usize = 1_000;
 const MAX_PAGE_SIZE: usize = 100_000;
@@ -294,8 +292,7 @@ pub async fn search_assets(
         params.group = Some(raw_group);
     }
 
-    let scheme = request_scheme(&headers);
-    let host = external_host(&headers, scheme, uri.authority().map(|a| a.as_str()));
+    let origin = state.external_origin(&headers, uri.authority().map(|a| a.as_str()));
     let repo_name = match &params.repository {
         Some(r) => r.clone(),
         None => {
@@ -349,7 +346,7 @@ pub async fn search_assets(
             let items: Vec<NexusAssetItem> = collected
                 .iter()
                 .map(|(path, record)| NexusAssetItem {
-                    download_url: download_url(&host, scheme, &repo_name, path),
+                    download_url: download_url(&origin, &repo_name, path),
                     path: path.clone(),
                     id: record.id.clone(),
                     repository: repo_name.clone(),
@@ -392,8 +389,7 @@ pub async fn search_assets_download(
     if let Some(raw_group) = raw_query_param(uri.query(), "group") {
         params.group = Some(raw_group);
     }
-    let scheme = request_scheme(&headers);
-    let host = external_host(&headers, scheme, uri.authority().map(|a| a.as_str()));
+    let origin = state.external_origin(&headers, uri.authority().map(|a| a.as_str()));
     let repo_name = match &params.repository {
         Some(r) => r.clone(),
         None => return (StatusCode::BAD_REQUEST, "repository parameter required").into_response(),
@@ -438,7 +434,7 @@ pub async fn search_assets_download(
     match results {
         Ok(page) => {
             if let Some((path, _)) = page.items.first() {
-                let url = download_url(&host, scheme, &repo_name, path);
+                let url = download_url(&origin, &repo_name, path);
                 (StatusCode::FOUND, [(header::LOCATION, url)]).into_response()
             } else {
                 (StatusCode::NOT_FOUND, "no matching assets").into_response()
@@ -465,8 +461,7 @@ pub async fn search_components(
     if let Some(raw_group) = raw_query_param(uri.query(), "group") {
         params.group = Some(raw_group);
     }
-    let scheme = request_scheme(&headers);
-    let host = external_host(&headers, scheme, uri.authority().map(|a| a.as_str()));
+    let origin = state.external_origin(&headers, uri.authority().map(|a| a.as_str()));
     let repo_name = match &params.repository {
         Some(r) => r.clone(),
         None => {
@@ -518,7 +513,7 @@ pub async fn search_components(
                 .iter()
                 .map(|(path, record)| {
                     let asset = NexusAssetItem {
-                        download_url: download_url(&host, scheme, &repo_name, path),
+                        download_url: download_url(&origin, &repo_name, path),
                         path: path.clone(),
                         id: record.id.clone(),
                         repository: repo_name.clone(),
@@ -572,8 +567,7 @@ pub async fn list_repositories(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    let scheme = request_scheme(&headers);
-    let host = external_host(&headers, scheme, uri.authority().map(|a| a.as_str()));
+    let origin = state.external_origin(&headers, uri.authority().map(|a| a.as_str()));
     if user.0 == "anonymous" {
         return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
@@ -586,7 +580,7 @@ pub async fn list_repositories(
                     name: r.name.clone(),
                     format: r.format().to_string(),
                     repo_type: r.repo_type().to_string(),
-                    url: format!("{scheme}://{host}/repository/{}", r.name),
+                    url: format!("{origin}/repository/{}", r.name),
                 })
                 .collect();
             Json(items).into_response()

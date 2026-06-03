@@ -86,6 +86,19 @@ pub struct Settings {
     /// OTLP endpoint for trace export (overrides TOML tracing.otlp_endpoint on restart).
     #[serde(default)]
     pub tracing_endpoint: Option<String>,
+
+    /// External base URL (`scheme://host[:port]`) used to build absolute URLs
+    /// in artifact metadata (npm `dist.tarball`, Docker `WWW-Authenticate`
+    /// realm, Nexus-compat asset URLs, …).
+    ///
+    /// When set, it is a hard override applied regardless of request headers —
+    /// the equivalent of Nexus's "Base URL" capability. Use it to pin a
+    /// canonical public URL, e.g. to force `http://` while a TLS certificate is
+    /// being fixed. When unset (the default), the origin is derived per-request
+    /// from `X-Forwarded-Proto`/`Host`, falling back to the scheme of the
+    /// listener that accepted the request.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 /// Logging endpoint configuration stored in dynamic settings.
@@ -149,6 +162,7 @@ impl Default for Settings {
             task_retention_secs: default_task_retention_secs(),
             logging: None,
             tracing_endpoint: None,
+            base_url: None,
         }
     }
 }
@@ -196,6 +210,22 @@ impl Settings {
         if let (Some(interval), Some(min)) = (self.gc_interval_secs, self.gc_min_interval_secs) {
             if interval < min {
                 errors.push("gc_interval_secs must be >= gc_min_interval_secs".to_string());
+            }
+        }
+
+        if let Some(ref base) = self.base_url {
+            let trimmed = base.trim();
+            let valid_scheme = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+            let host = trimmed
+                .split_once("://")
+                .map(|(_, rest)| rest.trim_end_matches('/'))
+                .unwrap_or("");
+            if !valid_scheme || host.is_empty() || host.contains('/') {
+                errors.push(
+                    "base_url must be an absolute origin like https://depot.example.com \
+                     (scheme://host[:port], no path)"
+                        .to_string(),
+                );
             }
         }
 
@@ -403,6 +433,51 @@ mod tests {
         });
         let errs = s.validate().unwrap_err();
         assert!(errs[0].contains("NOT A METHOD"));
+    }
+
+    #[test]
+    fn test_validate_base_url_ok() {
+        for ok in [
+            "https://depot.example.com",
+            "http://depot-dev.lab.mdh.quantum.com",
+            "https://depot.example.com:8443",
+            "https://depot.example.com/", // trailing slash tolerated
+        ] {
+            let mut s = Settings::default();
+            s.base_url = Some(ok.to_string());
+            s.validate()
+                .unwrap_or_else(|e| panic!("{ok:?} should be valid, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn test_validate_base_url_bad() {
+        for bad in [
+            "depot.example.com",                    // no scheme
+            "ftp://depot.example.com",              // wrong scheme
+            "https://",                             // empty host
+            "https://depot.example.com/repository", // path not allowed
+        ] {
+            let mut s = Settings::default();
+            s.base_url = Some(bad.to_string());
+            let errs = s.validate().unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains("base_url")),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_settings_without_base_url_deserializes() {
+        // A settings record persisted by an older build (no `base_url` field)
+        // must load with `base_url = None` thanks to the container-level
+        // `#[serde(default)]`. Encode an empty named map to simulate that.
+        let empty = std::collections::BTreeMap::<String, u8>::new();
+        let bytes = rmp_serde::to_vec_named(&empty).unwrap();
+        let s: Settings = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(s.base_url, None);
+        assert_eq!(s, Settings::default());
     }
 
     #[test]

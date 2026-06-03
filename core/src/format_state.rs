@@ -61,6 +61,14 @@ pub trait FormatSettings: Send + Sync {
 
     /// Maximum number of chunks allowed per Docker chunked upload session.
     fn max_docker_chunk_count(&self) -> u32;
+
+    /// Configured external base URL (`scheme://host[:port]`), if any.
+    ///
+    /// When set, it is a hard override for the origin used to build absolute
+    /// URLs in format metadata (e.g. npm `dist.tarball`), regardless of request
+    /// headers — the equivalent of Nexus's "Base URL" capability. `None` means
+    /// derive the origin from the request.
+    fn base_url(&self) -> Option<String>;
 }
 
 /// State available to format HTTP handlers.
@@ -77,6 +85,29 @@ pub struct FormatState {
     pub updater: UpdateSender,
     pub auth: Arc<dyn PermissionChecker>,
     pub settings: Arc<dyn FormatSettings>,
+    /// Scheme of the listener that accepted the request (`"http"` or
+    /// `"https"`). Used as the fallback when no `X-Forwarded-Proto` header is
+    /// present, so absolute URLs match the scheme the client connected with.
+    pub default_scheme: &'static str,
+}
+
+impl FormatState {
+    /// Build the external-facing origin (`scheme://host`) for absolute URLs in
+    /// format metadata, honoring (in priority): the configured `base_url`
+    /// setting, `X-Forwarded-Proto`/`Host` reverse-proxy headers, then this
+    /// listener's [`default_scheme`](Self::default_scheme).
+    pub fn external_origin(
+        &self,
+        headers: &axum::http::HeaderMap,
+        uri_authority: Option<&str>,
+    ) -> String {
+        crate::api_helpers::external_origin_resolved(
+            self.settings.base_url().as_deref(),
+            headers,
+            uri_authority,
+            self.default_scheme,
+        )
+    }
 }
 
 impl FormatState {

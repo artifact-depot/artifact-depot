@@ -79,24 +79,72 @@ macro_rules! store_from_config_fn {
     };
 }
 
-/// Derive the external scheme from proxy headers, defaulting to `"https"`.
-pub fn request_scheme(headers: &HeaderMap) -> &str {
+/// Derive the external scheme, honoring `X-Forwarded-Proto` and falling back to
+/// `default_scheme` when no proxy header is present.
+///
+/// `default_scheme` should be the scheme of the listener that accepted the
+/// request (`"http"` for the plain-HTTP listener, `"https"` for the TLS
+/// listener). This lets a direct HTTP client receive HTTP URLs while a TLS
+/// deployment still defaults to HTTPS — mirroring how servlet-based managers
+/// (Nexus/Artifactory) derive the scheme from the connector, with the proxy
+/// header overriding it.
+pub fn request_scheme_with_default<'a>(headers: &'a HeaderMap, default_scheme: &'a str) -> &'a str {
     headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("https")
+        .unwrap_or(default_scheme)
 }
 
-/// Build the external-facing origin (`scheme://host`) from request headers.
+/// Derive the external scheme from proxy headers, defaulting to `"https"`.
 ///
-/// Combines [`request_scheme`] and [`external_host`] so callers that need a
-/// fully-qualified URL prefix (e.g. npm `dist.tarball`) get correct results
-/// behind a reverse proxy. Honors `X-Forwarded-Proto`/`X-Forwarded-Port` and
-/// the `Host` header, falling back to `uri_authority` then `localhost`.
-pub fn external_origin(headers: &HeaderMap, uri_authority: Option<&str>) -> String {
-    let scheme = request_scheme(headers);
+/// Prefer [`request_scheme_with_default`] where the accepting listener's scheme
+/// is known. This `https`-defaulting variant is retained for callers that
+/// cannot observe the listener and must assume TLS when no proxy header is set.
+pub fn request_scheme(headers: &HeaderMap) -> &str {
+    request_scheme_with_default(headers, "https")
+}
+
+/// Build the external-facing origin (`scheme://host`), resolving in priority:
+///
+/// 1. An explicit configured base URL (`base_url_override`, e.g. the `base_url`
+///    setting) — a hard override that replaces scheme/host entirely. Any
+///    trailing slash is trimmed; a blank value is ignored.
+/// 2. `X-Forwarded-Proto` / `X-Forwarded-Port` / `Host` from a reverse proxy.
+/// 3. `default_scheme` (the accepting listener's scheme) combined with the
+///    `Host` header (falling back to `uri_authority`, then `localhost`).
+///
+/// This is the general form behind [`external_origin`]; callers that know the
+/// configured base URL and the accepting listener's scheme should use it so
+/// that e.g. npm `dist.tarball` URLs match the scheme the client connected
+/// with instead of unconditionally assuming HTTPS.
+pub fn external_origin_resolved(
+    base_url_override: Option<&str>,
+    headers: &HeaderMap,
+    uri_authority: Option<&str>,
+    default_scheme: &str,
+) -> String {
+    if let Some(base) = base_url_override {
+        let trimmed = base.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let scheme = request_scheme_with_default(headers, default_scheme);
     let host = external_host(headers, scheme, uri_authority);
     format!("{scheme}://{host}")
+}
+
+/// Build the external-facing origin (`scheme://host`) from request headers,
+/// defaulting to `https` when no `X-Forwarded-Proto` is present.
+///
+/// Combines [`request_scheme`] and [`external_host`] so callers that need a
+/// fully-qualified URL prefix get correct results behind a reverse proxy.
+/// Honors `X-Forwarded-Proto`/`X-Forwarded-Port` and the `Host` header,
+/// falling back to `uri_authority` then `localhost`. For scheme handling that
+/// respects a plain-HTTP listener or a configured base URL, use
+/// [`external_origin_resolved`].
+pub fn external_origin(headers: &HeaderMap, uri_authority: Option<&str>) -> String {
+    external_origin_resolved(None, headers, uri_authority, "https")
 }
 
 /// Determine the external-facing host authority from request headers.
@@ -427,5 +475,92 @@ mod tests {
     fn request_scheme_default() {
         let h = HeaderMap::new();
         assert_eq!(request_scheme(&h), "https");
+    }
+
+    #[test]
+    fn request_scheme_with_default_honors_listener() {
+        // No proxy header: fall back to the accepting listener's scheme.
+        let h = HeaderMap::new();
+        assert_eq!(request_scheme_with_default(&h, "http"), "http");
+        assert_eq!(request_scheme_with_default(&h, "https"), "https");
+    }
+
+    #[test]
+    fn request_scheme_with_default_proxy_header_wins() {
+        // A TLS-terminating proxy that forwards plain HTTP still advertises
+        // https via X-Forwarded-Proto; that must override the listener default.
+        let h = headers(&[("x-forwarded-proto", "https")]);
+        assert_eq!(request_scheme_with_default(&h, "http"), "https");
+        let h = headers(&[("x-forwarded-proto", "http")]);
+        assert_eq!(request_scheme_with_default(&h, "https"), "http");
+    }
+
+    #[test]
+    fn external_origin_http_listener_no_proxy() {
+        // The reported bug: a direct HTTP client (no proxy header) must get an
+        // http:// origin, not the historical hardcoded https://.
+        let h = headers(&[("host", "depot-dev.lab.mdh.quantum.com")]);
+        assert_eq!(
+            external_origin_resolved(None, &h, None, "http"),
+            "http://depot-dev.lab.mdh.quantum.com"
+        );
+    }
+
+    #[test]
+    fn external_origin_https_listener_no_proxy() {
+        let h = headers(&[("host", "artifacts.example.com")]);
+        assert_eq!(
+            external_origin_resolved(None, &h, None, "https"),
+            "https://artifacts.example.com"
+        );
+    }
+
+    #[test]
+    fn external_origin_proxy_overrides_listener_default() {
+        // Plain-HTTP listener behind a TLS proxy: X-Forwarded-Proto wins so we
+        // don't downgrade HTTPS clients.
+        let h = headers(&[
+            ("host", "artifacts.example.com"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        assert_eq!(
+            external_origin_resolved(None, &h, None, "http"),
+            "https://artifacts.example.com"
+        );
+    }
+
+    #[test]
+    fn external_origin_configured_base_url_overrides_everything() {
+        // Even with X-Forwarded-Proto: https present, an explicit base_url is a
+        // hard override (Nexus "Base URL" capability semantics).
+        let h = headers(&[("host", "internal:8080"), ("x-forwarded-proto", "https")]);
+        assert_eq!(
+            external_origin_resolved(
+                Some("http://depot-dev.lab.mdh.quantum.com"),
+                &h,
+                None,
+                "http"
+            ),
+            "http://depot-dev.lab.mdh.quantum.com"
+        );
+    }
+
+    #[test]
+    fn external_origin_configured_base_url_trims_trailing_slash() {
+        let h = HeaderMap::new();
+        assert_eq!(
+            external_origin_resolved(Some("https://depot.example.com/"), &h, None, "https"),
+            "https://depot.example.com"
+        );
+    }
+
+    #[test]
+    fn external_origin_blank_base_url_ignored() {
+        // A blank/whitespace override falls through to header derivation.
+        let h = headers(&[("host", "example.com")]);
+        assert_eq!(
+            external_origin_resolved(Some("   "), &h, None, "http"),
+            "http://example.com"
+        );
     }
 }

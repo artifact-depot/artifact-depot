@@ -33,6 +33,7 @@ Changes propagate to every cluster instance within 30 seconds.
 | `task_retention_secs` | integer | `86400` (24h) | Retention for completed / failed / cancelled tasks before auto-reap |
 | `logging` | object or null | `null` | Override the TOML `[logging]` config at runtime; currently only carries `otlp_endpoint`. Takes effect after restart. |
 | `tracing_endpoint` | string or null | `null` | Override the TOML `[tracing].otlp_endpoint` (takes effect after restart) |
+| `base_url` | string or null | `null` | External base URL (`scheme://host[:port]`, no path) used to build absolute URLs in artifact metadata (npm `dist.tarball`, Docker `WWW-Authenticate` realm, Nexus-compat asset URLs). Hard override applied regardless of request headers — the equivalent of Nexus's "Base URL" capability. When `null`, the origin is derived per-request from `X-Forwarded-Proto`/`Host`, falling back to the scheme of the listener that accepted the request (`http` for the plain-HTTP listener, `https` for the TLS listener). Set it to pin a canonical public URL, e.g. to force `http://` while a TLS certificate is being fixed. |
 
 ## Blob Store Management
 

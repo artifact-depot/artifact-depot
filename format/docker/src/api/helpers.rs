@@ -28,13 +28,17 @@ pub fn docker_error(code: &str, message: &str, status: StatusCode) -> Response {
 
 /// Build the `WWW-Authenticate: Bearer` challenge value from request headers.
 ///
-/// Extracts scheme from `x-forwarded-proto` (default `https`) and host from
-/// the `Host` header or `uri_authority` (for HTTP/2), constructing a realm
-/// pointing to `/v2/token`.
-pub fn docker_bearer_challenge(req_headers: &HeaderMap, uri_authority: Option<&str>) -> String {
-    let scheme = depot_core::api_helpers::request_scheme(req_headers);
-    let host = depot_core::api_helpers::external_host(req_headers, scheme, uri_authority);
-    format!("Bearer realm=\"{scheme}://{host}/v2/token\",service=\"Artifact Depot\"")
+/// The realm origin honors (in priority) the configured `base_url` setting,
+/// `X-Forwarded-Proto`/`Host` reverse-proxy headers, then the accepting
+/// listener's scheme — so a client talking to the plain-HTTP listener gets an
+/// `http://` realm rather than an unconditional `https://`.
+pub fn docker_bearer_challenge(
+    state: &FormatState,
+    req_headers: &HeaderMap,
+    uri_authority: Option<&str>,
+) -> String {
+    let origin = state.external_origin(req_headers, uri_authority);
+    format!("Bearer realm=\"{origin}/v2/token\",service=\"Artifact Depot\"")
 }
 
 /// Build a 401 UNAUTHORIZED response with a Docker Bearer challenge.
@@ -42,10 +46,11 @@ pub fn docker_bearer_challenge(req_headers: &HeaderMap, uri_authority: Option<&s
 /// Used when an anonymous (unauthenticated) client must authenticate before
 /// accessing a Docker resource.
 pub fn docker_unauthorized_response(
+    state: &FormatState,
     req_headers: &HeaderMap,
     uri_authority: Option<&str>,
 ) -> Response {
-    let challenge = docker_bearer_challenge(req_headers, uri_authority);
+    let challenge = docker_bearer_challenge(state, req_headers, uri_authority);
     let body = serde_json::json!({
         "errors": [{
             "code": "UNAUTHORIZED",
@@ -96,7 +101,7 @@ pub async fn check_docker_permission(
         .await
         .map_err(|_| {
             if username == "anonymous" {
-                docker_unauthorized_response(req_headers, uri_authority)
+                docker_unauthorized_response(state, req_headers, uri_authority)
             } else {
                 docker_error(
                     "DENIED",

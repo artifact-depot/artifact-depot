@@ -734,10 +734,8 @@ pub async fn head_artifact(
                 .await
             }
             ArtifactFormat::Npm => {
-                let origin = depot_core::api_helpers::external_origin(
-                    &request_headers,
-                    uri.authority().map(|a| a.as_str()),
-                );
+                let origin =
+                    fs.external_origin(&request_headers, uri.authority().map(|a| a.as_str()));
                 depot_format_npm::api::try_handle_repository_path(
                     &fs,
                     &repo_config,
@@ -949,10 +947,8 @@ pub async fn get_artifact(
                 .await
             }
             ArtifactFormat::Npm => {
-                let origin = depot_core::api_helpers::external_origin(
-                    &request_headers,
-                    uri.authority().map(|a| a.as_str()),
-                );
+                let origin =
+                    fs.external_origin(&request_headers, uri.authority().map(|a| a.as_str()));
                 depot_format_npm::api::try_handle_repository_path(
                     &fs,
                     &repo_config,

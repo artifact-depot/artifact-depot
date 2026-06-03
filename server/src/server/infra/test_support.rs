@@ -209,6 +209,7 @@ impl TestServer {
                 ..Settings::default()
             })),
             rate_limiter: Arc::new(DynamicRateLimiter::new(None)),
+            default_scheme: "https",
         };
 
         // Bootstrap default store record.
