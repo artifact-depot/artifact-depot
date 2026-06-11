@@ -422,7 +422,9 @@ impl CacheRepo {
                     }
                 }
 
-                // Create KV records for the blob and artifact.
+                // Create KV records for the blob and artifact. On a dedup hit
+                // (re-fetch of unchanged upstream content) this deletes the
+                // duplicate blob we just wrote and reuses the existing one.
                 let blob_rec = BlobRecord {
                     schema_version: CURRENT_RECORD_VERSION,
                     blob_id: blob_id_bg.clone(),
@@ -431,13 +433,15 @@ impl CacheRepo {
                     created_at: now,
                     store: store_bg.clone(),
                 };
-                service::put_dedup_record(kv.as_ref(), &store_bg, &blob_rec).await?;
+                let effective_blob_id =
+                    service::claim_or_reuse_blob(kv.as_ref(), blobs.as_ref(), &store_bg, &blob_rec)
+                        .await?;
 
                 let artifact = ArtifactRecord {
                     schema_version: CURRENT_RECORD_VERSION,
                     id: String::new(),
                     kind: ArtifactKind::Raw,
-                    blob_id: Some(blob_id_bg),
+                    blob_id: Some(effective_blob_id),
                     content_hash: Some(content_hash),
                     etag: Some(etag_bg.clone()),
                     size,

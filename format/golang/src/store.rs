@@ -94,6 +94,18 @@ impl<'a> GolangStore<'a> {
             _ => "application/octet-stream",
         };
 
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob_id.clone(),
+            hash: blake3_hash.clone(),
+            size: data.len() as u64,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let store = self.store.to_string();
+        let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -108,7 +120,7 @@ impl<'a> GolangStore<'a> {
                     upstream_url: None,
                 },
             },
-            blob_id: Some(blob_id.clone()),
+            blob_id: Some(blob_id),
             content_hash: Some(blake3_hash.clone()),
             etag: Some(blake3_hash.clone()),
             created_at: now,
@@ -117,19 +129,7 @@ impl<'a> GolangStore<'a> {
             path: String::new(),
             internal: false,
         };
-
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob_id.clone(),
-            hash: blake3_hash.clone(),
-            size: data.len() as u64,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-        let store = self.store.to_string();
-        let repo = self.repo.to_string();
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -163,6 +163,18 @@ impl<'a> GolangStore<'a> {
             _ => "application/octet-stream",
         };
 
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob.blob_id.clone(),
+            hash: blob.blake3_hash.clone(),
+            size: blob.size,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let store = self.store.to_string();
+        let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -177,7 +189,7 @@ impl<'a> GolangStore<'a> {
                     upstream_url: None,
                 },
             },
-            blob_id: Some(blob.blob_id.clone()),
+            blob_id: Some(blob_id),
             content_hash: Some(blob.blake3_hash.clone()),
             etag: Some(blob.blake3_hash.clone()),
             created_at: now,
@@ -186,19 +198,7 @@ impl<'a> GolangStore<'a> {
             path: String::new(),
             internal: false,
         };
-
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob.blob_id.clone(),
-            hash: blob.blake3_hash.clone(),
-            size: blob.size,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-        let store = self.store.to_string();
-        let repo = self.repo.to_string();
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),

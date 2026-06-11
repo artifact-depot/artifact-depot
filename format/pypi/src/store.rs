@@ -146,6 +146,18 @@ impl<'a> PypiStore<'a> {
 
         let path = package_path(name, version, filename);
 
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob_id.clone(),
+            hash: blake3_hash.clone(),
+            size: data.len() as u64,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let store = self.store.to_string();
+        let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -163,7 +175,7 @@ impl<'a> PypiStore<'a> {
                     upstream_url: None,
                 },
             },
-            blob_id: Some(blob_id.clone()),
+            blob_id: Some(blob_id),
             content_hash: Some(blake3_hash.clone()),
             etag: Some(blake3_hash.clone()),
             created_at: now,
@@ -172,20 +184,7 @@ impl<'a> PypiStore<'a> {
             path: String::new(),
             internal: false,
         };
-
-        // Atomic KV updates inside txn
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob_id.clone(),
-            hash: blake3_hash.clone(),
-            size: data.len() as u64,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-        let store = self.store.to_string();
-        let repo = self.repo.to_string();
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -220,6 +219,18 @@ impl<'a> PypiStore<'a> {
         let now = depot_core::repo::now_utc();
         let path = package_path(meta.name, meta.version, meta.filename);
 
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob.blob_id.clone(),
+            hash: blob.blake3_hash.clone(),
+            size: blob.size,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let store = self.store.to_string();
+        let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -237,7 +248,7 @@ impl<'a> PypiStore<'a> {
                     upstream_url: None,
                 },
             },
-            blob_id: Some(blob.blob_id.clone()),
+            blob_id: Some(blob_id),
             content_hash: Some(blob.blake3_hash.clone()),
             etag: Some(blob.blake3_hash.clone()),
             created_at: now,
@@ -246,19 +257,7 @@ impl<'a> PypiStore<'a> {
             path: String::new(),
             internal: false,
         };
-
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob.blob_id.clone(),
-            hash: blob.blake3_hash.clone(),
-            size: blob.size,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-        let store = self.store.to_string();
-        let repo = self.repo.to_string();
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -293,6 +292,18 @@ impl<'a> PypiStore<'a> {
 
         let path = package_path(name, version, filename);
 
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob_id.clone(),
+            hash: blake3_hash.clone(),
+            size: data.len() as u64,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let store = self.store.to_string();
+        let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -310,7 +321,7 @@ impl<'a> PypiStore<'a> {
                     upstream_url: Some(upstream_url.to_string()),
                 },
             },
-            blob_id: Some(blob_id.clone()),
+            blob_id: Some(blob_id),
             content_hash: Some(blake3_hash.clone()),
             etag: Some(blake3_hash.clone()),
             created_at: now,
@@ -319,20 +330,7 @@ impl<'a> PypiStore<'a> {
             path: String::new(),
             internal: false,
         };
-
-        // Atomic KV updates inside txn
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob_id.clone(),
-            hash: blake3_hash.clone(),
-            size: data.len() as u64,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-        let store = self.store.to_string();
-        let repo = self.repo.to_string();
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -366,6 +364,18 @@ impl<'a> PypiStore<'a> {
 
         let path = package_path(name, version, filename);
 
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob_id.to_string(),
+            hash: blake3_hash.to_string(),
+            size,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let store = self.store.to_string();
+        let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -383,7 +393,7 @@ impl<'a> PypiStore<'a> {
                     upstream_url: Some(upstream_url.to_string()),
                 },
             },
-            blob_id: Some(blob_id.to_string()),
+            blob_id: Some(blob_id),
             content_hash: Some(blake3_hash.to_string()),
             etag: Some(blake3_hash.to_string()),
             created_at: now,
@@ -392,21 +402,7 @@ impl<'a> PypiStore<'a> {
             path: String::new(),
             internal: false,
         };
-
-        // Atomic KV updates inside txn
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob_id.to_string(),
-            hash: blake3_hash.to_string(),
-            size,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-        let store = self.store.to_string();
-        let _blake3_hash = blake3_hash.to_string();
-        let repo = self.repo.to_string();
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -514,31 +510,33 @@ impl<'a> PypiStore<'a> {
         self.blobs.put(&blob_id, &json).await?;
 
         let index_path = format!("_index/{}", normalize_name(project));
+
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob_id.clone(),
+            hash: blake3_hash.clone(),
+            size: json.len() as u64,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
+
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
             size: json.len() as u64,
             content_type: "application/json".to_string(),
             kind: ArtifactKind::Raw,
-            blob_id: Some(blob_id.clone()),
+            blob_id: Some(blob_id),
             content_hash: Some(blake3_hash.clone()),
-            etag: Some(blake3_hash.clone()),
+            etag: Some(blake3_hash),
             created_at: now,
             updated_at: now,
             last_accessed_at: now,
             path: String::new(),
             internal: false,
         };
-
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob_id.clone(),
-            hash: blake3_hash,
-            size: json.len() as u64,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
         let _ = service::put_artifact(self.kv, self.repo, &index_path, &record).await?;
         Ok(())
     }
@@ -667,7 +665,8 @@ impl<'a> PypiStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+        let blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,

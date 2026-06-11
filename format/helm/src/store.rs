@@ -572,6 +572,8 @@ impl<'a> HelmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
+        let blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
         let index_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -587,7 +589,6 @@ impl<'a> HelmStore<'a> {
             etag: Some(blake3_hash.clone()),
             content_hash: Some(blake3_hash.clone()),
         };
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
         let old_record =
             service::put_artifact(self.kv, self.repo, "_helm/meta/index.yaml", &index_record)
                 .await?;
@@ -684,6 +685,8 @@ impl<'a> HelmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
+        let blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -699,7 +702,6 @@ impl<'a> HelmStore<'a> {
             etag: Some(blake3_hash.clone()),
             content_hash: Some(blake3_hash.clone()),
         };
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
         let old_record =
             service::put_artifact(self.kv, self.repo, "_helm/meta/index.yaml", &record).await?;
         let content_changed = match &old_record {

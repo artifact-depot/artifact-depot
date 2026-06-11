@@ -49,22 +49,6 @@ impl<'a> YumStore<'a> {
 
         let path = packages_kv_path(directory, filename);
 
-        let record = ArtifactRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            id: String::new(),
-            size: data.len() as u64,
-            content_type: "application/x-rpm".to_string(),
-            created_at: now,
-            updated_at: now,
-            last_accessed_at: now,
-            path: String::new(),
-            blob_id: Some(blob_id.clone()),
-            content_hash: Some(blake3_hash.clone()),
-            etag: Some(blake3_hash.clone()),
-            kind: ArtifactKind::YumPackage { rpm: meta },
-            internal: false,
-        };
-
         let blob_rec = BlobRecord {
             schema_version: CURRENT_RECORD_VERSION,
             blob_id: blob_id.clone(),
@@ -75,10 +59,27 @@ impl<'a> YumStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
+        let record = ArtifactRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            id: String::new(),
+            size: data.len() as u64,
+            content_type: "application/x-rpm".to_string(),
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            path: String::new(),
+            blob_id: Some(blob_id),
+            content_hash: Some(blake3_hash.clone()),
+            etag: Some(blake3_hash.clone()),
+            kind: ArtifactKind::YumPackage { rpm: meta },
+            internal: false,
+        };
+
         let path_owned = path.clone();
         let record_clone = record.clone();
 
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path_owned, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -121,22 +122,6 @@ impl<'a> YumStore<'a> {
         let now = depot_core::repo::now_utc();
         let path = packages_kv_path(directory, filename);
 
-        let record = ArtifactRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            id: String::new(),
-            size,
-            content_type: "application/x-rpm".to_string(),
-            created_at: now,
-            updated_at: now,
-            last_accessed_at: now,
-            path: String::new(),
-            blob_id: Some(blob_id.to_string()),
-            content_hash: Some(blake3_hash.to_string()),
-            etag: Some(blake3_hash.to_string()),
-            kind: ArtifactKind::YumPackage { rpm: meta },
-            internal: false,
-        };
-
         let blob_rec = BlobRecord {
             schema_version: CURRENT_RECORD_VERSION,
             blob_id: blob_id.to_string(),
@@ -147,8 +132,25 @@ impl<'a> YumStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
+        let record = ArtifactRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            id: String::new(),
+            size,
+            content_type: "application/x-rpm".to_string(),
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            path: String::new(),
+            blob_id: Some(blob_id),
+            content_hash: Some(blake3_hash.to_string()),
+            etag: Some(blake3_hash.to_string()),
+            kind: ArtifactKind::YumPackage { rpm: meta },
+            internal: false,
+        };
+
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -453,7 +455,8 @@ impl<'a> YumStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+        let blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -514,7 +517,8 @@ impl<'a> YumStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+        let blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -640,6 +644,8 @@ impl<'a> YumStore<'a> {
         public_key_armor: &str,
     ) -> error::Result<()> {
         let now = depot_core::repo::now_utc();
+        let store = self.store.to_string();
+        let repo = self.repo.to_string();
 
         // Store private key as blob
         let priv_data = private_key_armor.as_bytes();
@@ -655,6 +661,8 @@ impl<'a> YumStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
+        let priv_blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &priv_blob_rec).await?;
         let priv_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -685,6 +693,8 @@ impl<'a> YumStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
+        let pub_blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &pub_blob_rec).await?;
         let pub_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -701,9 +711,6 @@ impl<'a> YumStore<'a> {
             internal: true,
         };
 
-        let store = self.store.to_string();
-        let repo = self.repo.to_string();
-        service::put_dedup_record(self.kv, &store, &priv_blob_rec).await?;
         let old_priv =
             service::put_artifact(self.kv, &repo, "_yum/signing_key", &priv_record).await?;
         let (cd, bd) = match &old_priv {
@@ -715,7 +722,6 @@ impl<'a> YumStore<'a> {
             .await;
         self.updater.store_changed(self.store, cd, bd).await;
 
-        service::put_dedup_record(self.kv, &store, &pub_blob_rec).await?;
         let old_pub = service::put_artifact(self.kv, &repo, "_yum/public_key", &pub_record).await?;
         let (cd, bd) = match &old_pub {
             Some(old) => (0i64, pub_record.size as i64 - old.size as i64),
@@ -875,7 +881,8 @@ impl<'a> YumStore<'a> {
                 created_at: now,
                 store: self.store.to_string(),
             };
-            service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+            let blob_id =
+                service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
             let record = ArtifactRecord {
                 schema_version: CURRENT_RECORD_VERSION,
                 id: String::new(),

@@ -81,24 +81,6 @@ impl<'a> CargoStore<'a> {
 
         let path = crate_path(&meta.name, &meta.vers);
 
-        let record = ArtifactRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            id: String::new(),
-            size: crate_bytes.len() as u64,
-            content_type: "application/x-tar".to_string(),
-            kind: ArtifactKind::CargoCrate {
-                cargo: meta.clone(),
-            },
-            blob_id: Some(blob_id.clone()),
-            content_hash: Some(blake3_hash.clone()),
-            etag: Some(blake3_hash.clone()),
-            created_at: now,
-            updated_at: now,
-            last_accessed_at: now,
-            path: String::new(),
-            internal: false,
-        };
-
         let blob_rec = BlobRecord {
             schema_version: CURRENT_RECORD_VERSION,
             blob_id: blob_id.clone(),
@@ -109,8 +91,26 @@ impl<'a> CargoStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
+        let record = ArtifactRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            id: String::new(),
+            size: crate_bytes.len() as u64,
+            content_type: "application/x-tar".to_string(),
+            kind: ArtifactKind::CargoCrate {
+                cargo: meta.clone(),
+            },
+            blob_id: Some(blob_id),
+            content_hash: Some(blake3_hash.clone()),
+            etag: Some(blake3_hash.clone()),
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            path: String::new(),
+            internal: false,
+        };
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -136,24 +136,6 @@ impl<'a> CargoStore<'a> {
         let now = depot_core::repo::now_utc();
         let path = crate_path(&meta.name, &meta.vers);
 
-        let record = ArtifactRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            id: String::new(),
-            size,
-            content_type: "application/x-tar".to_string(),
-            kind: ArtifactKind::CargoCrate {
-                cargo: meta.clone(),
-            },
-            blob_id: Some(blob_id.to_string()),
-            content_hash: Some(blake3_hash.to_string()),
-            etag: Some(blake3_hash.to_string()),
-            created_at: now,
-            updated_at: now,
-            last_accessed_at: now,
-            path: String::new(),
-            internal: false,
-        };
-
         let blob_rec = BlobRecord {
             schema_version: CURRENT_RECORD_VERSION,
             blob_id: blob_id.to_string(),
@@ -164,8 +146,26 @@ impl<'a> CargoStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+
+        let record = ArtifactRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            id: String::new(),
+            size,
+            content_type: "application/x-tar".to_string(),
+            kind: ArtifactKind::CargoCrate {
+                cargo: meta.clone(),
+            },
+            blob_id: Some(blob_id),
+            content_hash: Some(blake3_hash.to_string()),
+            etag: Some(blake3_hash.to_string()),
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: now,
+            path: String::new(),
+            internal: false,
+        };
         let record_clone = record.clone();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
