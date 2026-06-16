@@ -33,8 +33,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Optional heavy deps — only pulled in by feature-gated error conversions
 # and shared repo infrastructure.
 axum = { version = "0.8", features = ["multipart"], optional = true }
-opentelemetry = { version = "0.31", optional = true }
-tracing-opentelemetry = { version = "0.32", optional = true }
+opentelemetry = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
 reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"], default-features = false, optional = true }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
 
