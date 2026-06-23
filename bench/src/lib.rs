@@ -4,4 +4,5 @@
 
 pub mod client;
 pub mod demo;
+pub mod reorg;
 pub mod runner;

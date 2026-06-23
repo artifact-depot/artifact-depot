@@ -7,7 +7,7 @@
 
 use clap::{Parser, Subcommand};
 
-use depot_bench::{client, demo, runner};
+use depot_bench::{client, demo, reorg, runner};
 
 #[derive(Parser)]
 #[command(
@@ -147,6 +147,37 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         pipeline: usize,
     },
+
+    /// Re-file Docker images into the right repositories by tag, per a rules file
+    Reorg {
+        /// Base URL of the depot instance
+        #[arg(long, default_value = "http://localhost:8080")]
+        url: String,
+
+        /// Username for authentication
+        #[arg(long, default_value = "admin")]
+        username: String,
+
+        /// Password for authentication
+        #[arg(long, default_value = "admin")]
+        password: String,
+
+        /// Skip TLS certificate verification
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
+
+        /// Path to the TOML rules file
+        #[arg(long)]
+        rules: String,
+
+        /// Perform the moves (default is a dry run that only prints the plan)
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        /// Use staging copy (leave the source intact) instead of move
+        #[arg(long, default_value_t = false)]
+        copy: bool,
+    },
 }
 
 #[tokio::main]
@@ -245,6 +276,34 @@ async fn main() -> anyhow::Result<()> {
                     store,
                     random_data,
                     pipeline,
+                },
+            )
+            .await?;
+        }
+
+        Command::Reorg {
+            url,
+            username,
+            password,
+            insecure,
+            rules,
+            apply,
+            copy,
+        } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "depot=info".into()),
+                )
+                .init();
+
+            let c = client::DepotClient::new(&url, &username, &password, insecure)?;
+            reorg::run(
+                &c,
+                reorg::ReorgConfig {
+                    rules_path: rules,
+                    apply,
+                    copy,
                 },
             )
             .await?;

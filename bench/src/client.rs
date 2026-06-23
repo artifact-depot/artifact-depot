@@ -1090,6 +1090,76 @@ impl DepotClient {
         Ok(resp.status().as_u16())
     }
 
+    // --- Nexus staging ops ---
+
+    /// `POST /service/rest/v1/staging/move/{dest}` — move a Docker `image:tag`
+    /// from `source` into `dest` (same blob store, metadata-only).
+    pub async fn staging_move(
+        &self,
+        source: &str,
+        dest: &str,
+        image: &str,
+        tag: &str,
+    ) -> Result<()> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .post(format!(
+                "{}/service/rest/v1/staging/move/{}",
+                self.base_url, dest
+            ))
+            .bearer_auth(&token)
+            .query(&[
+                ("repository", source),
+                ("docker.imageName", image),
+                ("docker.imageTag", tag),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "staging move {source}/{image}:{tag} -> {dest} failed ({status}): {body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `POST /service/rest/v1/staging/copy/{dest}` — copy a Docker `image:tag`
+    /// from `source` into `dest` (works across blob stores; leaves the source).
+    pub async fn staging_copy(
+        &self,
+        source: &str,
+        dest: &str,
+        image: &str,
+        tag: &str,
+    ) -> Result<()> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .post(format!(
+                "{}/service/rest/v1/staging/copy/{}",
+                self.base_url, dest
+            ))
+            .bearer_auth(&token)
+            .query(&[
+                ("repository", source),
+                ("docker.imageName", image),
+                ("docker.imageTag", tag),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "staging copy {source}/{image}:{tag} -> {dest} failed ({status}): {body}"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn docker_push_manifest_raw(
         &self,
         repo: &str,
