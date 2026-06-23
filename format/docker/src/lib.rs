@@ -8,5 +8,5 @@ pub mod api;
 pub mod promote;
 pub mod store;
 
-pub use promote::{copy_tag, delete_tag, PromoteOutcome};
+pub use promote::{copy_tag, delete_tag, CopyTarget, PromoteOutcome};
 pub use store::DockerStore;

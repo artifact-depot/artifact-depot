@@ -333,6 +333,10 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
             "/service/rest/v1/staging/delete",
             post(nexus_compat::staging_delete),
         )
+        .route(
+            "/service/rest/v1/staging/copy/{destination}",
+            post(nexus_compat::staging_copy),
+        )
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT));
 
     // --- Unified artifact/format route — dynamic limit from settings ---

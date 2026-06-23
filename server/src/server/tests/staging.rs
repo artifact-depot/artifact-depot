@@ -112,6 +112,27 @@ async fn post(app: &TestApp, uri: &str) -> (StatusCode, Value) {
     app.call(app.auth_request(Method::POST, uri, &token)).await
 }
 
+/// Register a second file-backed blob store rooted at a fresh temp dir.
+/// Returns the kept `TempDir` (drop it and the store's files vanish).
+async fn create_file_store(app: &TestApp, name: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let token = app.admin_token();
+    let (status, body) = app
+        .call(app.json_request(
+            Method::POST,
+            "/api/v1/stores",
+            &token,
+            json!({
+                "name": name,
+                "store_type": "file",
+                "root": tmp.path().to_str().unwrap(),
+            }),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create store {name}: {body}");
+    tmp
+}
+
 // ===========================================================================
 // staging/move
 // ===========================================================================
@@ -347,22 +368,7 @@ async fn staging_move_cross_store_rejected() {
     app.create_docker_repo("src").await;
 
     // Register a second file store and a destination repo on it.
-    let tmp = tempfile::tempdir().unwrap();
-    let token = app.admin_token();
-    let (status, body) = app
-        .call(app.json_request(
-            Method::POST,
-            "/api/v1/stores",
-            &token,
-            json!({
-                "name": "store2",
-                "store_type": "file",
-                "root": tmp.path().to_str().unwrap(),
-            }),
-        ))
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "create store2: {body}");
-
+    let _store2 = create_file_store(&app, "store2").await;
     app.create_repo(json!({
         "name": "dst2",
         "repo_type": "hosted",
@@ -442,4 +448,102 @@ async fn staging_delete_removes_tag() {
         head_manifest(&app, "src", "9.9.9").await,
         StatusCode::NOT_FOUND
     );
+}
+
+// ===========================================================================
+// staging/copy (cross-store)
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_copy_cross_store_streams_blobs() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("src").await; // on "default" store
+
+    let _store2 = create_file_store(&app, "store2").await;
+    app.create_repo(json!({
+        "name": "dst2",
+        "repo_type": "hosted",
+        "format": "docker",
+        "store": "store2",
+    }))
+    .await;
+
+    let cfg = app.push_docker_blob("src", b"cs-config").await;
+    let layer = app.push_docker_blob("src", b"cs-layer").await;
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    let mdigest = app.push_docker_manifest("src", "1.2.3", &manifest).await;
+
+    // Copy across stores (no deleteSource → source stays intact).
+    let (status, body) = post(
+        &app,
+        "/service/rest/v1/staging/copy/dst2?repository=src&docker.imageTag=1.2.3",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Destination (on store2) serves the manifest and the layer blob — the
+    // bytes were physically streamed into store2.
+    assert_eq!(head_manifest(&app, "dst2", "1.2.3").await, StatusCode::OK);
+    assert_eq!(head_manifest(&app, "dst2", &mdigest).await, StatusCode::OK);
+    assert_eq!(head_blob(&app, "dst2", &layer).await, StatusCode::OK);
+
+    // Copy (not move) leaves the source intact.
+    assert_eq!(head_manifest(&app, "src", "1.2.3").await, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_copy_cross_store_with_delete_source_is_a_move() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("src").await;
+
+    let _store2 = create_file_store(&app, "store2").await;
+    app.create_repo(json!({
+        "name": "dst2",
+        "repo_type": "hosted",
+        "format": "docker",
+        "store": "store2",
+    }))
+    .await;
+
+    let cfg = app.push_docker_blob("src", b"csm-config").await;
+    let layer = app.push_docker_blob("src", b"csm-layer").await;
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    app.push_docker_manifest("src", "2.0.0", &manifest).await;
+
+    let (status, body) = post(
+        &app,
+        "/service/rest/v1/staging/copy/dst2?repository=src&docker.imageTag=2.0.0&deleteSource=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(head_manifest(&app, "dst2", "2.0.0").await, StatusCode::OK);
+    assert_eq!(head_blob(&app, "dst2", &layer).await, StatusCode::OK);
+    // deleteSource removed the source tag.
+    assert_eq!(
+        head_manifest(&app, "src", "2.0.0").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_copy_same_store_also_works() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("src").await;
+    app.create_docker_repo("dst").await;
+
+    let cfg = app.push_docker_blob("src", b"ss-config").await;
+    let layer = app.push_docker_blob("src", b"ss-layer").await;
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    app.push_docker_manifest("src", "3.0.0", &manifest).await;
+
+    let (status, body) = post(
+        &app,
+        "/service/rest/v1/staging/copy/dst?repository=src&docker.imageTag=3.0.0",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(head_manifest(&app, "dst", "3.0.0").await, StatusCode::OK);
+    assert_eq!(head_blob(&app, "dst", &layer).await, StatusCode::OK);
+    assert_eq!(head_manifest(&app, "src", "3.0.0").await, StatusCode::OK);
 }

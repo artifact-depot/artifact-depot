@@ -11,22 +11,26 @@
 //! point at content-addressable blobs that are shared store-wide.
 //!
 //! When the source and destination repositories live in the **same** blob
-//! store, re-homing a tag is therefore a metadata-only operation: copy the
-//! records into the destination repo (verbatim, so timestamps are preserved —
-//! see [`crate::promote::copy_tag`]); no blob bytes move. This mirrors how
-//! `clone_repo` copies records, but selectively for a single tag.
+//! store, re-homing a tag is a metadata-only operation: the records are copied
+//! into the destination repo verbatim (so timestamps are preserved) and no blob
+//! bytes move. This mirrors how `clone_repo` copies records, but selectively for
+//! a single tag.
 //!
-//! Cross-store copy (which must physically stream blob bytes into the
-//! destination store) is intentionally out of scope here; this module rejects
-//! a differing-store request so the caller can route it to the dedicated
-//! cross-store copy path.
+//! When the destination is on a **different** blob store, the bytes can't be
+//! shared, so each blob-backed record's data is streamed into the destination
+//! store (and de-duplicated there) before the record is written. Both paths are
+//! driven by [`CopyTarget`], which selects the strategy from whether the two
+//! stores match.
 
 use std::collections::BTreeSet;
 
 use depot_core::error::{self, DepotError};
+use depot_core::repo::now_utc;
 use depot_core::service;
 use depot_core::store::blob::BlobStore;
-use depot_core::store::kv::{ArtifactKind, KvStore};
+use depot_core::store::kv::{
+    ArtifactKind, ArtifactRecord, BlobRecord, KvStore, CURRENT_RECORD_VERSION,
+};
 use depot_core::update::UpdateSender;
 
 use crate::store::{blob_ref_path_for, manifest_path_for, tag_path_for};
@@ -41,35 +45,119 @@ pub struct PromoteOutcome {
     pub copied_records: u64,
 }
 
-/// Copy — and optionally move — a single Docker tag `image:tag` from
-/// `source_repo` to `dest_repo` within the **same** blob store (`store`).
+/// Source and destination context for a tag copy/move.
 ///
-/// Metadata-only: blob bytes are shared, not duplicated. Record timestamps
-/// (`created_at` / `last_accessed_at`) are preserved so the destination repo's
-/// retention policy is applied against the artifact's true age.
+/// When `source_store == dest_store` the two repos share a content-addressable
+/// blob store, so records are copied verbatim and no bytes move. When the
+/// stores differ, each blob-backed record's bytes are streamed into the
+/// destination store (and de-duplicated there) before the record is written —
+/// the cross-store copy path. Either way, record timestamps are preserved.
+pub struct CopyTarget<'a> {
+    pub kv: &'a dyn KvStore,
+    pub updater: &'a UpdateSender,
+    pub source_repo: &'a str,
+    pub source_store: &'a str,
+    pub source_blobs: &'a dyn BlobStore,
+    pub dest_repo: &'a str,
+    pub dest_store: &'a str,
+    pub dest_blobs: &'a dyn BlobStore,
+}
+
+impl CopyTarget<'_> {
+    fn same_store(&self) -> bool {
+        self.source_store == self.dest_store
+    }
+
+    /// Copy one artifact record from the source repo to the destination repo,
+    /// preserving its timestamps, and keep the destination's directory + store
+    /// counters in step. Returns 1 if a record was copied, 0 if the source
+    /// record was absent.
+    async fn copy_record(&self, path: &str) -> error::Result<u64> {
+        let rec = match service::get_artifact(self.kv, self.source_repo, path).await? {
+            Some(r) => r,
+            None => return Ok(0),
+        };
+        let dest_rec = if self.same_store() {
+            // Shared store: the blob pointer is valid as-is, copy verbatim.
+            rec
+        } else {
+            // Different store: stream the blob bytes across, re-point the record.
+            self.rehome_blob(rec).await?
+        };
+        let old = service::put_artifact(self.kv, self.dest_repo, path, &dest_rec).await?;
+        let (cd, bd) = delta(dest_rec.size, old.as_ref().map(|r| r.size));
+        self.updater.dir_changed(self.dest_repo, path, cd, bd).await;
+        self.updater.store_changed(self.dest_store, cd, bd).await;
+        Ok(1)
+    }
+
+    /// Stream a blob-backed record's bytes from the source store into the
+    /// destination store (de-duplicating there) and return the record cloned
+    /// with its `blob_id` re-pointed at the destination blob. Records without a
+    /// blob (e.g. tags) are returned unchanged. Timestamps are preserved.
+    async fn rehome_blob(&self, rec: ArtifactRecord) -> error::Result<ArtifactRecord> {
+        let blob_id = match rec.blob_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return Ok(rec),
+        };
+        let data = self.source_blobs.get(&blob_id).await?.ok_or_else(|| {
+            DepotError::DataIntegrity(format!(
+                "blob {blob_id} missing in source store '{}'",
+                self.source_store
+            ))
+        })?;
+        let blake3 = rec
+            .content_hash
+            .clone()
+            .unwrap_or_else(|| blake3::hash(&data).to_hex().to_string());
+
+        let new_blob_id = uuid::Uuid::new_v4().to_string();
+        self.dest_blobs.put(&new_blob_id, &data).await?;
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: new_blob_id.clone(),
+            hash: blake3,
+            size: data.len() as u64,
+            created_at: now_utc(),
+            store: self.dest_store.to_string(),
+        };
+        let existing = service::put_dedup_record(self.kv, self.dest_store, &blob_rec).await?;
+        let effective = existing.clone().unwrap_or_else(|| new_blob_id.clone());
+        // If the destination store already had this content, drop our upload.
+        if existing.is_some() {
+            let _ = self.dest_blobs.delete(&new_blob_id).await;
+        }
+
+        let mut dest_rec = rec;
+        dest_rec.blob_id = Some(effective);
+        Ok(dest_rec)
+    }
+}
+
+/// Copy — and optionally move — a single Docker tag `image:tag` between the
+/// repositories described by `t`.
+///
+/// Walks the tag's manifest closure (the manifest, plus the children of a
+/// multi-arch manifest list, plus the config/layer blob references) and copies
+/// every record into the destination repo, preserving `created_at` /
+/// `last_accessed_at` so the destination's retention policy is applied against
+/// the artifact's true age. Same-store copies move no bytes; cross-store copies
+/// stream the blobs into the destination store (see [`CopyTarget`]).
 ///
 /// When `delete_source` is `true` this is a *move*: after the copy succeeds,
 /// only the **source tag** record is removed. The now-orphaned manifest and
-/// blob records in the source repo are left to `docker_gc`, which reclaims
-/// them once no surviving tag references them — so layers shared with other
-/// tags in the source repo are never clobbered.
+/// blob records in the source repo are left to `docker_gc`, which reclaims them
+/// once no surviving tag references them — so layers shared with other tags in
+/// the source repo are never clobbered.
 ///
 /// `overwrite` governs only the destination *tag* collision; shared
 /// manifest/blob records are always upserted idempotently.
 ///
 /// # Errors
-/// - [`DepotError::BadRequest`] if `source_store` differs from `dest_store`
-///   (cross-store requires the byte-copy path, not this metadata move).
 /// - [`DepotError::NotFound`] if the source tag does not exist.
 /// - [`DepotError::Conflict`] if the destination tag exists and `!overwrite`.
-#[allow(clippy::too_many_arguments)]
 pub async fn copy_tag(
-    kv: &dyn KvStore,
-    blobs: &dyn BlobStore,
-    updater: &UpdateSender,
-    source_repo: &str,
-    dest_repo: &str,
-    store: &str,
+    t: &CopyTarget<'_>,
     image: Option<&str>,
     tag: &str,
     delete_source: bool,
@@ -78,30 +166,33 @@ pub async fn copy_tag(
     let tag_path = tag_path_for(image, tag);
 
     // Resolve the tag → root manifest digest.
-    let tag_rec = service::get_artifact(kv, source_repo, &tag_path)
+    let tag_rec = service::get_artifact(t.kv, t.source_repo, &tag_path)
         .await?
         .ok_or_else(|| {
             DepotError::NotFound(format!(
-                "tag '{tag}' not found in repository '{source_repo}'"
+                "tag '{tag}' not found in repository '{}'",
+                t.source_repo
             ))
         })?;
     let root_digest = match &tag_rec.kind {
         ArtifactKind::DockerTag { digest, .. } => digest.clone(),
         _ => {
             return Err(DepotError::DataIntegrity(format!(
-                "record at '{tag_path}' in '{source_repo}' is not a Docker tag"
+                "record at '{tag_path}' in '{}' is not a Docker tag",
+                t.source_repo
             )))
         }
     };
 
     // Destination tag collision check.
     if !overwrite
-        && service::get_artifact(kv, dest_repo, &tag_path)
+        && service::get_artifact(t.kv, t.dest_repo, &tag_path)
             .await?
             .is_some()
     {
         return Err(DepotError::Conflict(format!(
-            "tag '{tag}' already exists in repository '{dest_repo}' (set overwrite to replace)"
+            "tag '{tag}' already exists in repository '{}' (set overwrite to replace)",
+            t.dest_repo
         )));
     }
 
@@ -118,11 +209,12 @@ pub async fn copy_tag(
             continue;
         }
         let manifest_path = manifest_path_for(image, &digest);
-        let json = read_manifest_json(kv, blobs, source_repo, &manifest_path)
+        let json = read_manifest_json(t.kv, t.source_blobs, t.source_repo, &manifest_path)
             .await?
             .ok_or_else(|| {
                 DepotError::DataIntegrity(format!(
-                    "manifest '{digest}' referenced by tag '{tag}' is missing in '{source_repo}'"
+                    "manifest '{digest}' referenced by tag '{tag}' is missing in '{}'",
+                    t.source_repo
                 ))
             })?;
         manifest_digests.push(digest);
@@ -140,43 +232,16 @@ pub async fn copy_tag(
     // pullable image), then the tag last.
     let mut copied = 0u64;
     for digest in &blob_digests {
-        copied += copy_record(
-            kv,
-            updater,
-            source_repo,
-            dest_repo,
-            store,
-            &blob_ref_path_for(digest),
-        )
-        .await?;
+        copied += t.copy_record(&blob_ref_path_for(digest)).await?;
     }
     for digest in &manifest_digests {
-        copied += copy_record(
-            kv,
-            updater,
-            source_repo,
-            dest_repo,
-            store,
-            &manifest_path_for(image, digest),
-        )
-        .await?;
+        copied += t.copy_record(&manifest_path_for(image, digest)).await?;
     }
-
-    // Tag last — we already hold its record, write it verbatim.
-    let old_tag = service::put_artifact(kv, dest_repo, &tag_path, &tag_rec).await?;
-    let (cd, bd) = delta(tag_rec.size, old_tag.as_ref().map(|r| r.size));
-    updater.dir_changed(dest_repo, &tag_path, cd, bd).await;
-    updater.store_changed(store, cd, bd).await;
-    copied += 1;
+    copied += t.copy_record(&tag_path).await?;
 
     // Move: drop only the source tag; docker_gc reclaims orphaned bookkeeping.
     if delete_source {
-        if let Some(old) = service::delete_artifact(kv, source_repo, &tag_path).await? {
-            updater
-                .dir_changed(source_repo, &tag_path, -1, -(old.size as i64))
-                .await;
-            updater.store_changed(store, -1, -(old.size as i64)).await;
-        }
+        delete_tag(t.kv, t.updater, t.source_repo, t.source_store, image, tag).await?;
     }
 
     Ok(PromoteOutcome {
@@ -209,29 +274,6 @@ pub async fn delete_tag(
         }
         None => Ok(false),
     }
-}
-
-/// Copy one artifact record verbatim from `source_repo` to `dest_repo`,
-/// preserving its timestamps/id/blob pointer, and keep the destination's
-/// directory + store counters in step. Returns 1 if a record was copied,
-/// 0 if the source record was absent.
-async fn copy_record(
-    kv: &dyn KvStore,
-    updater: &UpdateSender,
-    source_repo: &str,
-    dest_repo: &str,
-    store: &str,
-    path: &str,
-) -> error::Result<u64> {
-    let rec = match service::get_artifact(kv, source_repo, path).await? {
-        Some(r) => r,
-        None => return Ok(0),
-    };
-    let old = service::put_artifact(kv, dest_repo, path, &rec).await?;
-    let (cd, bd) = delta(rec.size, old.as_ref().map(|r| r.size));
-    updater.dir_changed(dest_repo, path, cd, bd).await;
-    updater.store_changed(store, cd, bd).await;
-    Ok(1)
 }
 
 /// `(count_delta, bytes_delta)` for upserting a record of `new_size` over an
