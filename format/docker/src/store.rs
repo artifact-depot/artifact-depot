@@ -57,14 +57,14 @@ pub const MANIFEST_ACCEPT: &str = "application/vnd.docker.distribution.manifest.
 
 // --- Path helpers ---
 
-fn manifest_path_for(image: Option<&str>, digest: &str) -> String {
+pub(crate) fn manifest_path_for(image: Option<&str>, digest: &str) -> String {
     match image {
         Some(img) => format!("{img}/_manifests/{digest}"),
         None => format!("_manifests/{digest}"),
     }
 }
 
-fn tag_path_for(image: Option<&str>, tag: &str) -> String {
+pub(crate) fn tag_path_for(image: Option<&str>, tag: &str) -> String {
     match image {
         Some(img) => format!("{img}/_tags/{tag}"),
         None => format!("_tags/{tag}"),
@@ -78,7 +78,7 @@ fn tag_prefix_for(image: Option<&str>) -> String {
     }
 }
 
-fn blob_ref_path_for(digest: &str) -> String {
+pub(crate) fn blob_ref_path_for(digest: &str) -> String {
     format!("_blobs/{digest}")
 }
 

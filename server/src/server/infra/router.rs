@@ -324,6 +324,15 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
         )
         .route("/service/rest/v1/status", get(nexus_compat::status))
         .route("/service/rest/v1/assets", get(nexus_compat::search_assets))
+        // Nexus-compatible staging: move/delete components by search criteria.
+        .route(
+            "/service/rest/v1/staging/move/{destination}",
+            post(nexus_compat::staging_move),
+        )
+        .route(
+            "/service/rest/v1/staging/delete",
+            post(nexus_compat::staging_delete),
+        )
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT));
 
     // --- Unified artifact/format route — dynamic limit from settings ---
