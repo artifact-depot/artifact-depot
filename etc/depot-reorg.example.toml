@@ -1,40 +1,75 @@
 # Example rules for `depot-bench reorg`.
 #
-# Re-files first-party Docker images out of the source repos and into the
-# right destination repo based on each tag's shape. Run a dry run first:
+# Everything is data-driven from this file — no repo names, image prefixes, or
+# tag conventions are compiled into depot. Run a dry run first:
 #
-#   depot-bench reorg --url https://repository.mdh.quantum.com \
+#   depot-bench reorg --url https://depot-dev.lab.mdh.quantum.com \
 #       --username admin --password ... --rules etc/depot-reorg.example.toml
 #
-# then add --apply to perform the moves (or --copy for a non-destructive pass
-# that leaves the source intact).
+# then add --apply to execute (or --copy for a non-destructive pass that uses
+# staging/copy for moves and skips all deletes/purges).
 
-# Repositories to drain of first-party images.
-source_repos = ["docker-internal", "docker-upstream", "docker-external"]
+# --------------------------------------------------------------------------
+# Reusable named patterns. Reference any by name from a rule's `match`, or
+# inline a regex there. Patterns are auto-anchored (^(?:…)$), so write them
+# without ^ / $. Shared across every group below (and future helm/raw groups).
+# --------------------------------------------------------------------------
+[patterns]
+released   = '\d+\.\d+\.\d+'
+prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+'
+develop    = 'develop'
+ci         = 'ci-.+-\d+'
+developer  = '[a-z][a-z0-9]*-\d+'
 
-# Only images whose name starts with one of these prefixes are touched;
-# everything else (third-party content) is left in place.
+# --------------------------------------------------------------------------
+# One group per artifact format. Only `docker` is supported by the server-side
+# movers today; helm/raw groups will reuse the same [patterns] once those land.
+# --------------------------------------------------------------------------
+[[group]]
+format               = "docker"
+source_repos         = ["docker-internal", "docker-external"]
 first_party_prefixes = ["myriad/", "qkp/", "orchestrator/"]
+purge_repos          = ["docker-upstream"]   # dead cache (upstream gone): emptied wholesale
 
-# Released x.y.z images that are supplementary (not customer-facing) route to
-# dest.released_aux instead of dest.released. These are the images the projects'
-# .gitlab-ci.yml publish jobs send to ${DOCKER_INTERNAL} (release_aux) rather
-# than ${DOCKER_EXTERNAL} (release). Keep this list in sync with those jobs.
-aux_images = [
-    "myriad/test_exec_web",
-    "myriad/uncrustifier",
-]
+  # Ordered; first matching rule wins.
 
-[dest]
-# x.y.z  (released semver), customer-facing
-released = "docker-insight"
-# x.y.z  (released semver), supplementary
-released_aux = "docker-release-aux"
-# x.y.z-dev.n / x.y.z-rc.n  (prerelease semver)
-prerelease = "docker-prerelease"
-# the rolling `develop` tag
-develop = "docker-prerelease"
-# ci-*-<n>  (CI builds)
-ci = "docker-development-local"
-# <name>-<n>  (developer builds, e.g. slord-79)
-developer = "docker-development-local"
+  # x.y.z-dev.n / -rc.n  → prerelease repo
+  [[group.rule]]
+  match  = "prerelease"
+  action = "move"
+  dest   = "docker-prerelease"
+
+  # x.y.z, supplementary images only → release-aux. Keep this list in sync with
+  # each project's .gitlab-ci.yml publish job (the images sent to ${DOCKER_INTERNAL}
+  # / release_aux rather than ${DOCKER_EXTERNAL} / release).
+  [[group.rule]]
+  match  = "released"
+  images = ["myriad/test_exec_web", "myriad/uncrustifier"]
+  action = "move"
+  dest   = "docker-release-aux"
+
+  # x.y.z, everything else (primary) → docker-insight is a cache of the canonical
+  # release registry, so don't move there; delete from source only if insight
+  # doesn't already serve it.
+  [[group.rule]]
+  match  = "released"
+  action = "delete_if_absent"
+  check  = "docker-insight"
+
+  # rolling develop tag → prerelease repo
+  [[group.rule]]
+  match  = "develop"
+  action = "move"
+  dest   = "docker-prerelease"
+
+  # ci-*-<n>  → development-local
+  [[group.rule]]
+  match  = "ci"
+  action = "move"
+  dest   = "docker-development-local"
+
+  # <name>-<n> (e.g. slord-79) → development-local
+  [[group.rule]]
+  match  = "developer"
+  action = "move"
+  dest   = "docker-development-local"

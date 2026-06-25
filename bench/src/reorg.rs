@@ -2,64 +2,127 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tag-based Docker repository reorganization.
+//! Rules-driven artifact repository reorganization.
 //!
-//! Scans a set of source Docker repositories for first-party images and
-//! re-files each `image:tag` into the correct destination repository based on
-//! the tag shape (released semver, prerelease, `develop`, CI build, developer
-//! build). Classification destinations come from a TOML rules file; the tag
-//! matchers themselves are built in.
+//! Everything is data-driven by a TOML rules file — the product compiles no
+//! repo names, image prefixes, or tag conventions. The file defines:
 //!
-//! Runs as a dry-run by default — it prints the planned moves and an
-//! "unclassified" bucket so nothing is moved without review — and performs the
-//! moves only with `apply`. The moves are issued against the Nexus-compatible
-//! staging endpoints (`staging/move`, or `staging/copy` when `copy` is set so
-//! the source is left intact for a non-destructive first pass).
+//! - `[patterns]` — reusable named regexes (referenced by name from any rule,
+//!   or a rule may inline a regex). Patterns are auto-anchored (`^(?:…)$`).
+//! - `[[group]]` — one per artifact `format` (docker today; helm/raw later
+//!   reuse the same patterns). A group lists its source repos, the image-name
+//!   prefixes considered first-party, repos to purge wholesale, and an ordered
+//!   list of `[[group.rule]]`.
+//!
+//! Each rule matches a tag (by pattern name or inline regex) with an optional
+//! exact-image filter, and carries an `action`:
+//!
+//! - `move` — relocate the tag into `dest` (staging/move)
+//! - `delete_if_absent` — delete from source only if `check` repo lacks it
+//! - `delete` — delete from source unconditionally
+//! - `leave` — leave in place (reported)
+//!
+//! First matching rule wins; an unmatched tag is left in place.
+//!
+//! Dry-run by default (prints the plan; changes nothing). `--apply` executes;
+//! `--copy` uses staging/copy for moves and skips every destructive action.
 
-use anyhow::{Context, Result};
+use std::collections::{BTreeMap, HashMap};
+
+use anyhow::{bail, Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 
 use crate::client::DepotClient;
 
-/// Destination repository for each tag category.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Dest {
-    /// Released `x.y.z` images that customers download.
-    pub released: String,
-    /// Released `x.y.z` images that are supplementary (not customer-facing).
-    pub released_aux: String,
-    /// Prerelease `x.y.z-dev.n` / `-rc.n` images.
-    pub prerelease: String,
-    /// The rolling `develop` tag.
-    pub develop: String,
-    /// CI build images (`ci-*-<n>`).
-    pub ci: String,
-    /// Developer build images (`<name>-<n>`, e.g. `slord-79`).
-    pub developer: String,
+// ---------------------------------------------------------------------------
+// Rules file (TOML)
+// ---------------------------------------------------------------------------
+
+/// The action a rule applies to a matching `image:tag`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// Relocate the tag into `dest`.
+    Move,
+    /// Delete from source only if the `check` repo does not have the tag.
+    DeleteIfAbsent,
+    /// Delete from source unconditionally.
+    Delete,
+    /// Leave in place (reported).
+    Leave,
 }
 
-/// Reorg rules, loaded from a TOML file.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Rules {
-    /// Repositories to drain of first-party images.
-    pub source_repos: Vec<String>,
-    /// Only images whose name starts with one of these prefixes are touched
-    /// (e.g. `myriad/`, `qkp/`, `orchestrator/`). Everything else is left in
-    /// place (third-party content).
-    pub first_party_prefixes: Vec<String>,
-    /// Destination repositories per tag category.
-    pub dest: Dest,
-    /// Released images that are supplementary and route to `dest.released_aux`
-    /// instead of `dest.released` (exact image-name match).
+pub struct Rule {
+    /// Pattern name (from `[patterns]`) or an inline regex.
+    #[serde(rename = "match")]
+    pub match_: String,
+    /// Optional exact image-name filter; empty = any image.
     #[serde(default)]
-    pub aux_images: Vec<String>,
+    pub images: Vec<String>,
+    pub action: Action,
+    /// Destination repo for `move`.
+    #[serde(default)]
+    pub dest: Option<String>,
+    /// Presence-check repo for `delete_if_absent`.
+    #[serde(default)]
+    pub check: Option<String>,
 }
 
-impl Rules {
+#[derive(Debug, Clone, Deserialize)]
+pub struct Group {
+    /// Artifact format this group applies to (`docker` is the only one
+    /// currently supported by the server-side movers).
+    pub format: String,
+    #[serde(default)]
+    pub source_repos: Vec<String>,
+    /// Image-name prefixes considered first-party; only these are touched.
+    #[serde(default)]
+    pub first_party_prefixes: Vec<String>,
+    /// Repos emptied wholesale (every image/tag), e.g. a dead cache.
+    #[serde(default)]
+    pub purge_repos: Vec<String>,
+    #[serde(default, rename = "rule")]
+    pub rules: Vec<Rule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RulesFile {
+    /// Reusable named regexes.
+    #[serde(default)]
+    pub patterns: HashMap<String, String>,
+    #[serde(default)]
+    pub group: Vec<Group>,
+}
+
+impl RulesFile {
     pub fn from_toml(text: &str) -> Result<Self> {
         toml::from_str(text).context("parse reorg rules TOML")
     }
+}
 
+// ---------------------------------------------------------------------------
+// Compiled form
+// ---------------------------------------------------------------------------
+
+struct CompiledRule {
+    re: Regex,
+    images: Vec<String>,
+    action: Action,
+    dest: Option<String>,
+    check: Option<String>,
+}
+
+struct CompiledGroup {
+    format: String,
+    source_repos: Vec<String>,
+    first_party_prefixes: Vec<String>,
+    purge_repos: Vec<String>,
+    rules: Vec<CompiledRule>,
+}
+
+impl CompiledGroup {
     fn is_first_party(&self, image: &str) -> bool {
         self.first_party_prefixes
             .iter()
@@ -67,7 +130,89 @@ impl Rules {
     }
 }
 
-/// A single planned relocation.
+/// What to do with one `image:tag`, resolved from the first matching rule.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision<'a> {
+    Move(&'a str),
+    DeleteIfAbsent(&'a str),
+    Delete,
+    Leave,
+}
+
+/// Resolve a rule's `match` (pattern name or inline regex) to an anchored regex.
+fn compile_match(patterns: &HashMap<String, String>, match_: &str) -> Result<Regex> {
+    let src = patterns.get(match_).map(String::as_str).unwrap_or(match_);
+    Regex::new(&format!("^(?:{src})$"))
+        .with_context(|| format!("compile regex for match '{match_}' (resolved: '{src}')"))
+}
+
+/// Compile and validate every group's rules.
+fn compile_groups(rules: &RulesFile) -> Result<Vec<CompiledGroup>> {
+    let mut out = Vec::new();
+    for g in &rules.group {
+        let mut crules = Vec::new();
+        for r in &g.rules {
+            match r.action {
+                Action::Move if r.dest.is_none() => {
+                    bail!("rule match='{}' action=move requires 'dest'", r.match_)
+                }
+                Action::DeleteIfAbsent if r.check.is_none() => {
+                    bail!(
+                        "rule match='{}' action=delete_if_absent requires 'check'",
+                        r.match_
+                    )
+                }
+                _ => {}
+            }
+            crules.push(CompiledRule {
+                re: compile_match(&rules.patterns, &r.match_)?,
+                images: r.images.clone(),
+                action: r.action,
+                dest: r.dest.clone(),
+                check: r.check.clone(),
+            });
+        }
+        out.push(CompiledGroup {
+            format: g.format.clone(),
+            source_repos: g.source_repos.clone(),
+            first_party_prefixes: g.first_party_prefixes.clone(),
+            purge_repos: g.purge_repos.clone(),
+            rules: crules,
+        });
+    }
+    Ok(out)
+}
+
+/// Apply the group's rules to an `image:tag` — first match (regex matches the
+/// tag and the optional image filter passes) wins.
+fn decide<'a>(group: &'a CompiledGroup, image: &str, tag: &str) -> Decision<'a> {
+    for r in &group.rules {
+        let image_ok = r.images.is_empty() || r.images.iter().any(|i| i == image);
+        if image_ok && r.re.is_match(tag) {
+            return match r.action {
+                Action::Move => Decision::Move(r.dest.as_deref().unwrap_or_default()),
+                Action::DeleteIfAbsent => {
+                    Decision::DeleteIfAbsent(r.check.as_deref().unwrap_or_default())
+                }
+                Action::Delete => Decision::Delete,
+                Action::Leave => Decision::Leave,
+            };
+        }
+    }
+    Decision::Leave
+}
+
+// ---------------------------------------------------------------------------
+// Plan
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRef {
+    pub source_repo: String,
+    pub image: String,
+    pub tag: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedMove {
     pub source_repo: String,
@@ -76,186 +221,137 @@ pub struct PlannedMove {
     pub dest: String,
 }
 
-/// An `image:tag` whose tag matched no category.
+/// A delete gated on absence from a presence-check repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unclassified {
-    pub source_repo: String,
-    pub image: String,
-    pub tag: String,
+pub struct ConditionalDelete {
+    pub tag: TagRef,
+    pub check_repo: String,
 }
 
-/// Result of planning a reorg over an inventory.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     pub moves: Vec<PlannedMove>,
-    pub unclassified: Vec<Unclassified>,
+    pub conditional_deletes: Vec<ConditionalDelete>,
+    pub deletes: Vec<TagRef>,
+    pub leaves: Vec<TagRef>,
 }
 
-// --- Tag classification (built-in matchers) ---
-
-fn all_digits(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// `x.y.z` — three numeric, dot-separated components.
-fn is_released_semver(tag: &str) -> bool {
-    let parts: Vec<&str> = tag.split('.').collect();
-    parts.len() == 3 && parts.iter().all(|p| all_digits(p))
-}
-
-/// `x.y.z-dev.n` or `x.y.z-rc.n`.
-fn is_prerelease_semver(tag: &str) -> bool {
-    let Some((base, suffix)) = tag.split_once('-') else {
-        return false;
-    };
-    if !is_released_semver(base) {
-        return false;
-    }
-    match suffix.split_once('.') {
-        Some((kind, num)) => matches!(kind, "dev" | "rc") && all_digits(num),
-        None => false,
-    }
-}
-
-/// `ci-<something>-<n>` (e.g. `ci-build-4821`).
-fn is_ci(tag: &str) -> bool {
-    let Some((prefix, num)) = tag.rsplit_once('-') else {
-        return false;
-    };
-    prefix.starts_with("ci-") && prefix.len() > 3 && all_digits(num)
-}
-
-/// `<name>-<n>` where name is a single lowercase-alphanumeric word starting
-/// with a letter (e.g. `slord-79`).
-fn is_developer(tag: &str) -> bool {
-    let Some((name, num)) = tag.rsplit_once('-') else {
-        return false;
-    };
-    if !all_digits(num) {
-        return false;
-    }
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() => {}
-        _ => return false,
-    }
-    name.bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-}
-
-/// Classify a tag into its destination repository, or `None` if it matches no
-/// known category. Order matters: prerelease is checked before released so the
-/// `-dev.n` suffix isn't mistaken for plain semver.
-pub fn classify<'a>(rules: &'a Rules, image: &str, tag: &str) -> Option<&'a str> {
-    if is_prerelease_semver(tag) {
-        Some(&rules.dest.prerelease)
-    } else if is_released_semver(tag) {
-        if rules.aux_images.iter().any(|a| a == image) {
-            Some(&rules.dest.released_aux)
-        } else {
-            Some(&rules.dest.released)
-        }
-    } else if tag == "develop" {
-        Some(&rules.dest.develop)
-    } else if is_ci(tag) {
-        Some(&rules.dest.ci)
-    } else if is_developer(tag) {
-        Some(&rules.dest.developer)
-    } else {
-        None
-    }
-}
-
-/// Build the plan from a flat inventory of `(source_repo, image, tag)`.
-/// Non-first-party images are skipped entirely (left in place); first-party
-/// tags are either classified into a move or recorded as unclassified.
-pub fn build_plan(rules: &Rules, inventory: &[(String, String, String)]) -> Plan {
+/// Build a plan for one group from its `(image, tag)` inventory. Pure: no I/O.
+fn build_group_plan(
+    group: &CompiledGroup,
+    inventory: &[(String, String)],
+    source_repo: &str,
+) -> Plan {
     let mut plan = Plan::default();
-    for (source_repo, image, tag) in inventory {
-        if !rules.is_first_party(image) {
+    for (image, tag) in inventory {
+        if !group.is_first_party(image) {
             continue;
         }
-        match classify(rules, image, tag) {
-            Some(dest) => plan.moves.push(PlannedMove {
-                source_repo: source_repo.clone(),
+        let tagref = || TagRef {
+            source_repo: source_repo.to_string(),
+            image: image.clone(),
+            tag: tag.clone(),
+        };
+        match decide(group, image, tag) {
+            Decision::Move(dest) => plan.moves.push(PlannedMove {
+                source_repo: source_repo.to_string(),
                 image: image.clone(),
                 tag: tag.clone(),
                 dest: dest.to_string(),
             }),
-            None => plan.unclassified.push(Unclassified {
-                source_repo: source_repo.clone(),
-                image: image.clone(),
-                tag: tag.clone(),
+            Decision::DeleteIfAbsent(check) => plan.conditional_deletes.push(ConditionalDelete {
+                tag: tagref(),
+                check_repo: check.to_string(),
             }),
+            Decision::Delete => plan.deletes.push(tagref()),
+            Decision::Leave => plan.leaves.push(tagref()),
         }
     }
     plan
 }
 
-/// Configuration for a reorg run.
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+
 pub struct ReorgConfig {
     pub rules_path: String,
-    /// Perform the moves. When false (default), only print the plan.
+    /// Perform the actions. When false (default), only print the plan.
     pub apply: bool,
-    /// Use `staging/copy` (leave source intact) instead of `staging/move`.
+    /// Use `staging/copy` for moves and skip all destructive actions.
     pub copy: bool,
 }
 
-/// Fetch the full `(source_repo, image, tag)` inventory across the rules'
-/// source repos.
-async fn fetch_inventory(
-    client: &DepotClient,
-    rules: &Rules,
-) -> Result<Vec<(String, String, String)>> {
-    let mut inventory = Vec::new();
-    for repo in &rules.source_repos {
-        let images = client
-            .docker_repo_catalog(repo)
-            .await
-            .with_context(|| format!("list images in '{repo}'"))?;
-        for image in images {
-            if !rules.is_first_party(&image) {
-                continue;
-            }
-            let tags = client
-                .docker_list_tags(repo, &image)
-                .await
-                .with_context(|| format!("list tags for '{repo}/{image}'"))?;
-            for tag in tags {
-                inventory.push((repo.clone(), image.clone(), tag));
-            }
-        }
-    }
-    Ok(inventory)
+/// Resolved, ready-to-execute plan (after presence checks + purge enumeration).
+#[derive(Default)]
+struct ResolvedPlan {
+    moves: Vec<PlannedMove>,
+    deletes: Vec<TagRef>,
+    kept: Vec<TagRef>,
+    leaves: Vec<TagRef>,
+    purges: Vec<TagRef>,
 }
 
-/// Run the reorg: load rules, fetch inventory, plan, print, and (if `apply`)
-/// execute the moves.
 pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
     let text = std::fs::read_to_string(&cfg.rules_path)
         .with_context(|| format!("read rules file '{}'", cfg.rules_path))?;
-    let rules = Rules::from_toml(&text)?;
+    let rules = RulesFile::from_toml(&text)?;
+    let groups = compile_groups(&rules)?;
     client.login().await?;
 
-    let inventory = fetch_inventory(client, &rules).await?;
-    let plan = build_plan(&rules, &inventory);
+    let mut resolved = ResolvedPlan::default();
 
-    print_plan(&plan, cfg.copy);
+    for group in &groups {
+        if group.format != "docker" {
+            bail!(
+                "format '{}' is not supported yet (only 'docker'); \
+                 add server-side movers before using it",
+                group.format
+            );
+        }
+
+        for repo in &group.source_repos {
+            let inv = list_repo_tags(client, repo).await?;
+            let plan = build_group_plan(group, &inv, repo);
+            resolved.moves.extend(plan.moves);
+            resolved.deletes.extend(plan.deletes);
+            resolved.leaves.extend(plan.leaves);
+
+            // Resolve conditional deletes via a presence check.
+            for cd in plan.conditional_deletes {
+                if insight_has(client, &cd.check_repo, &cd.tag.image, &cd.tag.tag).await? {
+                    resolved.kept.push(cd.tag);
+                } else {
+                    resolved.deletes.push(cd.tag);
+                }
+            }
+        }
+
+        // Purge repos: every image/tag.
+        for repo in &group.purge_repos {
+            for (image, tag) in list_repo_tags(client, repo).await? {
+                resolved.purges.push(TagRef {
+                    source_repo: repo.clone(),
+                    image,
+                    tag,
+                });
+            }
+        }
+    }
+
+    print_plan(&resolved, cfg.copy);
 
     if !cfg.apply {
-        println!(
-            "\nDry run — no changes made. Re-run with --apply to {} {} tag(s).",
-            if cfg.copy { "copy" } else { "move" },
-            plan.moves.len()
-        );
+        println!("\nDry run — no changes made. Re-run with --apply to execute.");
         return Ok(());
     }
 
-    let verb = if cfg.copy { "copy" } else { "move" };
     let mut ok = 0usize;
     let mut failed = 0usize;
-    for m in &plan.moves {
-        let result = if cfg.copy {
+    let verb = if cfg.copy { "copy" } else { "move" };
+
+    for m in &resolved.moves {
+        let r = if cfg.copy {
             client
                 .staging_copy(&m.source_repo, &m.dest, &m.image, &m.tag)
                 .await
@@ -264,40 +360,103 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                 .staging_move(&m.source_repo, &m.dest, &m.image, &m.tag)
                 .await
         };
-        match result {
-            Ok(()) => {
-                ok += 1;
-                println!(
-                    "  {verb} ok: {}/{}:{} -> {}",
-                    m.source_repo, m.image, m.tag, m.dest
-                );
-            }
-            Err(e) => {
-                failed += 1;
-                eprintln!(
-                    "  {verb} FAILED: {}/{}:{} -> {}: {e}",
-                    m.source_repo, m.image, m.tag, m.dest
-                );
-            }
+        report(
+            &mut ok,
+            &mut failed,
+            verb,
+            &m.source_repo,
+            &m.image,
+            &m.tag,
+            r,
+        );
+    }
+
+    if cfg.copy {
+        let skipped = resolved.deletes.len() + resolved.purges.len();
+        if skipped > 0 {
+            println!("\n--copy is non-destructive: skipped {skipped} delete/purge action(s).");
+        }
+    } else {
+        for d in resolved.deletes.iter().chain(resolved.purges.iter()) {
+            let r = client
+                .staging_delete(&d.source_repo, &d.image, &d.tag)
+                .await;
+            report(
+                &mut ok,
+                &mut failed,
+                "delete",
+                &d.source_repo,
+                &d.image,
+                &d.tag,
+                r,
+            );
         }
     }
 
     println!("\nApplied: {ok} succeeded, {failed} failed.");
     if failed > 0 {
-        anyhow::bail!("{failed} staging operation(s) failed");
+        bail!("{failed} staging operation(s) failed");
     }
     Ok(())
 }
 
-fn print_plan(plan: &Plan, copy: bool) {
-    use std::collections::BTreeMap;
+async fn list_repo_tags(client: &DepotClient, repo: &str) -> Result<Vec<(String, String)>> {
+    let images = client
+        .docker_repo_catalog(repo)
+        .await
+        .with_context(|| format!("list images in '{repo}'"))?;
+    let mut out = Vec::new();
+    for image in images {
+        let tags = client
+            .docker_list_tags(repo, &image)
+            .await
+            .with_context(|| format!("list tags for '{repo}/{image}'"))?;
+        for tag in tags {
+            out.push((image.clone(), tag));
+        }
+    }
+    Ok(out)
+}
 
+/// HEAD the tag against a repo; true if it is served there (the cache resolves
+/// through to its upstream).
+async fn insight_has(client: &DepotClient, repo: &str, image: &str, tag: &str) -> Result<bool> {
+    let (status, _, _) = client
+        .docker_head_manifest(repo, image, tag)
+        .await
+        .with_context(|| format!("presence check {repo}/{image}:{tag}"))?;
+    Ok(status == 200)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report(
+    ok: &mut usize,
+    failed: &mut usize,
+    verb: &str,
+    repo: &str,
+    image: &str,
+    tag: &str,
+    result: Result<()>,
+) {
+    match result {
+        Ok(()) => {
+            *ok += 1;
+            println!("  {verb} ok: {repo}/{image}:{tag}");
+        }
+        Err(e) => {
+            *failed += 1;
+            eprintln!("  {verb} FAILED: {repo}/{image}:{tag}: {e}");
+        }
+    }
+}
+
+fn print_plan(p: &ResolvedPlan, copy: bool) {
     let verb = if copy { "copy" } else { "move" };
-    println!("Planned {verb}s ({} tag(s)):", plan.moves.len());
+    let del_note = if copy { " (skipped: --copy)" } else { "" };
 
-    // Group by destination for a readable summary.
+    println!("Planned {verb}s ({} tag(s)):", p.moves.len());
     let mut by_dest: BTreeMap<&str, Vec<&PlannedMove>> = BTreeMap::new();
-    for m in &plan.moves {
+    for m in &p.moves {
         by_dest.entry(m.dest.as_str()).or_default().push(m);
     }
     for (dest, moves) in &by_dest {
@@ -307,15 +466,45 @@ fn print_plan(plan: &Plan, copy: bool) {
         }
     }
 
-    if plan.unclassified.is_empty() {
+    println!("\nDeletes{del_note} ({} tag(s)):", p.deletes.len());
+    for d in &p.deletes {
+        println!("       {}/{}:{}", d.source_repo, d.image, d.tag);
+    }
+
+    if !p.purges.is_empty() {
+        let mut by_repo: BTreeMap<&str, usize> = BTreeMap::new();
+        for t in &p.purges {
+            *by_repo.entry(t.source_repo.as_str()).or_default() += 1;
+        }
+        println!(
+            "\nPurge{del_note} ({} tag(s) across {} repo(s)):",
+            p.purges.len(),
+            by_repo.len()
+        );
+        for (repo, n) in &by_repo {
+            println!("  {repo}: {n} tag(s)");
+        }
+    }
+
+    if !p.kept.is_empty() {
+        println!(
+            "\nKept ({} tag(s)) — already present in the check repo, left in place:",
+            p.kept.len()
+        );
+        for k in &p.kept {
+            println!("       {}/{}:{}", k.source_repo, k.image, k.tag);
+        }
+    }
+
+    if p.leaves.is_empty() {
         println!("\nUnclassified: none.");
     } else {
         println!(
-            "\nUnclassified ({} tag(s)) — left in place, no rule matched:",
-            plan.unclassified.len()
+            "\nUnclassified ({} tag(s)) — no rule matched, left in place:",
+            p.leaves.len()
         );
-        for u in &plan.unclassified {
-            println!("       {}/{}:{}", u.source_repo, u.image, u.tag);
+        for l in &p.leaves {
+            println!("       {}/{}:{}", l.source_repo, l.image, l.tag);
         }
     }
 }
@@ -324,150 +513,168 @@ fn print_plan(plan: &Plan, copy: bool) {
 mod tests {
     use super::*;
 
-    fn test_rules() -> Rules {
-        Rules {
-            source_repos: vec!["docker-internal".into(), "docker-upstream".into()],
-            first_party_prefixes: vec!["myriad/".into(), "qkp/".into(), "orchestrator/".into()],
-            dest: Dest {
-                released: "docker-insight".into(),
-                released_aux: "docker-release-aux".into(),
-                prerelease: "docker-prerelease".into(),
-                develop: "docker-prerelease".into(),
-                ci: "docker-development-local".into(),
-                developer: "docker-development-local".into(),
-            },
-            aux_images: vec!["myriad/test_exec_web".into(), "myriad/uncrustifier".into()],
-        }
+    const SAMPLE: &str = r#"
+        [patterns]
+        released   = '\d+\.\d+\.\d+'
+        prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+'
+        develop    = 'develop'
+        ci         = 'ci-.+-\d+'
+        developer  = '[a-z][a-z0-9]*-\d+'
+
+        [[group]]
+        format = "docker"
+        source_repos = ["docker-internal", "docker-external"]
+        first_party_prefixes = ["myriad/", "qkp/", "orchestrator/"]
+        purge_repos = ["docker-upstream"]
+
+          [[group.rule]]
+          match = "prerelease"
+          action = "move"
+          dest = "docker-prerelease"
+
+          [[group.rule]]
+          match = "released"
+          images = ["myriad/test_exec_web", "myriad/uncrustifier"]
+          action = "move"
+          dest = "docker-release-aux"
+
+          [[group.rule]]
+          match = "released"
+          action = "delete_if_absent"
+          check = "docker-insight"
+
+          [[group.rule]]
+          match = "develop"
+          action = "move"
+          dest = "docker-prerelease"
+
+          [[group.rule]]
+          match = "ci"
+          action = "move"
+          dest = "docker-development-local"
+
+          [[group.rule]]
+          match = "developer"
+          action = "move"
+          dest = "docker-development-local"
+    "#;
+
+    fn sample_group() -> CompiledGroup {
+        let rules = RulesFile::from_toml(SAMPLE).unwrap();
+        compile_groups(&rules).unwrap().pop().unwrap()
     }
 
     #[test]
-    fn released_semver_matches() {
-        assert!(is_released_semver("1.2.3"));
-        assert!(is_released_semver("10.0.44"));
-        assert!(!is_released_semver("1.2"));
-        assert!(!is_released_semver("1.2.3.4"));
-        assert!(!is_released_semver("1.2.x"));
-        assert!(!is_released_semver("1.2.3-dev.1"));
+    fn patterns_parse_and_compile() {
+        let rules = RulesFile::from_toml(SAMPLE).unwrap();
+        assert_eq!(rules.patterns.len(), 5);
+        let groups = compile_groups(&rules).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rules.len(), 6);
     }
 
     #[test]
-    fn prerelease_semver_matches() {
-        assert!(is_prerelease_semver("1.2.3-dev.7"));
-        assert!(is_prerelease_semver("1.2.3-rc.1"));
-        assert!(!is_prerelease_semver("1.2.3"));
-        assert!(!is_prerelease_semver("1.2.3-beta.1"));
-        assert!(!is_prerelease_semver("1.2.3-dev"));
-        assert!(!is_prerelease_semver("1.2.3-dev.x"));
+    fn decide_routes_every_shape() {
+        let g = sample_group();
+        assert_eq!(
+            decide(&g, "myriad/api_server", "1.2.3-dev.7"),
+            Decision::Move("docker-prerelease")
+        );
+        assert_eq!(
+            decide(&g, "myriad/api_server", "1.5.0-rc.2"),
+            Decision::Move("docker-prerelease")
+        );
+        assert_eq!(
+            decide(&g, "qkp/leaf", "develop"),
+            Decision::Move("docker-prerelease")
+        );
+        assert_eq!(
+            decide(&g, "qkp/leaf", "ci-build-12"),
+            Decision::Move("docker-development-local")
+        );
+        assert_eq!(
+            decide(&g, "qkp/leaf", "slord-79"),
+            Decision::Move("docker-development-local")
+        );
+        // supplementary released → aux; primary released → conditional delete
+        assert_eq!(
+            decide(&g, "myriad/test_exec_web", "1.2.3"),
+            Decision::Move("docker-release-aux")
+        );
+        assert_eq!(
+            decide(&g, "myriad/api_server", "1.2.3"),
+            Decision::DeleteIfAbsent("docker-insight")
+        );
+        // unmatched (e.g. the real 1.4.2-canal13 tag) → leave
+        assert_eq!(
+            decide(&g, "myriad/api_server", "1.4.2-canal13"),
+            Decision::Leave
+        );
+        assert_eq!(decide(&g, "myriad/api_server", "latest"), Decision::Leave);
     }
 
     #[test]
-    fn ci_and_developer_matches() {
-        assert!(is_ci("ci-build-4821"));
-        assert!(is_ci("ci-nightly-1"));
-        assert!(!is_ci("ci--1")); // empty middle still has prefix "ci-" len 3 -> rejected
-        assert!(!is_ci("build-12"));
-
-        assert!(is_developer("slord-79"));
-        assert!(is_developer("ab1-2"));
-        assert!(!is_developer("ci-build-4821")); // contains hyphen in name
-        assert!(!is_developer("Slord-79")); // uppercase
-        assert!(!is_developer("slord-x"));
+    fn first_match_wins_for_aux_vs_primary() {
+        let g = sample_group();
+        // The aux rule precedes the primary rule and has an image filter, so a
+        // non-aux image with a released tag falls through to the primary rule.
+        assert_eq!(
+            decide(&g, "myriad/uncrustifier", "2.0.0"),
+            Decision::Move("docker-release-aux")
+        );
+        assert_eq!(
+            decide(&g, "myriad/master", "2.0.0"),
+            Decision::DeleteIfAbsent("docker-insight")
+        );
     }
 
     #[test]
-    fn classify_routes_each_category() {
-        let r = test_rules();
-        assert_eq!(
-            classify(&r, "myriad/api_server", "1.2.3"),
-            Some("docker-insight")
-        );
-        assert_eq!(
-            classify(&r, "myriad/test_exec_web", "1.2.3"),
-            Some("docker-release-aux")
-        );
-        assert_eq!(
-            classify(&r, "myriad/api_server", "1.2.3-dev.7"),
-            Some("docker-prerelease")
-        );
-        assert_eq!(
-            classify(&r, "qkp/quantum_leaf", "develop"),
-            Some("docker-prerelease")
-        );
-        assert_eq!(
-            classify(&r, "qkp/quantum_leaf", "ci-build-12"),
-            Some("docker-development-local")
-        );
-        assert_eq!(
-            classify(&r, "qkp/quantum_leaf", "slord-79"),
-            Some("docker-development-local")
-        );
-        assert_eq!(classify(&r, "myriad/api_server", "weird-tag-format!"), None);
-    }
-
-    #[test]
-    fn build_plan_filters_and_classifies() {
-        let r = test_rules();
-        let inventory = vec![
-            (
-                "docker-internal".into(),
-                "myriad/api_server".into(),
-                "1.2.3".into(),
-            ),
-            (
-                "docker-internal".into(),
-                "myriad/test_exec_web".into(),
-                "1.2.3".into(),
-            ),
-            (
-                "docker-internal".into(),
-                "myriad/api_server".into(),
-                "1.2.3-dev.4".into(),
-            ),
-            (
-                "docker-internal".into(),
-                "myriad/api_server".into(),
-                "garbage".into(),
-            ),
-            // Third-party image — must be ignored entirely.
-            (
-                "docker-upstream".into(),
-                "library/postgres".into(),
-                "16.2".into(),
-            ),
+    fn build_group_plan_buckets_and_skips_third_party() {
+        let g = sample_group();
+        let inv = vec![
+            ("myriad/api_server".to_string(), "1.2.3".to_string()), // conditional delete
+            ("myriad/test_exec_web".to_string(), "1.2.3".to_string()), // move → aux
+            ("myriad/api_server".to_string(), "1.2.3-dev.4".to_string()), // move → prerelease
+            ("myriad/api_server".to_string(), "1.4.2-canal13".to_string()), // leave
+            ("library/postgres".to_string(), "16.2".to_string()),   // third-party: skipped
         ];
-        let plan = build_plan(&r, &inventory);
-
-        assert_eq!(plan.moves.len(), 3);
-        assert!(plan.moves.contains(&PlannedMove {
-            source_repo: "docker-internal".into(),
-            image: "myriad/test_exec_web".into(),
-            tag: "1.2.3".into(),
-            dest: "docker-release-aux".into(),
-        }));
-        assert_eq!(plan.unclassified.len(), 1);
-        assert_eq!(plan.unclassified[0].tag, "garbage");
-        // The third-party image contributed nothing.
+        let plan = build_group_plan(&g, &inv, "docker-internal");
+        assert_eq!(plan.moves.len(), 2);
+        assert_eq!(plan.conditional_deletes.len(), 1);
+        assert_eq!(plan.conditional_deletes[0].check_repo, "docker-insight");
+        assert_eq!(plan.leaves.len(), 1);
+        assert_eq!(plan.leaves[0].tag, "1.4.2-canal13");
         assert!(!plan.moves.iter().any(|m| m.image == "library/postgres"));
     }
 
     #[test]
-    fn rules_parse_from_toml() {
+    fn inline_regex_in_match_works() {
         let toml = r#"
-            source_repos = ["docker-internal", "docker-upstream"]
-            first_party_prefixes = ["myriad/", "qkp/"]
-            aux_images = ["myriad/test_exec_web"]
-            [dest]
-            released = "docker-insight"
-            released_aux = "docker-release-aux"
-            prerelease = "docker-prerelease"
-            develop = "docker-prerelease"
-            ci = "docker-development-local"
-            developer = "docker-development-local"
+            [[group]]
+            format = "docker"
+            source_repos = ["r"]
+            first_party_prefixes = ["app/"]
+              [[group.rule]]
+              match = '^v\d+$'
+              action = "move"
+              dest = "tagged"
         "#;
-        let rules = Rules::from_toml(toml).unwrap();
-        assert_eq!(rules.source_repos.len(), 2);
-        assert_eq!(rules.dest.released, "docker-insight");
-        assert!(rules.is_first_party("myriad/api_server"));
-        assert!(!rules.is_first_party("library/postgres"));
+        let rules = RulesFile::from_toml(toml).unwrap();
+        let g = compile_groups(&rules).unwrap().pop().unwrap();
+        assert_eq!(decide(&g, "app/x", "v3"), Decision::Move("tagged"));
+        assert_eq!(decide(&g, "app/x", "v3.1"), Decision::Leave);
+    }
+
+    #[test]
+    fn move_without_dest_is_rejected() {
+        let toml = r#"
+            [[group]]
+            format = "docker"
+              [[group.rule]]
+              match = 'x'
+              action = "move"
+        "#;
+        let rules = RulesFile::from_toml(toml).unwrap();
+        assert!(compile_groups(&rules).is_err());
     }
 }

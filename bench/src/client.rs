@@ -937,8 +937,11 @@ impl DepotClient {
     ) -> Result<(u16, String, String)> {
         let resp = self
             .http
+            // Path-based form so multi-segment image names (e.g.
+            // `breakpad/builder_redhat7`) route to the docker handler rather
+            // than the SPA frontend.
             .head(format!(
-                "{}/v2/{}/{}/manifests/{}",
+                "{}/repository/{}/v2/{}/manifests/{}",
                 self.base_url, repo, image, reference
             ))
             .header("Authorization", format!("Basic {}", self.basic_auth))
@@ -964,7 +967,12 @@ impl DepotClient {
     pub async fn docker_list_tags(&self, repo: &str, image: &str) -> Result<Vec<String>> {
         let resp = self
             .http
-            .get(format!("{}/v2/{}/{}/tags/list", self.base_url, repo, image))
+            // Path-based form so multi-segment image names route to the docker
+            // handler rather than the SPA frontend.
+            .get(format!(
+                "{}/repository/{}/v2/{}/tags/list",
+                self.base_url, repo, image
+            ))
             .header("Authorization", format!("Basic {}", self.basic_auth))
             .send()
             .await?;
@@ -1156,6 +1164,29 @@ impl DepotClient {
             anyhow::bail!(
                 "staging copy {source}/{image}:{tag} -> {dest} failed ({status}): {body}"
             );
+        }
+        Ok(())
+    }
+
+    /// `POST /service/rest/v1/staging/delete` — delete a Docker `image:tag`
+    /// from `source`.
+    pub async fn staging_delete(&self, source: &str, image: &str, tag: &str) -> Result<()> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .post(format!("{}/service/rest/v1/staging/delete", self.base_url))
+            .bearer_auth(&token)
+            .query(&[
+                ("repository", source),
+                ("docker.imageName", image),
+                ("docker.imageTag", tag),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("staging delete {source}/{image}:{tag} failed ({status}): {body}");
         }
         Ok(())
     }
