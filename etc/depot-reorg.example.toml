@@ -14,6 +14,13 @@
 # inline a regex there. Patterns are auto-anchored (^(?:…)$), so write them
 # without ^ / $. Shared across every group below (and future helm/raw groups).
 # --------------------------------------------------------------------------
+# Optional: read last-accessed (usage) data from this repo to annotate the
+# dry-run plan — typically the docker group/proxy, so each tag's *live* atime is
+# reported (the stale source member resolves last in the group). Report only; it
+# never changes what gets moved/deleted. Annotations: [pulled DATE] if the proxy
+# served the tag, or [absent from <repo>] (a "stale, safe to drop" hint).
+usage_repo = "docker"
+
 [patterns]
 released   = '\d+\.\d+\.\d+'
 prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+'

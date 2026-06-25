@@ -94,6 +94,12 @@ pub struct RulesFile {
     pub patterns: HashMap<String, String>,
     #[serde(default)]
     pub group: Vec<Group>,
+    /// Repository to read last-accessed (usage) data from for the dry-run
+    /// report — typically the docker group/proxy, so each tag's *live* atime is
+    /// reported (the stale source member resolves last in the group). Report
+    /// only; never filters what gets moved/deleted.
+    #[serde(default)]
+    pub usage_repo: Option<String>,
 }
 
 impl RulesFile {
@@ -339,7 +345,39 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         }
     }
 
-    print_plan(&resolved, cfg.copy);
+    // Optional: annotate the plan with last-accessed (usage) data from the
+    // configured usage repo (e.g. the docker proxy). Report-only — never alters
+    // what gets moved/deleted. One browse call per distinct image.
+    let mut atimes: HashMap<(String, String), String> = HashMap::new();
+    if let Some(usage_repo) = rules.usage_repo.as_deref() {
+        let mut images: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for m in &resolved.moves {
+            images.insert(m.image.clone());
+        }
+        for t in resolved
+            .deletes
+            .iter()
+            .chain(&resolved.kept)
+            .chain(&resolved.leaves)
+        {
+            images.insert(t.image.clone());
+        }
+        for image in images {
+            match client.image_tag_atimes(usage_repo, &image).await {
+                Ok(tags) => {
+                    for (tag, at) in tags {
+                        if let Some(at) = at {
+                            let date = at.get(0..10).unwrap_or(&at).to_string();
+                            atimes.insert((image.clone(), tag), date);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("  (usage lookup failed for '{image}': {e})"),
+            }
+        }
+    }
+
+    print_plan(&resolved, cfg.copy, rules.usage_repo.as_deref(), &atimes);
 
     if !cfg.apply {
         println!("\nDry run — no changes made. Re-run with --apply to execute.");
@@ -450,9 +488,35 @@ fn report(
     }
 }
 
-fn print_plan(p: &ResolvedPlan, copy: bool) {
+/// Format the last-accessed annotation for a tag line. Empty when no usage repo
+/// is configured; otherwise `[pulled DATE]` if the usage repo served the tag, or
+/// `[absent from <repo>]` if it has no copy (a strong "stale, safe to drop" hint).
+fn atime_note(
+    usage_repo: Option<&str>,
+    atimes: &HashMap<(String, String), String>,
+    image: &str,
+    tag: &str,
+) -> String {
+    match usage_repo {
+        Some(ur) => match atimes.get(&(image.to_string(), tag.to_string())) {
+            Some(date) => format!("  [pulled {date}]"),
+            None => format!("  [absent from {ur}]"),
+        },
+        None => String::new(),
+    }
+}
+
+fn print_plan(
+    p: &ResolvedPlan,
+    copy: bool,
+    usage_repo: Option<&str>,
+    atimes: &HashMap<(String, String), String>,
+) {
     let verb = if copy { "copy" } else { "move" };
     let del_note = if copy { " (skipped: --copy)" } else { "" };
+    if let Some(ur) = usage_repo {
+        println!("(usage annotations show last-accessed from '{ur}')");
+    }
 
     println!("Planned {verb}s ({} tag(s)):", p.moves.len());
     let mut by_dest: BTreeMap<&str, Vec<&PlannedMove>> = BTreeMap::new();
@@ -462,13 +526,15 @@ fn print_plan(p: &ResolvedPlan, copy: bool) {
     for (dest, moves) in &by_dest {
         println!("  -> {dest} ({} tag(s)):", moves.len());
         for m in moves {
-            println!("       {}/{}:{}", m.source_repo, m.image, m.tag);
+            let note = atime_note(usage_repo, atimes, &m.image, &m.tag);
+            println!("       {}/{}:{}{note}", m.source_repo, m.image, m.tag);
         }
     }
 
     println!("\nDeletes{del_note} ({} tag(s)):", p.deletes.len());
     for d in &p.deletes {
-        println!("       {}/{}:{}", d.source_repo, d.image, d.tag);
+        let note = atime_note(usage_repo, atimes, &d.image, &d.tag);
+        println!("       {}/{}:{}{note}", d.source_repo, d.image, d.tag);
     }
 
     if !p.purges.is_empty() {
@@ -492,7 +558,8 @@ fn print_plan(p: &ResolvedPlan, copy: bool) {
             p.kept.len()
         );
         for k in &p.kept {
-            println!("       {}/{}:{}", k.source_repo, k.image, k.tag);
+            let note = atime_note(usage_repo, atimes, &k.image, &k.tag);
+            println!("       {}/{}:{}{note}", k.source_repo, k.image, k.tag);
         }
     }
 
@@ -504,7 +571,8 @@ fn print_plan(p: &ResolvedPlan, copy: bool) {
             p.leaves.len()
         );
         for l in &p.leaves {
-            println!("       {}/{}:{}", l.source_repo, l.image, l.tag);
+            let note = atime_note(usage_repo, atimes, &l.image, &l.tag);
+            println!("       {}/{}:{}{note}", l.source_repo, l.image, l.tag);
         }
     }
 }
@@ -512,6 +580,27 @@ fn print_plan(p: &ResolvedPlan, copy: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atime_note_formats() {
+        let mut m = HashMap::new();
+        m.insert(
+            ("myriad/dev".to_string(), "develop".to_string()),
+            "2026-06-25".to_string(),
+        );
+        // No usage repo configured → no annotation.
+        assert_eq!(atime_note(None, &m, "myriad/dev", "develop"), "");
+        // Present in the usage repo → last-pull date.
+        assert_eq!(
+            atime_note(Some("docker"), &m, "myriad/dev", "develop"),
+            "  [pulled 2026-06-25]"
+        );
+        // Absent from the usage repo → flagged (stale hint).
+        assert_eq!(
+            atime_note(Some("docker"), &m, "myriad/dev", "missing"),
+            "  [absent from docker]"
+        );
+    }
 
     const SAMPLE: &str = r#"
         [patterns]

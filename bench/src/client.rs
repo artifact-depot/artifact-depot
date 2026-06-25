@@ -49,6 +49,9 @@ pub struct ArtifactResponse {
     pub path: String,
     #[allow(dead_code)]
     pub size: u64,
+    /// Authoritative last-accessed time (RFC3339), present on the browse API.
+    #[serde(default)]
+    pub last_accessed_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -642,6 +645,40 @@ impl DepotClient {
         }
         let browse: BrowseResponse = resp.json().await?;
         Ok(browse.artifacts)
+    }
+
+    /// List `(tag, last_accessed_at)` for an image's tags via the browse API.
+    /// `repo` is typically the docker *group/proxy* so the access time reflects
+    /// the live copy (the stale member resolves last). Returns the relative tag
+    /// name (the browse API strips the prefix) and its RFC3339 atime if present.
+    pub async fn image_tag_atimes(
+        &self,
+        repo: &str,
+        image: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let token = self.bearer_token().await?;
+        let prefix = format!("{image}/_tags/");
+        let resp = self
+            .http
+            .get(format!(
+                "{}/api/v1/repositories/{}/artifacts",
+                self.base_url, repo
+            ))
+            .bearer_auth(&token)
+            .query(&[("prefix", prefix.as_str()), ("limit", "100000")])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("browse {repo}/{prefix} failed ({status}): {body}");
+        }
+        let browse: BrowseResponse = resp.json().await?;
+        Ok(browse
+            .artifacts
+            .into_iter()
+            .map(|a| (a.path, a.last_accessed_at))
+            .collect())
     }
 
     pub async fn search_artifacts(&self, repo: &str, query: &str) -> Result<Vec<ArtifactResponse>> {
