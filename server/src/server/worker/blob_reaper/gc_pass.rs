@@ -367,17 +367,16 @@ pub async fn gc_pass(
                             Err(_) => continue,
                         };
 
-                        let is_docker_bookkeeping =
-                            is_docker && depot_format_docker::store::is_bookkeeping_path(sk);
-
-                        let expired = !record.internal
-                            && !is_docker_bookkeeping
-                            && (max_age_cutoff
-                                .map(|c| record.created_at < c)
-                                .unwrap_or(false)
-                                || max_unaccessed_cutoff
-                                    .map(|c| record.last_accessed_at < c)
-                                    .unwrap_or(false));
+                        let expired = super::repo_cleanup::record_expired(
+                            kv.as_ref(),
+                            &repo_name,
+                            sk,
+                            &record,
+                            is_docker,
+                            max_age_cutoff,
+                            max_unaccessed_cutoff,
+                        )
+                        .await;
 
                         if expired {
                             expired_entries.push((sk, record.size));

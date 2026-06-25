@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::server::infra::task::TaskProgress;
 use depot_core::store::keys;
-use depot_core::store::kv::KvStore;
+use depot_core::store::kv::{KvStore, TreeEntry};
 use depot_core::store_registry::StoreRegistry;
 use depot_core::update::UpdateSender;
 
@@ -25,6 +25,55 @@ pub struct RepoCleanStats {
     pub scanned_artifacts: u64,
     pub expired_artifacts: u64,
     pub docker_deleted: u64,
+}
+
+/// Read the authoritative last-accessed time for an artifact from its
+/// browse-tree file entry (`TABLE_DIR_ENTRIES`). Returns `None` if the entry is
+/// missing or unreadable, so the caller can fall back to the record's value.
+async fn tree_last_accessed_at(
+    kv: &dyn KvStore,
+    repo: &str,
+    path: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let (table, pk, sk) = keys::tree_entry_key(repo, path);
+    let (bytes, _) = kv.get_versioned(table, pk, sk).await.ok()??;
+    let entry: TreeEntry = rmp_serde::from_slice(&bytes).ok()?;
+    Some(entry.last_accessed_at)
+}
+
+/// Decide whether an artifact record is expired under a repo's cleanup policy.
+/// Shared by the GC pass and the per-repo cleanup sweep so the two can't drift.
+///
+/// `max_age` compares the record's creation time. `max_unaccessed` compares the
+/// **authoritative** access time, which lives on the browse-tree file entry
+/// (refreshed on download), not the record's `last_accessed_at` (frozen at write
+/// time) — falling back to the record only if the tree entry is missing.
+/// Internal artifacts and Docker bookkeeping paths are never expired here.
+pub(super) async fn record_expired(
+    kv: &dyn KvStore,
+    repo: &str,
+    sk: &str,
+    record: &depot_core::store::kv::ArtifactRecord,
+    is_docker: bool,
+    max_age_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    max_unaccessed_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    if record.internal || (is_docker && depot_format_docker::store::is_bookkeeping_path(sk)) {
+        return false;
+    }
+    let age_expired = max_age_cutoff
+        .map(|c| record.created_at < c)
+        .unwrap_or(false);
+    let unaccessed_expired = match max_unaccessed_cutoff {
+        Some(c) => {
+            tree_last_accessed_at(kv, repo, sk)
+                .await
+                .unwrap_or(record.last_accessed_at)
+                < c
+        }
+        None => false,
+    };
+    age_expired || unaccessed_expired
 }
 
 /// Expire artifacts in a single repository based on its cleanup policy
@@ -99,17 +148,16 @@ pub(super) async fn expire_repo_artifacts(
 
                     local_scanned_bytes += record.size;
 
-                    let is_docker_bookkeeping =
-                        is_docker && depot_format_docker::store::is_bookkeeping_path(sk);
-
-                    let expired = !record.internal
-                        && !is_docker_bookkeeping
-                        && (max_age_cutoff
-                            .map(|c| record.created_at < c)
-                            .unwrap_or(false)
-                            || max_unaccessed_cutoff
-                                .map(|c| record.last_accessed_at < c)
-                                .unwrap_or(false));
+                    let expired = record_expired(
+                        kv.as_ref(),
+                        &repo_name,
+                        sk,
+                        &record,
+                        is_docker,
+                        max_age_cutoff,
+                        max_unaccessed_cutoff,
+                    )
+                    .await;
 
                     if expired {
                         expired_entries.push((sk, record.size));
