@@ -372,9 +372,17 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
         .route("/v2/", get(docker::v2_check))
         .route("/v2/_catalog", get(docker::catalog))
         .route("/v2/{repo}/{image}/tags/list", get(docker::list_tags))
+        .route(
+            "/v2/{repo}/{image}/{image2}/tags/list",
+            get(docker::list_tags),
+        )
         .route("/v2/{name}/tags/list", get(docker::list_tags))
         .route(
             "/v2/{repo}/{image}/blobs/{digest}",
+            head(docker::head_blob).get(docker::get_blob),
+        )
+        .route(
+            "/v2/{repo}/{image}/{image2}/blobs/{digest}",
             head(docker::head_blob).get(docker::get_blob),
         )
         .route(
@@ -385,12 +393,23 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
             "/v2/{repo}/{image}/referrers/{digest}",
             get(docker::get_referrers),
         )
+        .route(
+            "/v2/{repo}/{image}/{image2}/referrers/{digest}",
+            get(docker::get_referrers),
+        )
         .route("/v2/{name}/referrers/{digest}", get(docker::get_referrers));
 
     // Manifest routes — 32 MiB (PUT sends JSON manifests; HEAD/GET/DELETE have no body).
     let docker_manifest_routes = Router::new()
         .route(
             "/v2/{repo}/{image}/manifests/{reference}",
+            head(docker::head_manifest)
+                .get(docker::get_manifest)
+                .put(docker::put_manifest)
+                .delete(docker::delete_manifest),
+        )
+        .route(
+            "/v2/{repo}/{image}/{image2}/manifests/{reference}",
             head(docker::head_manifest)
                 .get(docker::get_manifest)
                 .put(docker::put_manifest)
@@ -411,9 +430,17 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
             "/v2/{repo}/{image}/blobs/uploads/",
             post(docker::start_upload),
         )
+        .route(
+            "/v2/{repo}/{image}/{image2}/blobs/uploads/",
+            post(docker::start_upload),
+        )
         .route("/v2/{name}/blobs/uploads/", post(docker::start_upload))
         .route(
             "/v2/{repo}/{image}/blobs/uploads/{uuid}",
+            patch(docker::patch_upload).put(docker::complete_upload),
+        )
+        .route(
+            "/v2/{repo}/{image}/{image2}/blobs/uploads/{uuid}",
             patch(docker::patch_upload).put(docker::complete_upload),
         )
         .route(
@@ -457,7 +484,7 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
         .merge(artifact_routes)
         .merge(docker_routes)
         .merge(nexus_upload_routes)
-        .fallback_service(depot_ui::ui_routes())
+        .fallback(root_fallback)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::server::infra::audit::request_event_middleware,
@@ -491,6 +518,19 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
             crate::server::infra::middleware::request_id_middleware,
         ))
         .with_state(state)
+}
+
+/// Global fallback for unmatched routes. A request under `/v2` that matched no
+/// registry route still belongs to the docker API, so it gets a docker JSON 404
+/// rather than the SPA HTML (which would confuse registry clients and tools);
+/// everything else falls through to the embedded Vue frontend for SPA routing.
+async fn root_fallback(uri: axum::http::Uri) -> axum::response::Response {
+    let path = uri.path();
+    if path == "/v2" || path.starts_with("/v2/") {
+        docker::v2_not_found().await
+    } else {
+        depot_ui::static_handler(uri).await
+    }
 }
 
 /// Build a minimal router serving only the `/metrics` endpoint.

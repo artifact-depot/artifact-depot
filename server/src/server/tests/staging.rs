@@ -451,6 +451,39 @@ async fn staging_delete_removes_tag() {
 }
 
 // ===========================================================================
+// /v2 fallback
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unmatched_v2_path_returns_docker_404_not_html() {
+    let app = TestApp::new().await;
+    let token = app.admin_token();
+
+    // A multi-segment image addressed via the /v2/{repo}/{image} shortcut spans
+    // more than two name segments, so it matches no registry route. It must come
+    // back as a docker JSON error, not the SPA HTML.
+    let req = app.auth_request(
+        Method::GET,
+        "/v2/docker-internal/breakpad/builder_redhat7/tags/list",
+        &token,
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["errors"][0]["code"], "NAME_UNKNOWN", "body: {body}");
+
+    // A non-/v2 unmatched path still routes to the SPA branch, not the docker
+    // error envelope (the SPA returns HTML, or "UI not available" if the
+    // frontend wasn't built — either way, no docker `errors` body).
+    let (_, spa_body) = app
+        .call(app.request(Method::GET, "/some/client-side/route"))
+        .await;
+    assert!(
+        spa_body.get("errors").is_none(),
+        "non-/v2 path should not get a docker error envelope: {spa_body}"
+    );
+}
+
+// ===========================================================================
 // staging/copy (cross-store)
 // ===========================================================================
 
