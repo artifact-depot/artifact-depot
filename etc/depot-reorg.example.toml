@@ -46,22 +46,17 @@ purge_repos          = ["docker-upstream"]   # dead cache (upstream gone): empti
   action = "move"
   dest   = "docker-prerelease"
 
-  # x.y.z, supplementary images only → release-aux. Keep this list in sync with
-  # each project's .gitlab-ci.yml publish job (the images sent to ${DOCKER_INTERNAL}
-  # / release_aux rather than ${DOCKER_EXTERNAL} / release).
+  # x.y.z released → reconcile against insight (the canonical release registry,
+  # a cache we never write to). Insight-presence is the primary-vs-supplementary
+  # discriminator, so no hand-maintained image list is needed:
+  #   absent from insight            → supplementary → move to docker-release-aux
+  #   present, same content digest   → redundant dup → delete from source
+  #   present, different digest      → not the same image → left for review
   [[group.rule]]
   match  = "released"
-  images = ["myriad/test_exec_web", "myriad/uncrustifier"]
-  action = "move"
-  dest   = "docker-release-aux"
-
-  # x.y.z, everything else (primary) → docker-insight is a cache of the canonical
-  # release registry, so don't move there; delete from source only if insight
-  # doesn't already serve it.
-  [[group.rule]]
-  match  = "released"
-  action = "delete_if_absent"
+  action = "reconcile"
   check  = "docker-insight"
+  dest   = "docker-release-aux"
 
   # rolling develop tag → prerelease repo
   [[group.rule]]
@@ -80,3 +75,11 @@ purge_repos          = ["docker-upstream"]   # dead cache (upstream gone): empti
   match  = "developer"
   action = "move"
   dest   = "docker-development-local"
+
+  # Catch-all: anything no rule matched (dash-versions, platform-suffixed builder
+  # tags, branch tags, …) → development. Unused ones age out via that repo's
+  # cleanup_max_unaccessed_days; anything still pulled keeps its atime fresh.
+  [[group.rule]]
+  match  = '.*'
+  action = "move"
+  dest   = "docker-development"

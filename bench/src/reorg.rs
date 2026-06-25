@@ -19,10 +19,13 @@
 //!
 //! - `move` — relocate the tag into `dest` (staging/move)
 //! - `delete_if_absent` — delete from source only if `check` repo lacks it
+//! - `reconcile` — released-image reconcile against a canonical `check` repo:
+//!   absent → move to `dest`; present+same-digest → delete; present+diff → leave
 //! - `delete` — delete from source unconditionally
 //! - `leave` — leave in place (reported)
 //!
-//! First matching rule wins; an unmatched tag is left in place.
+//! First matching rule wins; an unmatched tag is left in place (add a trailing
+//! `match = '.*'` rule to route the remainder somewhere, e.g. development).
 //!
 //! Dry-run by default (prints the plan; changes nothing). `--apply` executes;
 //! `--copy` uses staging/copy for moves and skips every destructive action.
@@ -47,6 +50,11 @@ pub enum Action {
     Move,
     /// Delete from source only if the `check` repo does not have the tag.
     DeleteIfAbsent,
+    /// Released-image reconcile against a canonical `check` repo (e.g. insight):
+    /// absent from `check` → move to `dest` (supplementary); present with the
+    /// same content digest → delete the redundant source copy; present with a
+    /// different digest → leave + flag for review (not the same image).
+    Reconcile,
     /// Delete from source unconditionally.
     Delete,
     /// Leave in place (reported).
@@ -141,6 +149,7 @@ impl CompiledGroup {
 enum Decision<'a> {
     Move(&'a str),
     DeleteIfAbsent(&'a str),
+    Reconcile { check: &'a str, dest: &'a str },
     Delete,
     Leave,
 }
@@ -165,6 +174,12 @@ fn compile_groups(rules: &RulesFile) -> Result<Vec<CompiledGroup>> {
                 Action::DeleteIfAbsent if r.check.is_none() => {
                     bail!(
                         "rule match='{}' action=delete_if_absent requires 'check'",
+                        r.match_
+                    )
+                }
+                Action::Reconcile if r.check.is_none() || r.dest.is_none() => {
+                    bail!(
+                        "rule match='{}' action=reconcile requires 'check' and 'dest'",
                         r.match_
                     )
                 }
@@ -200,6 +215,10 @@ fn decide<'a>(group: &'a CompiledGroup, image: &str, tag: &str) -> Decision<'a> 
                 Action::DeleteIfAbsent => {
                     Decision::DeleteIfAbsent(r.check.as_deref().unwrap_or_default())
                 }
+                Action::Reconcile => Decision::Reconcile {
+                    check: r.check.as_deref().unwrap_or_default(),
+                    dest: r.dest.as_deref().unwrap_or_default(),
+                },
                 Action::Delete => Decision::Delete,
                 Action::Leave => Decision::Leave,
             };
@@ -234,10 +253,19 @@ pub struct ConditionalDelete {
     pub check_repo: String,
 }
 
+/// A released-image reconcile pending a digest comparison against `check_repo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileItem {
+    pub tag: TagRef,
+    pub check_repo: String,
+    pub dest: String,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     pub moves: Vec<PlannedMove>,
     pub conditional_deletes: Vec<ConditionalDelete>,
+    pub reconciles: Vec<ReconcileItem>,
     pub deletes: Vec<TagRef>,
     pub leaves: Vec<TagRef>,
 }
@@ -269,6 +297,11 @@ fn build_group_plan(
                 tag: tagref(),
                 check_repo: check.to_string(),
             }),
+            Decision::Reconcile { check, dest } => plan.reconciles.push(ReconcileItem {
+                tag: tagref(),
+                check_repo: check.to_string(),
+                dest: dest.to_string(),
+            }),
             Decision::Delete => plan.deletes.push(tagref()),
             Decision::Leave => plan.leaves.push(tagref()),
         }
@@ -296,6 +329,9 @@ struct ResolvedPlan {
     kept: Vec<TagRef>,
     leaves: Vec<TagRef>,
     purges: Vec<TagRef>,
+    /// Reconcile tags present in the check repo but with a *different* digest —
+    /// not the same image, so left in place pending review.
+    mismatched: Vec<TagRef>,
 }
 
 pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
@@ -331,6 +367,45 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                     resolved.deletes.push(cd.tag);
                 }
             }
+
+            // Resolve reconciles: compare the source digest against the canonical
+            // check repo. Absent → move to dest (supplementary); present + same
+            // digest → delete the redundant source copy; present + different
+            // digest → leave + flag (not the same image).
+            for rec in plan.reconciles {
+                let (check_status, _, check_digest) = client
+                    .docker_head_manifest(&rec.check_repo, &rec.tag.image, &rec.tag.tag)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "reconcile check {}/{}:{}",
+                            rec.check_repo, rec.tag.image, rec.tag.tag
+                        )
+                    })?;
+                if check_status != 200 {
+                    resolved.moves.push(PlannedMove {
+                        source_repo: rec.tag.source_repo.clone(),
+                        image: rec.tag.image.clone(),
+                        tag: rec.tag.tag.clone(),
+                        dest: rec.dest.clone(),
+                    });
+                    continue;
+                }
+                let (_, _, src_digest) = client
+                    .docker_head_manifest(&rec.tag.source_repo, &rec.tag.image, &rec.tag.tag)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "reconcile source {}/{}:{}",
+                            rec.tag.source_repo, rec.tag.image, rec.tag.tag
+                        )
+                    })?;
+                if !check_digest.is_empty() && check_digest == src_digest {
+                    resolved.deletes.push(rec.tag);
+                } else {
+                    resolved.mismatched.push(rec.tag);
+                }
+            }
         }
 
         // Purge repos: every image/tag.
@@ -359,6 +434,7 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
             .iter()
             .chain(&resolved.kept)
             .chain(&resolved.leaves)
+            .chain(&resolved.mismatched)
         {
             images.insert(t.image.clone());
         }
@@ -563,6 +639,18 @@ fn print_plan(
         }
     }
 
+    if !p.mismatched.is_empty() {
+        println!(
+            "\nReconcile mismatch ({} tag(s)) — in the check repo but a DIFFERENT digest; \
+             left in place for review:",
+            p.mismatched.len()
+        );
+        for m in &p.mismatched {
+            let note = atime_note(usage_repo, atimes, &m.image, &m.tag);
+            println!("       {}/{}:{}{note}", m.source_repo, m.image, m.tag);
+        }
+    }
+
     if p.leaves.is_empty() {
         println!("\nUnclassified: none.");
     } else {
@@ -623,14 +711,9 @@ mod tests {
 
           [[group.rule]]
           match = "released"
-          images = ["myriad/test_exec_web", "myriad/uncrustifier"]
-          action = "move"
-          dest = "docker-release-aux"
-
-          [[group.rule]]
-          match = "released"
-          action = "delete_if_absent"
+          action = "reconcile"
           check = "docker-insight"
+          dest = "docker-release-aux"
 
           [[group.rule]]
           match = "develop"
@@ -646,6 +729,11 @@ mod tests {
           match = "developer"
           action = "move"
           dest = "docker-development-local"
+
+          [[group.rule]]
+          match = '.*'
+          action = "move"
+          dest = "docker-development"
     "#;
 
     fn sample_group() -> CompiledGroup {
@@ -685,35 +773,49 @@ mod tests {
             decide(&g, "qkp/leaf", "slord-79"),
             Decision::Move("docker-development-local")
         );
-        // supplementary released → aux; primary released → conditional delete
+        // any released x.y.z → reconcile against insight (image-independent;
+        // the supplementary/primary split happens at digest-check time).
         assert_eq!(
             decide(&g, "myriad/test_exec_web", "1.2.3"),
-            Decision::Move("docker-release-aux")
+            Decision::Reconcile {
+                check: "docker-insight",
+                dest: "docker-release-aux"
+            }
         );
         assert_eq!(
             decide(&g, "myriad/api_server", "1.2.3"),
-            Decision::DeleteIfAbsent("docker-insight")
+            Decision::Reconcile {
+                check: "docker-insight",
+                dest: "docker-release-aux"
+            }
         );
-        // unmatched (e.g. the real 1.4.2-canal13 tag) → leave
+        // unmatched (e.g. the real 1.4.2-canal13 tag, or latest) → catch-all
         assert_eq!(
             decide(&g, "myriad/api_server", "1.4.2-canal13"),
-            Decision::Leave
+            Decision::Move("docker-development")
         );
-        assert_eq!(decide(&g, "myriad/api_server", "latest"), Decision::Leave);
+        assert_eq!(
+            decide(&g, "myriad/api_server", "latest"),
+            Decision::Move("docker-development")
+        );
     }
 
     #[test]
-    fn first_match_wins_for_aux_vs_primary() {
+    fn catch_all_routes_unmatched_to_development() {
         let g = sample_group();
-        // The aux rule precedes the primary rule and has an image filter, so a
-        // non-aux image with a released tag falls through to the primary rule.
+        // A specific rule still wins over the catch-all (ordering).
         assert_eq!(
-            decide(&g, "myriad/uncrustifier", "2.0.0"),
-            Decision::Move("docker-release-aux")
+            decide(&g, "myriad/x", "1.2.3-dev.1"),
+            Decision::Move("docker-prerelease")
+        );
+        // Anything no specific rule matched falls to the catch-all.
+        assert_eq!(
+            decide(&g, "myriad/x", "some-branch-tag"),
+            Decision::Move("docker-development")
         );
         assert_eq!(
-            decide(&g, "myriad/master", "2.0.0"),
-            Decision::DeleteIfAbsent("docker-insight")
+            decide(&g, "myriad/x", "0-9-0"),
+            Decision::Move("docker-development")
         );
     }
 
@@ -721,19 +823,25 @@ mod tests {
     fn build_group_plan_buckets_and_skips_third_party() {
         let g = sample_group();
         let inv = vec![
-            ("myriad/api_server".to_string(), "1.2.3".to_string()), // conditional delete
-            ("myriad/test_exec_web".to_string(), "1.2.3".to_string()), // move → aux
+            ("myriad/api_server".to_string(), "1.2.3".to_string()), // reconcile
             ("myriad/api_server".to_string(), "1.2.3-dev.4".to_string()), // move → prerelease
-            ("myriad/api_server".to_string(), "1.4.2-canal13".to_string()), // leave
-            ("library/postgres".to_string(), "16.2".to_string()),   // third-party: skipped
+            ("myriad/api_server".to_string(), "1.4.2-canal13".to_string()), // catch-all → development
+            ("library/postgres".to_string(), "16.2".to_string()),           // third-party: skipped
         ];
         let plan = build_group_plan(&g, &inv, "docker-internal");
+        // 1.2.3-dev.4 → prerelease, 1.4.2-canal13 → development
         assert_eq!(plan.moves.len(), 2);
-        assert_eq!(plan.conditional_deletes.len(), 1);
-        assert_eq!(plan.conditional_deletes[0].check_repo, "docker-insight");
-        assert_eq!(plan.leaves.len(), 1);
-        assert_eq!(plan.leaves[0].tag, "1.4.2-canal13");
+        assert_eq!(plan.reconciles.len(), 1);
+        assert_eq!(plan.reconciles[0].check_repo, "docker-insight");
+        assert_eq!(plan.reconciles[0].dest, "docker-release-aux");
+        // Catch-all means nothing is left unclassified.
+        assert!(plan.leaves.is_empty());
+        // Third-party image contributed nothing.
         assert!(!plan.moves.iter().any(|m| m.image == "library/postgres"));
+        assert!(!plan
+            .reconciles
+            .iter()
+            .any(|r| r.tag.image == "library/postgres"));
     }
 
     #[test]
