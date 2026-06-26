@@ -352,12 +352,20 @@ impl MismatchInfo {
     }
 }
 
+/// A planned source-tag deletion together with the reason it's being removed,
+/// so the dry-run can explain each delete instead of just listing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteItem {
+    pub tag: TagRef,
+    pub reason: String,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     pub moves: Vec<PlannedMove>,
     pub conditional_deletes: Vec<ConditionalDelete>,
     pub reconciles: Vec<ReconcileItem>,
-    pub deletes: Vec<TagRef>,
+    pub deletes: Vec<DeleteItem>,
     pub leaves: Vec<TagRef>,
 }
 
@@ -398,7 +406,10 @@ fn build_group_plan(
                 dest: dest.to_string(),
                 on_mismatch,
             }),
-            Decision::Delete => plan.deletes.push(tagref()),
+            Decision::Delete => plan.deletes.push(DeleteItem {
+                tag: tagref(),
+                reason: "matched a delete rule".to_string(),
+            }),
             Decision::Leave => plan.leaves.push(tagref()),
         }
     }
@@ -429,24 +440,23 @@ fn validate_repo_refs(
         .collect();
     let mut errs = Vec::new();
 
-    let mut check = |name: &str, fmt: &str, must_be_hosted: bool, role: &str| match by_name
-        .get(name)
-    {
-        None => errs.push(format!("{role} repo '{name}' does not exist")),
-        Some((repo_type, repo_fmt)) => {
-            if *repo_fmt != fmt {
-                errs.push(format!(
-                    "{role} repo '{name}' is format '{repo_fmt}', expected '{fmt}'"
-                ));
-            }
-            if must_be_hosted && *repo_type != "hosted" {
-                errs.push(format!(
-                    "{role} repo '{name}' is type '{repo_type}', but a move/copy \
+    let mut check =
+        |name: &str, fmt: &str, must_be_hosted: bool, role: &str| match by_name.get(name) {
+            None => errs.push(format!("{role} repo '{name}' does not exist")),
+            Some((repo_type, repo_fmt)) => {
+                if *repo_fmt != fmt {
+                    errs.push(format!(
+                        "{role} repo '{name}' is format '{repo_fmt}', expected '{fmt}'"
+                    ));
+                }
+                if must_be_hosted && *repo_type != "hosted" {
+                    errs.push(format!(
+                        "{role} repo '{name}' is type '{repo_type}', but a move/copy \
                      destination must be 'hosted'"
-                ));
+                    ));
+                }
             }
-        }
-    };
+        };
 
     for g in groups {
         for s in &g.source_repos {
@@ -519,7 +529,7 @@ pub struct ReorgConfig {
 #[derive(Default)]
 struct ResolvedPlan {
     moves: Vec<PlannedMove>,
-    deletes: Vec<TagRef>,
+    deletes: Vec<DeleteItem>,
     kept: Vec<TagRef>,
     leaves: Vec<TagRef>,
     purges: Vec<TagRef>,
@@ -582,7 +592,11 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                 if insight_has(client, &cd.check_repo, &cd.tag.image, &cd.tag.tag).await? {
                     resolved.kept.push(cd.tag);
                 } else {
-                    resolved.deletes.push(cd.tag);
+                    let reason = format!("absent from {} (delete-if-absent)", cd.check_repo);
+                    resolved.deletes.push(DeleteItem {
+                        tag: cd.tag,
+                        reason,
+                    });
                 }
             }
 
@@ -619,7 +633,14 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                         )
                     })?;
                 if !check_digest.is_empty() && check_digest == src_digest {
-                    resolved.deletes.push(rec.tag);
+                    let reason = format!(
+                        "identical digest already in {} (redundant duplicate)",
+                        rec.check_repo
+                    );
+                    resolved.deletes.push(DeleteItem {
+                        tag: rec.tag,
+                        reason,
+                    });
                 } else {
                     // A real mismatch: gather the build-time evidence so the plan
                     // can explain it (and prompt, under the `ask` policy). The
@@ -663,12 +684,10 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         for m in &resolved.moves {
             images.insert(m.image.clone());
         }
-        for t in resolved
-            .deletes
-            .iter()
-            .chain(&resolved.kept)
-            .chain(&resolved.leaves)
-        {
+        for d in &resolved.deletes {
+            images.insert(d.tag.image.clone());
+        }
+        for t in resolved.kept.iter().chain(&resolved.leaves) {
             images.insert(t.image.clone());
         }
         for m in &resolved.mismatched {
@@ -863,13 +882,12 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         }
     } else {
         let mismatch_tags = approved_mismatch_deletes.iter().map(|m| &m.tag);
-        for d in resolved
-            .deletes
+        let other_tags = resolved
+            .purges
             .iter()
-            .chain(resolved.purges.iter())
             .chain(resolved.prefix_deletes.iter())
-            .chain(mismatch_tags)
-        {
+            .chain(mismatch_tags);
+        for d in resolved.deletes.iter().map(|d| &d.tag).chain(other_tags) {
             let r = client
                 .staging_delete(&d.source_repo, &d.image, &d.tag)
                 .await;
@@ -964,8 +982,11 @@ fn print_remaining(
     cache_contents: &BTreeMap<String, Vec<TagRef>>,
     first_party_prefixes: &[String],
 ) {
-    let is_fp =
-        |image: &str| first_party_prefixes.iter().any(|pre| image.starts_with(pre.as_str()));
+    let is_fp = |image: &str| {
+        first_party_prefixes
+            .iter()
+            .any(|pre| image.starts_with(pre.as_str()))
+    };
 
     // Group a set of tag refs by image, with sorted tags per image.
     let by_image = |tags: &[&TagRef]| -> BTreeMap<String, Vec<String>> {
@@ -993,7 +1014,11 @@ fn print_remaining(
         .collect();
 
     let mut source_repos: std::collections::BTreeSet<&str> = Default::default();
-    for t in p.remaining_third_party.iter().chain(fp_left.iter().copied()) {
+    for t in p
+        .remaining_third_party
+        .iter()
+        .chain(fp_left.iter().copied())
+    {
         source_repos.insert(t.source_repo.as_str());
     }
 
@@ -1061,15 +1086,76 @@ fn print_plan(
 ) {
     let verb = if copy { "copy" } else { "move" };
     let del_note = if copy { " (skipped: --copy)" } else { "" };
-    if let Some(ur) = usage_repo {
-        println!("(usage annotations show last-accessed from '{ur}')");
-    }
 
-    println!("Planned {verb}s ({} tag(s)):", p.moves.len());
     let mut by_dest: BTreeMap<&str, Vec<&PlannedMove>> = BTreeMap::new();
     for m in &p.moves {
         by_dest.entry(m.dest.as_str()).or_default().push(m);
     }
+
+    // ---- Overview: the whole plan in one screen, before the long detail dump.
+    // Every action with its count + a one-line meaning, so a reader doesn't have
+    // to scroll thousands of move lines to learn the shape of the run.
+    println!("================ Reorg plan ({verb}) — overview ================");
+    if let Some(ur) = usage_repo {
+        println!("Usage annotations '[pulled DATE]' show last access from '{ur}'.");
+    }
+    println!(
+        "  {:<9} {:>6} tag(s) — re-homed by tag class into:",
+        "Moves",
+        p.moves.len()
+    );
+    for (dest, moves) in &by_dest {
+        println!("            {:>6}  -> {dest}", moves.len());
+    }
+    let purge_repos = {
+        let mut s: BTreeMap<&str, usize> = BTreeMap::new();
+        for t in &p.purges {
+            *s.entry(t.source_repo.as_str()).or_default() += 1;
+        }
+        s
+    };
+    let summarize = |label: &str, n: usize, meaning: &str| {
+        if n > 0 {
+            println!("  {label:<9} {n:>6} tag(s) — {meaning}");
+        }
+    };
+    summarize(
+        "Delete",
+        p.deletes.len(),
+        "redundant: identical digest already in the check repo",
+    );
+    summarize(
+        "Purge",
+        p.purges.len(),
+        &format!(
+            "dead cache(s) emptied wholesale: {}",
+            purge_repos.keys().copied().collect::<Vec<_>>().join(", ")
+        ),
+    );
+    summarize(
+        "Retired",
+        p.prefix_deletes.len(),
+        "old namespaces removed wholesale (delete_prefixes)",
+    );
+    summarize(
+        "Review",
+        p.mismatched.len(),
+        "different digest in the check repo (Reconcile mismatch — decided on --apply)",
+    );
+    summarize(
+        "Kept",
+        p.kept.len(),
+        "already in the check repo, left in place",
+    );
+    println!(
+        "  {:<9} {:>6} tag(s) — no rule matched{}",
+        "Unmatched",
+        p.leaves.len(),
+        if p.leaves.is_empty() { " ✓" } else { "" }
+    );
+    println!("Full detail follows.\n");
+
+    println!("Planned {verb}s ({} tag(s)):", p.moves.len());
     for (dest, moves) in &by_dest {
         println!("  -> {dest} ({} tag(s)):", moves.len());
         for m in moves {
@@ -1079,9 +1165,22 @@ fn print_plan(
     }
 
     println!("\nDeletes{del_note} ({} tag(s)):", p.deletes.len());
+    // Group by the recorded reason so each delete explains itself (redundant
+    // duplicate already in the check repo / absent from the check repo / matched
+    // an explicit delete rule) rather than appearing as an unexplained list.
+    let mut by_reason: BTreeMap<&str, Vec<&DeleteItem>> = BTreeMap::new();
     for d in &p.deletes {
-        let note = atime_note(usage_repo, atimes, &d.image, &d.tag);
-        println!("       {}/{}:{}{note}", d.source_repo, d.image, d.tag);
+        by_reason.entry(d.reason.as_str()).or_default().push(d);
+    }
+    for (reason, items) in &by_reason {
+        println!("  {reason} — {} tag(s):", items.len());
+        for d in items {
+            let note = atime_note(usage_repo, atimes, &d.tag.image, &d.tag.tag);
+            println!(
+                "       {}/{}:{}{note}",
+                d.tag.source_repo, d.tag.image, d.tag.tag
+            );
+        }
     }
 
     if !p.purges.is_empty() {
@@ -1090,7 +1189,8 @@ fn print_plan(
             *by_repo.entry(t.source_repo.as_str()).or_default() += 1;
         }
         println!(
-            "\nPurge{del_note} ({} tag(s) across {} repo(s)):",
+            "\nPurge{del_note} ({} tag(s) across {} repo(s)) — \
+             configured `purge_repos`, emptied wholesale:",
             p.purges.len(),
             by_repo.len()
         );
@@ -1265,13 +1365,14 @@ async fn fetch_settled_summary(client: &DepotClient, scope: &[String]) -> Result
 /// shared by N repos is counted in each repo's size, so the per-repo sizes sum
 /// to more than the store's deduplicated physical total.
 fn print_repo_summary(before: &RepoSummary, after: Option<&RepoSummary>) {
-    let after_of = |name: &str| {
-        after.and_then(|a| a.repos.iter().find(|r| r.name == name))
-    };
+    let after_of = |name: &str| after.and_then(|a| a.repos.iter().find(|r| r.name == name));
     match after {
         None => {
             println!("\n================ Repository summary (current) ================");
-            println!("  {:28} {:8} {:>12} {:>12}", "repo", "type", "artifacts", "size");
+            println!(
+                "  {:28} {:8} {:>12} {:>12}",
+                "repo", "type", "artifacts", "size"
+            );
             for r in &before.repos {
                 println!(
                     "  {:28} {:8} {:>12} {:>12}",
@@ -1281,10 +1382,19 @@ fn print_repo_summary(before: &RepoSummary, after: Option<&RepoSummary>) {
                     fmt_gb(r.bytes)
                 );
             }
-            println!("\n  sum(all hosted/cache repos)    = {}", fmt_gb(before.logical_sum));
-            println!("  sum(docker hosted/cache repos) = {}", fmt_gb(before.docker_logical));
+            println!(
+                "\n  sum(all hosted/cache repos)    = {}",
+                fmt_gb(before.logical_sum)
+            );
+            println!(
+                "  sum(docker hosted/cache repos) = {}",
+                fmt_gb(before.docker_logical)
+            );
             for (name, bytes, blobs) in &before.stores {
-                println!("  store '{name}' physical total      = {} ({blobs} blobs, dedup)", fmt_gb(*bytes));
+                println!(
+                    "  store '{name}' physical total      = {} ({blobs} blobs, dedup)",
+                    fmt_gb(*bytes)
+                );
             }
         }
         Some(a) => {
@@ -1295,7 +1405,9 @@ fn print_repo_summary(before: &RepoSummary, after: Option<&RepoSummary>) {
             );
             for b in &before.repos {
                 let aft = after_of(&b.name);
-                let (a_art, a_bytes) = aft.map(|r| (r.artifacts, r.bytes)).unwrap_or((b.artifacts, b.bytes));
+                let (a_art, a_bytes) = aft
+                    .map(|r| (r.artifacts, r.bytes))
+                    .unwrap_or((b.artifacts, b.bytes));
                 println!(
                     "  {:28} {:8} {:>9} → {:>9} {:>10} → {:>10}",
                     b.name,
@@ -1491,7 +1603,10 @@ fn prompt_yes_no(question: &str) -> Result<bool> {
     std::io::stdout().flush().ok();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 #[cfg(test)]
@@ -1728,7 +1843,9 @@ mod tests {
         let mut missing = inv("hosted");
         missing.retain(|(n, _, _)| n != "docker-prerelease");
         let errs = validate_repo_refs(&missing, groups, Some("docker"));
-        assert!(errs.iter().any(|e| e.contains("docker-prerelease") && e.contains("does not exist")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("docker-prerelease") && e.contains("does not exist")));
 
         // Missing usage repo is reported.
         let errs = validate_repo_refs(&inv("hosted"), groups, Some("nope"));

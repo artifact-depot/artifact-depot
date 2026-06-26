@@ -266,7 +266,10 @@ async fn resolve_built(
         .and_then(|c| c.get("digest"))
         .and_then(|d| d.as_str())
     {
-        let (cbody, _) = client.docker_get_manifest_path(repo, image, child).await.ok()?;
+        let (cbody, _) = client
+            .docker_get_manifest_path(repo, image, child)
+            .await
+            .ok()?;
         let cm: serde_json::Value = serde_json::from_slice(&cbody).ok()?;
         return created_from_config(client, repo, image, &cm).await;
     }
