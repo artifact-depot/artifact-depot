@@ -38,10 +38,27 @@ pub struct CreateRepoRequest {
 #[derive(Debug, Deserialize)]
 pub struct RepoResponse {
     pub name: String,
-    #[allow(dead_code)]
     pub repo_type: String,
-    #[allow(dead_code)]
     pub format: String,
+    /// Ordered member list for group/proxy repos (first-match-wins resolution).
+    #[serde(default)]
+    pub members: Option<Vec<String>>,
+    /// Total artifact records (tags + manifests + blobs) currently in the repo.
+    #[serde(default)]
+    pub artifact_count: u64,
+    /// Logical size of those records in bytes (shared blobs counted per-repo).
+    #[serde(default)]
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StoreResponse {
+    pub name: String,
+    #[serde(default)]
+    pub blob_count: u64,
+    /// Physical bytes stored (deduplicated; shared blobs counted once).
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +221,22 @@ impl DepotClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("list repos failed ({}): {}", status, body);
+        }
+        Ok(resp.json().await?)
+    }
+
+    pub async fn list_stores(&self) -> Result<Vec<StoreResponse>> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/stores", self.base_url))
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("list stores failed ({}): {}", status, body);
         }
         Ok(resp.json().await?)
     }
@@ -919,6 +952,62 @@ impl DepotClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("docker pull blob failed ({}): {}", status, body);
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// GET a manifest using the path-based form so multi-segment image names
+    /// route to the docker handler rather than the SPA. Returns (body, content-type).
+    pub async fn docker_get_manifest_path(
+        &self,
+        repo: &str,
+        image: &str,
+        reference: &str,
+    ) -> Result<(Vec<u8>, String)> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/repository/{}/v2/{}/manifests/{}",
+                self.base_url, repo, image, reference
+            ))
+            .header("Authorization", format!("Basic {}", self.basic_auth))
+            .header("Accept", MANIFEST_ACCEPT_ALL)
+            .send()
+            .await?;
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("docker get manifest failed ({status}): {body}");
+        }
+        Ok((resp.bytes().await?.to_vec(), content_type))
+    }
+
+    /// GET a blob using the path-based form (multi-segment image safe).
+    pub async fn docker_get_blob_path(
+        &self,
+        repo: &str,
+        image: &str,
+        digest: &str,
+    ) -> Result<Vec<u8>> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/repository/{}/v2/{}/blobs/{}",
+                self.base_url, repo, image, digest
+            ))
+            .header("Authorization", format!("Basic {}", self.basic_auth))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("docker get blob failed ({status}): {body}");
         }
         Ok(resp.bytes().await?.to_vec())
     }

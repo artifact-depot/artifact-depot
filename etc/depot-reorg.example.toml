@@ -21,6 +21,19 @@
 # served the tag, or [absent from <repo>] (a "stale, safe to drop" hint).
 usage_repo = "docker"
 
+# --------------------------------------------------------------------------
+# Optional cache-integrity check. A local cache repo (e.g. docker-insight) is
+# supposed to mirror an authoritative upstream registry; anything in the cache
+# that the upstream doesn't have was manually pushed (pollution). The dry-run
+# diffs the cache against the union of the upstream repos and flags the extras.
+# Upstream credentials come from the UPSTREAM_USERNAME / UPSTREAM_PASSWORD env
+# vars. Report-only, and skipped (with a note) if creds are unset or the
+# upstream is unreachable.
+[check_authority]
+cache_repo     = "docker-insight"
+upstream_url   = "https://insight.quantum.com:8081"
+upstream_repos = ["docker-external", "docker-release"]
+
 [patterns]
 released   = '\d+\.\d+\.\d+'
 prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+'
@@ -35,8 +48,11 @@ developer  = '[a-z][a-z0-9]*-\d+'
 [[group]]
 format               = "docker"
 source_repos         = ["docker-internal", "docker-external"]
-first_party_prefixes = ["myriad/", "qkp/", "orchestrator/"]
+first_party_prefixes = ["myriad/", "qkp/", "quantum-orchestrator/"]
 purge_repos          = ["docker-upstream"]   # dead cache (upstream gone): emptied wholesale
+# Retired/renamed namespaces — every tag under these is deleted from the source
+# repos (e.g. the project was renamed to quantum-orchestrator/).
+delete_prefixes      = ["orchestrator/", "quantum_orchestrator/"]
 
   # Ordered; first matching rule wins.
 
@@ -52,11 +68,16 @@ purge_repos          = ["docker-upstream"]   # dead cache (upstream gone): empti
   #   absent from insight            → supplementary → move to docker-release-aux
   #   present, same content digest   → redundant dup → delete from source
   #   present, different digest      → not the same image → left for review
+  #   present, different digest      → not the same image. The script does NOT
+  #     guess which copy is right — `on_mismatch = "ask"` makes a dry-run print
+  #     the build-time/digest evidence, and `--apply` prompt you per tag before
+  #     deleting the source. Omit it (or set "leave") to just report and skip.
   [[group.rule]]
-  match  = "released"
-  action = "reconcile"
-  check  = "docker-insight"
-  dest   = "docker-release-aux"
+  match       = "released"
+  action      = "reconcile"
+  check       = "docker-insight"
+  dest        = "docker-release-aux"
+  on_mismatch = "ask"
 
   # rolling develop tag → prerelease repo
   [[group.rule]]
@@ -77,9 +98,11 @@ purge_repos          = ["docker-upstream"]   # dead cache (upstream gone): empti
   dest   = "docker-development-local"
 
   # Catch-all: anything no rule matched (dash-versions, platform-suffixed builder
-  # tags, branch tags, …) → development. Unused ones age out via that repo's
-  # cleanup_max_unaccessed_days; anything still pulled keeps its atime fresh.
+  # tags, branch tags, …) → development-local (the hosted repo that backs the
+  # `docker-development` group; a move must target a hosted repo, not the group).
+  # Unused ones age out via that repo's cleanup_max_unaccessed_days; anything
+  # still pulled keeps its atime fresh.
   [[group.rule]]
   match  = '.*'
   action = "move"
-  dest   = "docker-development"
+  dest   = "docker-development-local"

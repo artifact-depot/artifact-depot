@@ -7,7 +7,7 @@
 
 use clap::{Parser, Subcommand};
 
-use depot_bench::{client, demo, reorg, runner};
+use depot_bench::{audit, client, demo, reorg, runner};
 
 #[derive(Parser)]
 #[command(
@@ -178,6 +178,29 @@ enum Command {
         #[arg(long, default_value_t = false)]
         copy: bool,
     },
+
+    /// Audit a group repo for tags cloaked by an earlier member (shadowing)
+    AuditShadow {
+        /// Base URL of the depot instance
+        #[arg(long, default_value = "http://localhost:8080")]
+        url: String,
+
+        /// Username for authentication
+        #[arg(long, default_value = "admin")]
+        username: String,
+
+        /// Password for authentication
+        #[arg(long, default_value = "admin")]
+        password: String,
+
+        /// Skip TLS certificate verification
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
+
+        /// Name of the group/proxy repo to audit
+        #[arg(long)]
+        group: String,
+    },
 }
 
 #[tokio::main]
@@ -304,9 +327,28 @@ async fn main() -> anyhow::Result<()> {
                     rules_path: rules,
                     apply,
                     copy,
+                    insecure,
                 },
             )
             .await?;
+        }
+
+        Command::AuditShadow {
+            url,
+            username,
+            password,
+            insecure,
+            group,
+        } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "depot=info".into()),
+                )
+                .init();
+
+            let c = client::DepotClient::new(&url, &username, &password, insecure)?;
+            audit::run(&c, audit::AuditConfig { group }).await?;
         }
     }
 
