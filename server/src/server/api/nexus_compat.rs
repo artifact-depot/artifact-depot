@@ -1286,7 +1286,6 @@ pub async fn staging_delete(
             state.kv.as_ref(),
             &state.updater,
             &source,
-            &source_cfg.store,
             image.as_deref(),
             &tag,
         )

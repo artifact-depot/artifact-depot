@@ -41,7 +41,6 @@ pub async fn bulk_delete(
     repo: &str,
     prefix: &str,
     updater: &UpdateSender,
-    store_name: &str,
     cancel: Option<&CancellationToken>,
     progress_tx: Option<&watch::Sender<TaskProgress>>,
     progress_offset: &ProgressOffset,
@@ -126,9 +125,8 @@ pub async fn bulk_delete(
                 -(deleted.bytes as i64),
             )
             .await;
-        updater
-            .store_changed(store_name, -(deleted.count as i64), -(deleted.bytes as i64))
-            .await;
+        // No store_changed: bulk delete removes artifact records, not blobs —
+        // the orphaned blobs are reclaimed (and store stats recomputed) by GC.
     }
 
     Ok(BulkDeleteResult {

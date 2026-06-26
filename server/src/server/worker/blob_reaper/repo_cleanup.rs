@@ -100,13 +100,11 @@ pub(super) async fn expire_repo_artifacts(
     }
 
     let repo_name = &repo.name;
-    let store_name = &repo.store;
     let is_docker = repo.format() == depot_core::store::kv::ArtifactFormat::Docker;
     let mut js = JoinSet::new();
     for shard in 0..keys::NUM_SHARDS {
         let kv = kv.clone();
         let repo_name = repo_name.clone();
-        let store_name = store_name.clone();
         let cancel = cancel.cloned();
         let updater = updater.clone();
         js.spawn(async move {
@@ -174,16 +172,14 @@ pub(super) async fn expire_repo_artifacts(
                     )
                     .await?;
                     local_expired += expired_entries.len() as u64;
-                    let mut batch_bytes = 0i64;
                     for &(sk, size) in &expired_entries {
                         updater
                             .dir_changed(&repo_name, sk, -1, -(size as i64))
                             .await;
-                        batch_bytes += size as i64;
                     }
-                    updater
-                        .store_changed(&store_name, -(expired_entries.len() as i64), -batch_bytes)
-                        .await;
+                    // No store_changed: expiring artifact records removes no
+                    // physical blob — the orphan sweep reclaims (and recomputes
+                    // store stats) once nothing references the blob.
                 }
 
                 if result.done {

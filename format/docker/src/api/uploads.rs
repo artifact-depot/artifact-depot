@@ -288,8 +288,13 @@ pub async fn do_start_upload(
         };
         let blob_ref_path = store.blob_ref_path(&computed);
         let txn_result: Result<Option<String>, depot_core::error::DepotError> = async {
-            let existing =
-                service::put_dedup_record(state.kv.as_ref(), &store_name, &blob_rec).await?;
+            let existing = service::put_dedup_record_counted(
+                state.kv.as_ref(),
+                &store_name,
+                &blob_rec,
+                &state.updater,
+            )
+            .await?;
             if let Some(ref existing_id) = existing {
                 record.blob_id = Some(existing_id.to_string());
             }
@@ -303,14 +308,11 @@ pub async fn do_start_upload(
                 if dedup.is_some() {
                     let _ = blobs.delete(&mono_blob_id).await;
                 }
-                // Notify dir-entry and store-stats workers.
+                // Per-repo dir stats only; store credit handled by
+                // put_dedup_record_counted above.
                 state
                     .updater
                     .dir_changed(&target_repo, &blob_ref_path, 1, size as i64)
-                    .await;
-                state
-                    .updater
-                    .store_changed(&target_config.store, 1, size as i64)
                     .await;
                 let mut headers = HeaderMap::new();
                 headers.insert(
@@ -889,7 +891,13 @@ pub async fn do_complete_upload(
     };
     let blob_ref_path = store.blob_ref_path(&docker_digest);
     let commit_result: Result<Option<String>, depot_core::error::DepotError> = async {
-        let existing = service::put_dedup_record(state.kv.as_ref(), &store_name, &blob_rec).await?;
+        let existing = service::put_dedup_record_counted(
+            state.kv.as_ref(),
+            &store_name,
+            &blob_rec,
+            &state.updater,
+        )
+        .await?;
         if let Some(ref existing_id) = existing {
             record.blob_id = Some(existing_id.to_string());
         }
@@ -907,14 +915,11 @@ pub async fn do_complete_upload(
             for chunk_id in &chunk_blob_ids {
                 let _ = blobs.delete(chunk_id).await;
             }
-            // Notify dir-entry and store-stats workers.
+            // Per-repo dir stats only; store credit handled by
+            // put_dedup_record_counted above.
             state
                 .updater
                 .dir_changed(&target_repo, &blob_ref_path, 1, size as i64)
-                .await;
-            state
-                .updater
-                .store_changed(&store_name, 1, size as i64)
                 .await;
             let mut headers = HeaderMap::new();
             headers.insert(

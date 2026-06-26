@@ -89,7 +89,14 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -129,8 +136,14 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let ver_blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &ver_blob_rec).await?;
+        let ver_blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &ver_blob_rec,
+            self.updater,
+        )
+        .await?;
         let version_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -166,8 +179,14 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let tags_blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &tags_blob_rec).await?;
+        let tags_blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &tags_blob_rec,
+            self.updater,
+        )
+        .await?;
         let tags_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -197,23 +216,18 @@ impl<'a> NpmStore<'a> {
         self.updater
             .dir_changed(self.repo, &path, count_delta, bytes_delta)
             .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
-            .await;
         let old_ver = service::put_artifact(self.kv, &repo, &ver_path, &version_record).await?;
         let (vc, vb) = match &old_ver {
             Some(old) => (0i64, version_record.size as i64 - old.size as i64),
             None => (1i64, version_record.size as i64),
         };
         self.updater.dir_changed(self.repo, &ver_path, vc, vb).await;
-        self.updater.store_changed(self.store, vc, vb).await;
         let old_tags = service::put_artifact(self.kv, &repo, &dt_path, &tags_record).await?;
         let (tc, tb) = match &old_tags {
             Some(old) => (0i64, tags_record.size as i64 - old.size as i64),
             None => (1i64, tags_record.size as i64),
         };
         self.updater.dir_changed(self.repo, &dt_path, tc, tb).await;
-        self.updater.store_changed(self.store, tc, tb).await;
 
         Ok(record)
     }
@@ -248,7 +262,14 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -288,8 +309,14 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let ver_blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &ver_blob_rec).await?;
+        let ver_blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &ver_blob_rec,
+            self.updater,
+        )
+        .await?;
         let version_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -318,16 +345,12 @@ impl<'a> NpmStore<'a> {
         self.updater
             .dir_changed(self.repo, &path, count_delta, bytes_delta)
             .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
-            .await;
         let old_ver = service::put_artifact(self.kv, &repo, &ver_path, &version_record).await?;
         let (vc, vb) = match &old_ver {
             Some(old) => (0i64, version_record.size as i64 - old.size as i64),
             None => (1i64, version_record.size as i64),
         };
         self.updater.dir_changed(self.repo, &ver_path, vc, vb).await;
-        self.updater.store_changed(self.store, vc, vb).await;
 
         Ok(record)
     }
@@ -399,8 +422,14 @@ impl<'a> NpmStore<'a> {
             store: self.store.to_string(),
         };
         let store = self.store.to_string();
-        let tags_blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+        let tags_blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -424,9 +453,6 @@ impl<'a> NpmStore<'a> {
         };
         self.updater
             .dir_changed(self.repo, &path, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
         Ok(())
     }
@@ -734,8 +760,14 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            self.store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let norm = normalize_name(package);
         let path = format!("_npm/packument/{norm}");

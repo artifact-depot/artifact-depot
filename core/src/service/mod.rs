@@ -26,8 +26,9 @@ pub use artifact::{
     list_artifacts, put_artifact, put_artifact_if_absent, search_artifacts, touch_artifact,
 };
 pub use blob::{
-    claim_or_reuse_blob, count_blobs_for_store, delete_blob, fold_all_blobs, get_blob,
-    list_blobs_for_store, put_blob, put_dedup_record,
+    claim_or_reuse_blob, claim_or_reuse_blob_counted, count_blobs_for_store, delete_blob,
+    delete_blob_counted, fold_all_blobs, get_blob, list_blobs_for_store, put_blob,
+    put_dedup_record, put_dedup_record_counted,
 };
 pub use directory::{get_dir, get_repo_stats, list_children};
 pub use meta::{delete_meta, get_gc_last_started_at, get_meta, put_meta, set_gc_last_started_at};
@@ -38,7 +39,7 @@ pub use repo::{
 pub use scan::{BG_SHARD_CONCURRENCY, SHARD_CONCURRENCY};
 pub use store::{
     delete_store, delete_store_stats, get_store, get_store_stats, list_stores, put_store,
-    put_store_stats,
+    put_store_stats, reconcile_store_stats,
 };
 pub use typed::{typed_get, typed_get_versioned, typed_list, typed_put, typed_put_if_absent};
 pub use upload::{

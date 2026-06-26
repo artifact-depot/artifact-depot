@@ -73,6 +73,7 @@ use depot_format_docker::api as docker;
         stores::delete_store,
         stores::browse_store_blobs,
         stores::check_store,
+        stores::reconcile_stores,
         // Settings
         api_settings::get_settings,
         api_settings::put_settings,
@@ -123,6 +124,8 @@ use depot_format_docker::api as docker;
         stores::BrowseEntry,
         stores::BrowseResponse,
         stores::StoreCheckResponse,
+        stores::ReconcileEntry,
+        stores::ReconcileResponse,
         // Settings
         crate::server::config::settings::Settings,
         crate::server::config::settings::LoggingSettingsConfig,
@@ -274,6 +277,7 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
             get(stores::browse_store_blobs),
         )
         .route("/api/v1/stores/{name}/check", post(stores::check_store))
+        .route("/api/v1/stores/reconcile", post(stores::reconcile_stores))
         // Settings
         .route(
             "/api/v1/settings",

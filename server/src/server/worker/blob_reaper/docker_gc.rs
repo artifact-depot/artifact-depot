@@ -48,7 +48,6 @@ pub(super) async fn docker_gc(
 
     let mut deleted = 0u64;
     let repo_name = &repo.name;
-    let store_name = &repo.store;
     let grace_cutoff = chrono::Utc::now() - chrono::Duration::seconds(DOCKER_GC_GRACE_SECS as i64);
 
     // Collect all Docker artifacts across all shards in parallel, grouped by path prefix.
@@ -186,14 +185,12 @@ pub(super) async fn docker_gc(
         depot_core::service::delete_artifacts_paired_batch(kv.as_ref(), repo_name, &blob_del_sks)
             .await?;
         deleted += blob_del_sks.len() as u64;
-        let mut batch_bytes = 0i64;
         for (&sk, &size) in blob_del_sks.iter().zip(blob_del_sizes.iter()) {
             updater.dir_changed(repo_name, sk, -1, -(size as i64)).await;
-            batch_bytes += size as i64;
         }
-        updater
-            .store_changed(store_name, -(blob_del_sks.len() as i64), -batch_bytes)
-            .await;
+        // No store_changed: deleting blob-ref artifact records orphans the
+        // blobs but doesn't remove them — the orphan sweep reclaims them (and
+        // recomputes store stats) once unreferenced.
     }
 
     // --- Phase B: Delete unreferenced manifests (if policy enabled) ---
@@ -256,14 +253,10 @@ pub(super) async fn docker_gc(
             )
             .await?;
             deleted += manifest_del_sks.len() as u64;
-            let mut batch_bytes = 0i64;
             for (&sk, &size) in manifest_del_sks.iter().zip(manifest_del_sizes.iter()) {
                 updater.dir_changed(repo_name, sk, -1, -(size as i64)).await;
-                batch_bytes += size as i64;
             }
-            updater
-                .store_changed(store_name, -(manifest_del_sks.len() as i64), -batch_bytes)
-                .await;
+            // No store_changed: same as above — orphaned, not yet reclaimed.
         }
     }
 

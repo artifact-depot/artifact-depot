@@ -485,6 +485,7 @@ const MANAGEMENT_ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/stores/{name}", &["get", "put", "delete"]),
     ("/api/v1/stores/{name}/browse", &["get"]),
     ("/api/v1/stores/{name}/check", &["post"]),
+    ("/api/v1/stores/reconcile", &["post"]),
     // Settings
     ("/api/v1/settings", &["get", "put"]),
     // Backup & Restore

@@ -57,6 +57,7 @@ pub async fn run_check(
     cancel: CancellationToken,
     dry_run: bool,
     verify_blob_hashes: bool,
+    updater: depot_core::update::UpdateSender,
 ) {
     let mode_label = if dry_run { "dry-run" } else { "fix" };
     task_manager
@@ -680,7 +681,10 @@ pub async fn run_check(
     if !dry_run {
         let to_delete = missing_blobs.lock().await.clone();
         for (store, hash) in &to_delete {
-            if let Ok(true) = service::delete_blob(kv.as_ref(), store, hash).await {
+            // Counted delete: the dangling dedup record was being counted in the
+            // store stat though its blob is already gone — debit it on removal.
+            if let Ok(true) = service::delete_blob_counted(kv.as_ref(), store, hash, &updater).await
+            {
                 task_manager
                     .append_log(
                         task_id,
@@ -1379,6 +1383,7 @@ mod tests {
             cancel,
             true, // dry_run
             true, // verify_blob_hashes
+            depot_core::update::UpdateSender::noop(),
         )
         .await;
         let tasks = task_manager.list().await;

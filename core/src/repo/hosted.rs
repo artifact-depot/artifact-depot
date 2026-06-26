@@ -65,8 +65,12 @@ impl HostedRepo {
             format: &self.format,
             repo_type: "hosted",
         };
-        let IngestionResult { record, old_record } =
-            ingest_artifact(&ctx, path, content_type, data).await?;
+        let IngestionResult {
+            record,
+            old_record,
+            new_blob,
+        } = ingest_artifact(&ctx, path, content_type, data).await?;
+        // Per-repo (logical) dir stats track the artifact record either way.
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
             None => (1i64, record.size as i64),
@@ -74,9 +78,12 @@ impl HostedRepo {
         self.updater
             .dir_changed(&self.name, path, count_delta, bytes_delta)
             .await;
-        self.updater
-            .store_changed(&self.store, count_delta, bytes_delta)
-            .await;
+        // Store (physical) stats grow only when a genuinely new blob was stored.
+        if new_blob {
+            self.updater
+                .store_changed(&self.store, 1, record.size as i64)
+                .await;
+        }
 
         // If a chart was uploaded to a Helm repo via the generic raw handler
         // (e.g. restore), mark metadata stale so the index is rebuilt.
@@ -98,11 +105,10 @@ impl HostedRepo {
     pub async fn delete(&self, path: &str) -> error::Result<bool> {
         let old_record = service::delete_artifact(self.kv.as_ref(), &self.name, path).await?;
         if let Some(old) = &old_record {
+            // Per-repo dir stats only — removing the artifact record orphans the
+            // blob; GC reclaims it (and adjusts store stats) once unreferenced.
             self.updater
                 .dir_changed(&self.name, path, -1, -(old.size as i64))
-                .await;
-            self.updater
-                .store_changed(&self.store, -1, -(old.size as i64))
                 .await;
         }
         // If a chart was deleted from a Helm repo, mark metadata stale.

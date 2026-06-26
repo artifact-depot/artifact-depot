@@ -433,9 +433,16 @@ impl CacheRepo {
                     created_at: now,
                     store: store_bg.clone(),
                 };
-                let effective_blob_id =
-                    service::claim_or_reuse_blob(kv.as_ref(), blobs.as_ref(), &store_bg, &blob_rec)
-                        .await?;
+                // Credits the store iff a new blob record was created, and drops
+                // the duplicate on a dedup hit (the cache-refetch leak fix).
+                let effective_blob_id = service::claim_or_reuse_blob_counted(
+                    kv.as_ref(),
+                    blobs.as_ref(),
+                    &store_bg,
+                    &blob_rec,
+                    &updater_bg,
+                )
+                .await?;
 
                 let artifact = ArtifactRecord {
                     schema_version: CURRENT_RECORD_VERSION,
@@ -461,9 +468,7 @@ impl CacheRepo {
                 updater_bg
                     .dir_changed(&repo_name, &path_bg, count_delta, bytes_delta)
                     .await;
-                updater_bg
-                    .store_changed(&store_bg, count_delta, bytes_delta)
-                    .await;
+                // Store credit handled by claim_or_reuse_blob_counted above.
 
                 // tx is dropped here after successful commit → clean stream end
                 Ok::<(), DepotError>(())

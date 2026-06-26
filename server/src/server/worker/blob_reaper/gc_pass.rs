@@ -313,13 +313,11 @@ pub async fn gc_pass(
             .map(|d| now - chrono::Duration::days(d as i64));
 
         let repo_name = repo.name.clone();
-        let store_name = repo.store.clone();
         let is_docker = repo.format() == depot_core::store::kv::ArtifactFormat::Docker;
         for shard in 0..keys::NUM_SHARDS {
             let kv = kv.clone();
             let tmpl = template.clone();
             let repo_name = repo_name.clone();
-            let store_name = store_name.clone();
             let cancel = cancel.cloned();
             let updater = updater.clone();
             let live_scanned = live_scanned.clone();
@@ -392,20 +390,14 @@ pub async fn gc_pass(
                         service::delete_artifacts_paired_batch(kv.as_ref(), &repo_name, &paths)
                             .await?;
                         local_expired += expired_entries.len() as u64;
-                        let mut batch_bytes = 0i64;
                         for &(sk, size) in &expired_entries {
                             updater
                                 .dir_changed(&repo_name, sk, -1, -(size as i64))
                                 .await;
-                            batch_bytes += size as i64;
                         }
-                        updater
-                            .store_changed(
-                                &store_name,
-                                -(expired_entries.len() as i64),
-                                -batch_bytes,
-                            )
-                            .await;
+                        // No store_changed: expiring artifact records removes no
+                        // physical blob (the blob lingers until the orphan sweep
+                        // reclaims it, where store stats are recomputed).
                     }
 
                     // Update the shared counter so the progress ticker picks it up.

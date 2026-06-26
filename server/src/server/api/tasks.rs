@@ -73,6 +73,7 @@ pub async fn start_check(
     let task_manager = state.bg.tasks.clone();
     let kv = state.repo.kv.clone();
     let stores = state.repo.stores.clone();
+    let updater = state.repo.updater.clone();
     let instance_id = state.bg.instance_id.clone();
 
     tokio::spawn(async move {
@@ -86,6 +87,7 @@ pub async fn start_check(
             cancel,
             dry_run,
             verify_blob_hashes,
+            updater,
         )
         .await;
     });

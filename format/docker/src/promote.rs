@@ -77,28 +77,41 @@ impl CopyTarget<'_> {
             Some(r) => r,
             None => return Ok(0),
         };
-        let dest_rec = if self.same_store() {
-            // Shared store: the blob pointer is valid as-is, copy verbatim.
-            rec
+        let (dest_rec, store_bytes_added) = if self.same_store() {
+            // Shared store: the blob pointer is valid as-is, copy verbatim. No
+            // physical bytes are added — the content-addressed blob is shared —
+            // so the store's physical counter must NOT move.
+            (rec, 0u64)
         } else {
             // Different store: stream the blob bytes across, re-point the record.
+            // Reports the bytes actually newly persisted (0 on a dedup hit).
             self.rehome_blob(rec).await?
         };
         let old = service::put_artifact(self.kv, self.dest_repo, path, &dest_rec).await?;
+        // Per-repo (directory) stats are logical — every repo counts the records
+        // it holds — so the destination legitimately grows here.
         let (cd, bd) = delta(dest_rec.size, old.as_ref().map(|r| r.size));
         self.updater.dir_changed(self.dest_repo, path, cd, bd).await;
-        self.updater.store_changed(self.dest_store, cd, bd).await;
+        // Store stats track *physical* (deduplicated) bytes — only credit blobs
+        // that were genuinely newly stored, never a same-store verbatim copy.
+        if store_bytes_added > 0 {
+            self.updater
+                .store_changed(self.dest_store, 1, store_bytes_added as i64)
+                .await;
+        }
         Ok(1)
     }
 
     /// Stream a blob-backed record's bytes from the source store into the
     /// destination store (de-duplicating there) and return the record cloned
-    /// with its `blob_id` re-pointed at the destination blob. Records without a
-    /// blob (e.g. tags) are returned unchanged. Timestamps are preserved.
-    async fn rehome_blob(&self, rec: ArtifactRecord) -> error::Result<ArtifactRecord> {
+    /// with its `blob_id` re-pointed at the destination blob, plus the number of
+    /// bytes **newly persisted** to the destination store (0 if the record has
+    /// no blob, or if the destination already had this content). Timestamps are
+    /// preserved.
+    async fn rehome_blob(&self, rec: ArtifactRecord) -> error::Result<(ArtifactRecord, u64)> {
         let blob_id = match rec.blob_id.as_deref() {
             Some(id) if !id.is_empty() => id.to_string(),
-            _ => return Ok(rec),
+            _ => return Ok((rec, 0)),
         };
         let data = self.source_blobs.get(&blob_id).await?.ok_or_else(|| {
             DepotError::DataIntegrity(format!(
@@ -122,15 +135,19 @@ impl CopyTarget<'_> {
             store: self.dest_store.to_string(),
         };
         let existing = service::put_dedup_record(self.kv, self.dest_store, &blob_rec).await?;
-        let effective = existing.clone().unwrap_or_else(|| new_blob_id.clone());
-        // If the destination store already had this content, drop our upload.
-        if existing.is_some() {
-            let _ = self.dest_blobs.delete(&new_blob_id).await;
-        }
+        // If the destination store already had this content, drop our upload and
+        // credit nothing; otherwise the bytes we just stored are genuinely new.
+        let (effective, added) = match existing {
+            Some(existing_id) => {
+                let _ = self.dest_blobs.delete(&new_blob_id).await;
+                (existing_id, 0u64)
+            }
+            None => (new_blob_id, data.len() as u64),
+        };
 
         let mut dest_rec = rec;
         dest_rec.blob_id = Some(effective);
-        Ok(dest_rec)
+        Ok((dest_rec, added))
     }
 }
 
@@ -241,7 +258,7 @@ pub async fn copy_tag(
 
     // Move: drop only the source tag; docker_gc reclaims orphaned bookkeeping.
     if delete_source {
-        delete_tag(t.kv, t.updater, t.source_repo, t.source_store, image, tag).await?;
+        delete_tag(t.kv, t.updater, t.source_repo, image, tag).await?;
     }
 
     Ok(PromoteOutcome {
@@ -259,17 +276,18 @@ pub async fn delete_tag(
     kv: &dyn KvStore,
     updater: &UpdateSender,
     repo: &str,
-    store: &str,
     image: Option<&str>,
     tag: &str,
 ) -> error::Result<bool> {
     let tag_path = tag_path_for(image, tag);
     match service::delete_artifact(kv, repo, &tag_path).await? {
         Some(old) => {
+            // Per-repo dir stats only — removing a tag deletes no physical blob
+            // (the manifest/layers linger until docker_gc reclaims them, which
+            // is where store stats are adjusted).
             updater
                 .dir_changed(repo, &tag_path, -1, -(old.size as i64))
                 .await;
-            updater.store_changed(store, -1, -(old.size as i64)).await;
             Ok(true)
         }
         None => Ok(false),

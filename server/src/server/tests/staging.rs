@@ -580,3 +580,99 @@ async fn staging_copy_same_store_also_works() {
     assert_eq!(head_blob(&app, "dst", &layer).await, StatusCode::OK);
     assert_eq!(head_manifest(&app, "src", "3.0.0").await, StatusCode::OK);
 }
+
+/// A *same-store* staging move re-points records at shared, content-addressed
+/// blobs and writes no bytes to disk. Measured authoritatively via
+/// `reconcile_store_stats` (recomputed from the blob records, so it's immune to
+/// the async `store_changed` worker), the store's physical blob count and bytes
+/// must be identical before and after the move — i.e. no duplication. (This also
+/// guards against a regression where the move takes the byte-streaming path on a
+/// shared store.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_move_same_store_adds_no_physical_blobs() {
+    use depot_core::service::{get_store_stats, reconcile_store_stats};
+
+    let app = TestApp::new().await;
+    app.create_docker_repo("src").await;
+    app.create_docker_repo("dst").await;
+
+    let cfg = app.push_docker_blob("src", b"stats-config").await;
+    let layer = app.push_docker_blob("src", &vec![7u8; 8192]).await; // a sizeable layer
+    let manifest = TestApp::make_manifest(&cfg, &[&layer]);
+    app.push_docker_manifest("src", "1.0.0", &manifest).await;
+    let kv = app.state.repo.kv.clone();
+
+    reconcile_store_stats(kv.as_ref()).await.unwrap();
+    let before = get_store_stats(kv.as_ref(), "default")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (status, body) = post(
+        &app,
+        "/service/rest/v1/staging/move/dst?repository=src&docker.imageTag=1.0.0",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(head_manifest(&app, "dst", "1.0.0").await, StatusCode::OK);
+
+    reconcile_store_stats(kv.as_ref()).await.unwrap();
+    let after = get_store_stats(kv.as_ref(), "default")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.blob_count, before.blob_count,
+        "same-store move must not add physical blobs"
+    );
+    assert_eq!(
+        after.total_bytes, before.total_bytes,
+        "same-store move must not add physical bytes (before={}, after={})",
+        before.total_bytes, after.total_bytes
+    );
+}
+
+/// `reconcile_store_stats` re-derives the store counter from the actual blob
+/// records, correcting any drift (the whole point of fix B).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_store_stats_corrects_drift() {
+    use depot_core::service::{get_store_stats, put_store_stats, reconcile_store_stats};
+    use depot_core::store::kv::StoreStatsRecord;
+
+    let app = TestApp::new().await;
+    app.create_docker_repo("src").await;
+    let kv = app.state.repo.kv.clone();
+
+    // Two distinct blobs (1000 + 2000 bytes) plus a duplicate of the first,
+    // which dedups → 2 physical blobs, 3000 bytes.
+    app.push_docker_blob("src", &vec![1u8; 1000]).await;
+    app.push_docker_blob("src", &vec![2u8; 2000]).await;
+    app.push_docker_blob("src", &vec![1u8; 1000]).await; // dup → no new physical blob
+
+    // Inject drift: a wildly wrong stored counter.
+    put_store_stats(
+        kv.as_ref(),
+        "default",
+        &StoreStatsRecord {
+            blob_count: 999,
+            total_bytes: 9_999_999,
+            updated_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Reconcile re-derives the truth from the blob records.
+    let returned = reconcile_store_stats(kv.as_ref()).await.unwrap();
+    assert!(returned.iter().any(|(s, _)| s == "default"));
+
+    let stats = get_store_stats(kv.as_ref(), "default")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stats.blob_count, 2, "two distinct blobs after dedup");
+    assert_eq!(
+        stats.total_bytes, 3000,
+        "1000 + 2000, dup not double-counted"
+    );
+}

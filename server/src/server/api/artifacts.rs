@@ -1370,11 +1370,14 @@ pub async fn put_artifact(
                 .updater
                 .dir_changed(&target_repo, &path, count_delta, bytes_delta)
                 .await;
-            state
-                .repo
-                .updater
-                .store_changed(&store_name, count_delta, bytes_delta)
-                .await;
+            // Store (physical) stats grow only when a genuinely new blob was stored.
+            if result.new_blob {
+                state
+                    .repo
+                    .updater
+                    .store_changed(&store_name, 1, result.record.size as i64)
+                    .await;
+            }
             (
                 StatusCode::CREATED,
                 Json(ArtifactResponse::from_record(path, result.record)),
@@ -1771,7 +1774,6 @@ pub async fn start_bulk_delete(
                 &target.name,
                 &prefix_for_task,
                 &updater,
-                &target.store,
                 Some(&cancel),
                 Some(&progress_tx),
                 &offset,
