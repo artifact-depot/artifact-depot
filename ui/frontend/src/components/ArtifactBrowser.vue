@@ -1001,11 +1001,10 @@ watch(
   margin: 0 0.25rem;
 }
 /* Override global table: this component needs fixed layout and tighter padding.
-   Cap the width so on wide monitors the columns group instead of stretching a
-   huge gap between Name and Size. */
+   Width is bounded by the centered `main` container (see App.vue), so the
+   table fills its panel without stretching across an ultra-wide monitor. */
 table {
   table-layout: fixed;
-  max-width: 1180px;
 }
 .type-label {
   text-transform: capitalize;
