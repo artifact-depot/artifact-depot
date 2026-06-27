@@ -110,7 +110,12 @@ test('proxy repos are excluded from Repositories page storage totals', async ({ 
 
     // Sanity: the member shows up in the table and in the pie legend.
     await expect(page.locator('tbody tr td strong', { hasText: new RegExp(`^${memberName}$`) })).toBeVisible()
-    await expect(page.locator('.pie-container .legend-name', { hasText: new RegExp(`^${memberName}$`) })).toBeVisible()
+    // The legend entries render a beat after the .pie-card container (chart
+    // layout runs once the repo data has loaded), so under parallel load this
+    // can lag past Playwright's 5s default. Give it the same budget as the
+    // card above. This also gates the proxy-absence check below: the legend
+    // must be populated before toHaveCount(0) is a meaningful assertion.
+    await expect(page.locator('.pie-container .legend-name', { hasText: new RegExp(`^${memberName}$`) })).toBeVisible({ timeout: 10000 })
 
     // Core assertion: the proxy is visible in the table (it is a repository),
     // but MUST NOT appear as a pie slice -- otherwise its bytes would be
