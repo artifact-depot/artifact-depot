@@ -567,6 +567,17 @@ export const api = {
     return { data, digest }
   },
 
+  /** All Docker image names in a repo (one cheap call), so the browser can
+   *  label a folder as a namespace vs an image without probing each row. */
+  async getDockerCatalog(repo: string): Promise<string[]> {
+    const resp = await fetch(`/repository/${encodeURIComponent(repo)}/v2/_catalog`, {
+      headers: authHeaders(),
+    })
+    if (!resp.ok) return []
+    const data = await resp.json()
+    return Array.isArray(data?.repositories) ? data.repositories : []
+  },
+
   async deleteArtifact(repo: string, path: string): Promise<void> {
     const resp = await fetch(`/repository/${encodeURIComponent(repo)}/${path}`, {
       method: 'DELETE',

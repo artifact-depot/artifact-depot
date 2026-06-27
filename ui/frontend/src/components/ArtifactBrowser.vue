@@ -43,6 +43,25 @@ function toggleExpert() {
   load()
 }
 
+// Repo image catalog (one cached call per repo) — lets us label a folder as a
+// namespace vs an image cheaply, without probing every row.
+const dockerImageSet = ref<Set<string>>(new Set())
+let catalogFetchedFor = ''
+async function ensureCatalog() {
+  if (!isDocker.value || catalogFetchedFor === props.repoName) return
+  try {
+    dockerImageSet.value = new Set(await api.getDockerCatalog(props.repoName))
+    catalogFetchedFor = props.repoName
+  } catch {
+    /* leave empty — folders just fall back to "namespace" */
+  }
+}
+function dockerType(item: DisplayItem): string {
+  if (item.kind === 'tag') return 'tag'
+  if (!item.isDir) return item.content_type || 'file'
+  return dockerImageSet.value.has(item.path.replace(/\/+$/, '')) ? 'image' : 'namespace'
+}
+
 // `docker pull` is available through the default docker group (host-root
 // routing), so a tag's pull command is just <host>/<image>:<tag> — no per-repo
 // port. Only offer it when a default group is configured (else it wouldn't
@@ -299,6 +318,7 @@ function clearSearch() {
 async function load() {
   loading.value = true
   try {
+    await ensureCatalog()
     if (isSearchMode.value && search.value) {
       const resp = await api.listArtifacts(props.repoName, { q: search.value })
       dirs.value = resp.dirs
@@ -614,15 +634,15 @@ watch(
         <colgroup>
           <col style="width: auto;" />
           <col style="width: 10rem;" />
-          <col style="width: 12rem;" />
+          <col :style="{ width: isDocker ? '9rem' : '16rem' }" />
           <col style="width: 14rem;" />
-          <col style="width: 5rem;" />
+          <col style="width: 13rem;" />
         </colgroup>
         <thead>
           <tr>
             <th>Name</th>
             <th>Size</th>
-            <th>Content Type</th>
+            <th>{{ isDocker ? 'Type' : 'Content Type' }}</th>
             <th>Updated</th>
             <th></th>
           </tr>
@@ -645,11 +665,14 @@ watch(
             <td>
               <template v-if="item.isDir">
                 {{ formatSize(item.total_bytes || 0) }}
-                <span class="dir-count">({{ item.artifact_count }} items)</span>
+                <span v-if="!isDocker" class="dir-count">({{ item.artifact_count }} items)</span>
               </template>
               <template v-else>{{ formatSize(item.size) }}</template>
             </td>
-            <td>{{ item.isDir ? 'Folder' : item.content_type }}</td>
+            <td>
+              <span v-if="isDocker" class="type-label">{{ dockerType(item) }}</span>
+              <template v-else>{{ item.isDir ? 'Folder' : item.content_type }}</template>
+            </td>
             <td>{{ formatDate(item.updated_at) }}</td>
             <td>
               <!-- Docker default view: a tag offers its `docker pull` command;
@@ -657,19 +680,19 @@ watch(
               <template v-if="dockerDefault && item.kind === 'tag'">
                 <button
                   v-if="hasDefaultDockerGroup"
-                  class="action-btn pull-btn"
+                  class="act-link"
                   :title="pullCommand(item.name)"
                   @click="copyPull(item, $event)"
                 >{{ copiedTag === item.name ? 'Copied ✓' : 'Copy pull' }}</button>
               </template>
               <template v-else-if="dockerDefault" />
               <template v-else-if="item.isDir">
-                <button class="action-btn" @click="confirmDirDownload(item, $event)" title="Download directory">&#11015;</button>
-                <button class="action-btn action-delete" @click="confirmDirDelete(item, $event)" title="Delete directory">&#10005;</button>
+                <button class="act-link" @click="confirmDirDownload(item, $event)" title="Download directory">Download</button>
+                <button class="act-link act-delete" @click="confirmDirDelete(item, $event)" title="Delete directory">Delete</button>
               </template>
               <template v-else>
-                <a :href="downloadUrl(item.path)" target="_blank" class="action-btn" title="Download">&#11015;</a>
-                <button class="action-btn action-delete" @click="confirmDelete(item.path, $event)" title="Delete">&#10005;</button>
+                <a :href="downloadUrl(item.path)" target="_blank" class="act-link" title="Download" @click.stop>Download</a>
+                <button class="act-link act-delete" @click="confirmDelete(item.path, $event)" title="Delete">Delete</button>
               </template>
             </td>
           </tr>
@@ -977,9 +1000,33 @@ watch(
   color: var(--color-text-disabled);
   margin: 0 0.25rem;
 }
-/* Override global table: this component needs fixed layout and tighter padding */
+/* Override global table: this component needs fixed layout and tighter padding.
+   Cap the width so on wide monitors the columns group instead of stretching a
+   huge gap between Name and Size. */
 table {
   table-layout: fixed;
+  max-width: 1180px;
+}
+.type-label {
+  text-transform: capitalize;
+  color: var(--color-text-secondary);
+}
+.act-link {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.15rem 0.4rem;
+  margin-right: 0.25rem;
+  color: var(--color-blue);
+  text-decoration: none;
+}
+.act-link:hover {
+  text-decoration: underline;
+}
+.act-delete {
+  color: var(--color-danger);
 }
 th, td {
   padding: 0.5rem 0.75rem;
