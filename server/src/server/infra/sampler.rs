@@ -11,9 +11,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use opentelemetry::trace::{Link, SamplingDecision, SamplingResult, SpanKind, TraceId, TraceState};
+use opentelemetry::trace::{Link, SpanKind, TraceId, TraceState};
 use opentelemetry::{Context, KeyValue};
-use opentelemetry_sdk::trace::ShouldSample;
+use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample};
 
 /// A sampler that allows up to `max_traces_per_sec` root traces per second.
 ///

@@ -50,14 +50,14 @@ axum = { version = "0.8", features = ["multipart"] }
 http-body = "1"
 http-body-util = "0.1"
 blake3 = "1"
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "logs"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace", "logs"], default-features = false }
-opentelemetry-appender-tracing = "0.31"
-tracing-opentelemetry = "0.32"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "logs"], default-features = false }
+opentelemetry-appender-tracing = "0.32"
+tracing-opentelemetry = "0.33"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -75,9 +75,9 @@ tempfile = "3"
 # our HS256 tokens) and avoids a C/aws-lc-rs build dependency.
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
-ldap3 = { version = "0.11", optional = true }
+ldap3 = { version = "0.12", optional = true }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 
 # Used by server repo modules (apt, yum, helm)
 tar = "0.4"
@@ -89,8 +89,12 @@ rmp-serde = "1"
 aes-gcm = "0.10"
 arc-swap = "1"
 moka = { version = "0.12", features = ["sync"] }
+# Held at 1.x: bloomfilter 3.0 is a full API rewrite (sip_keys/bitmap/from_existing
+# removed, set/check now fallible). The blob-GC reaper relies on those internals to
+# build seed-identical shard filters and merge them; a mistranslation would treat
+# live blobs as orphans. Migrate in a dedicated, test-covered PR, not a group bump.
 bloomfilter = "1"
-gethostname = "0.5"
+gethostname = "1.1"
 
 [dev-dependencies]
 depot-bench = { path = "../bench" }
