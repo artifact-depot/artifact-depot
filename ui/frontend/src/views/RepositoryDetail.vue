@@ -318,7 +318,7 @@ onMounted(async () => {
       <button :class="{ active: activeTab === 'manage' }" @click="activeTab = 'manage'">Manage</button>
     </div>
 
-    <artifact-browser v-if="repo && activeTab === 'browse'" :repo-name="repoName" />
+    <artifact-browser v-if="repo && activeTab === 'browse'" :repo-name="repoName" :format="repo.format" />
 
     <div v-if="repo && activeTab === 'manage'" class="manage-section">
       <form class="manage-form" @submit.prevent="save">

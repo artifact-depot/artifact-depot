@@ -11,7 +11,7 @@ import ConfirmDialog from './ConfirmDialog.vue'
 import ResponsiveTable from './ResponsiveTable.vue'
 import { formatSize, formatDate } from '../composables/useFormatters'
 
-const props = defineProps<{ repoName: string }>()
+const props = defineProps<{ repoName: string; format?: string }>()
 
 const route = useRoute()
 const router = useRouter()
@@ -20,6 +20,24 @@ const dirs = ref<DirInfo[]>([])
 const artifacts = ref<Artifact[]>([])
 const loading = ref(false)
 const prefix = computed(() => (route.query.path as string) || '')
+
+// Docker repos browse tags-first: bookkeeping dirs (_manifests/_blobs) are
+// hidden in the default view, and at an image level the _tags/ contents are
+// shown as tag rows. Expert view reveals the raw storage tree instead.
+const isDocker = computed(() => props.format === 'docker')
+const expert = ref(false)
+const BOOKKEEPING = ['_manifests', '_blobs', '_tags']
+// Set when the current prefix is a Docker image (its listing contains _tags/);
+// holds the tag rows fetched from _tags/.
+const atImage = ref(false)
+const dockerTagItems = ref<DisplayItem[]>([])
+const dockerDefault = computed(
+  () => isDocker.value && !expert.value && !isSearchMode.value,
+)
+function toggleExpert() {
+  expert.value = !expert.value
+  load()
+}
 const search = ref('')
 const isSearchMode = ref(false)
 const selectedArtifact = ref<Artifact | null>(null)
@@ -46,6 +64,7 @@ interface DisplayItem {
   updated_at: string
   artifact_count?: number
   total_bytes?: number
+  kind?: 'tag'
 }
 
 const breadcrumbs = computed(() => {
@@ -70,6 +89,24 @@ const displayItems = computed((): DisplayItem[] => {
       content_type: a.content_type,
       updated_at: a.updated_at,
     }))
+  }
+
+  // Docker default view: at an image show its tags; otherwise list child
+  // namespaces/images with bookkeeping dirs hidden.
+  if (dockerDefault.value) {
+    if (atImage.value) return dockerTagItems.value
+    return dirs.value
+      .filter(d => !BOOKKEEPING.includes(d.name))
+      .map(d => ({
+        name: d.name,
+        path: prefix.value + d.name + '/',
+        isDir: true,
+        size: d.total_bytes,
+        content_type: '',
+        updated_at: d.last_modified_at,
+        artifact_count: d.artifact_count,
+        total_bytes: d.total_bytes,
+      }))
   }
 
   const dirItems: DisplayItem[] = dirs.value.map(d => ({
@@ -193,10 +230,31 @@ async function load() {
       artifacts.value = resp.artifacts
       totalArtifacts.value = resp.total ?? resp.artifacts.length
     }
+
+    // Docker default view: if this level is an image (has a _tags/ dir), pull
+    // its tags so they can be shown in place of the bookkeeping dirs.
+    atImage.value = false
+    dockerTagItems.value = []
+    if (dockerDefault.value && dirs.value.some(d => d.name === '_tags')) {
+      atImage.value = true
+      const tagsPrefix = prefix.value + '_tags/'
+      const t = await api.listArtifacts(props.repoName, { prefix: tagsPrefix, limit: 1000 })
+      dockerTagItems.value = t.artifacts.map(a => ({
+        name: a.path,
+        path: tagsPrefix + a.path,
+        isDir: false,
+        size: a.size,
+        content_type: 'docker tag',
+        updated_at: a.updated_at,
+        kind: 'tag' as const,
+      }))
+    }
   } catch {
     dirs.value = []
     artifacts.value = []
     totalArtifacts.value = 0
+    atImage.value = false
+    dockerTagItems.value = []
   } finally {
     loading.value = false
   }
@@ -428,7 +486,16 @@ watch(
       <h3>Artifacts</h3>
       <div class="header-actions">
         <input ref="fileInput" type="file" hidden @change="onFileSelected" />
-        <button class="btn btn-upload" :disabled="uploading" @click="triggerUpload">
+        <button
+          v-if="isDocker"
+          class="btn btn-expert"
+          :class="{ 'btn-expert-on': expert }"
+          :title="expert ? 'Showing raw storage (manifests, blobs)' : 'Show raw storage: manifests, blobs, and delete'"
+          @click="toggleExpert"
+        >
+          Expert: {{ expert ? 'on' : 'off' }}
+        </button>
+        <button v-if="!isDocker" class="btn btn-upload" :disabled="uploading" @click="triggerUpload">
           {{ uploading ? 'Uploading...' : 'Upload' }}
         </button>
         <div class="search-box">
@@ -501,7 +568,10 @@ watch(
             <td>{{ item.isDir ? 'Folder' : item.content_type }}</td>
             <td>{{ formatDate(item.updated_at) }}</td>
             <td>
-              <template v-if="item.isDir">
+              <!-- Docker default view is read-only browsing; manage (download
+                   layers, delete) via Expert / raw storage. -->
+              <template v-if="dockerDefault" />
+              <template v-else-if="item.isDir">
                 <button class="action-btn" @click="confirmDirDownload(item, $event)" title="Download directory">&#11015;</button>
                 <button class="action-btn action-delete" @click="confirmDirDelete(item, $event)" title="Delete directory">&#10005;</button>
               </template>
@@ -705,6 +775,15 @@ watch(
 .btn-upload:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+.btn-expert {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-secondary);
+}
+.btn-expert-on {
+  background: var(--color-primary);
+  color: var(--color-primary-text);
+  border-color: var(--color-primary);
 }
 .upload-error {
   color: var(--color-danger);
