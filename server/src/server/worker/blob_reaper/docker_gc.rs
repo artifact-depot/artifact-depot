@@ -7,6 +7,7 @@
 // ---------------------------------------------------------------------------
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bloomfilter::Bloom;
@@ -196,31 +197,55 @@ pub(super) async fn docker_gc(
     // --- Phase B: Delete unreferenced manifests (if policy enabled) ---
 
     if repo.format_config.cleanup_untagged_manifests() {
-        // Collect digests referenced by manifest lists (multi-arch) before
-        // sizing the bloom filter — both these and the tag digests are
-        // inserted, so the filter must be dimensioned for their combined
-        // count to keep the false-positive rate near the nominal 1%.
-        // Sizing for tag_digests alone over-fills the filter and inflates
-        // the FP rate, leaving untagged manifests wrongly protected.
-        let mut manifest_list_child_digests = Vec::new();
-        for (_, _, ref record) in &manifests {
+        // A manifest is live iff it is reachable from a tag. Tags point at a
+        // manifest digest; a manifest list/index points at child manifest
+        // digests. Build the reachable closure starting from the tag digests
+        // and follow children **only through manifests that are themselves
+        // reachable** — so an untagged orphan index does NOT protect its
+        // children. Both the orphan index and its now-unreferenced children are
+        // reclaimed in the SAME pass (no second pass required for multi-arch).
+        //
+        // Exact sets, not a bloom filter: manifest counts per repo are modest
+        // (thousands, vs. millions of layer blobs in Phase A), so an exact
+        // membership test is cheap and — unlike a bloom — has zero false
+        // positives, so no untagged manifest is ever wrongly protected.
+        let digest_of = |sk: &str| -> Option<String> {
+            if let Some((_, d)) = sk.rsplit_once("/_manifests/") {
+                // Namespaced: "img/_manifests/sha256:abc" → "sha256:abc"
+                Some(d.to_string())
+            } else {
+                sk.strip_prefix("_manifests/").map(|d| d.to_string())
+            }
+        };
+
+        // Map each present list/index manifest's own digest → its child digests.
+        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        for (sk, _shard, record) in &manifests {
             let ct = &record.content_type;
             if ct.contains("manifest.list") || ct.contains("image.index") {
-                if let Some(json) = read_manifest_json(&blobs, record).await {
-                    for digest in extract_manifest_refs(&json) {
-                        manifest_list_child_digests.push(digest);
-                    }
+                if let (Some(digest), Some(json)) =
+                    (digest_of(sk), read_manifest_json(&blobs, record).await)
+                {
+                    children_of.insert(digest, extract_manifest_refs(&json));
                 }
             }
         }
 
-        let bf_capacity = (tag_digests.len() + manifest_list_child_digests.len()).max(1);
-        let mut tag_bf = Bloom::new_for_fp_rate(bf_capacity, 0.01);
-        for digest in &tag_digests {
-            tag_bf.set(digest.as_bytes());
-        }
-        for digest in &manifest_list_child_digests {
-            tag_bf.set(digest.as_bytes());
+        // BFS the reachable set from the tags, descending through reachable
+        // lists only (handles nested indexes; orphan indexes are never entered).
+        let mut reachable: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = tag_digests.clone();
+        while let Some(d) = queue.pop() {
+            if !reachable.insert(d.clone()) {
+                continue;
+            }
+            if let Some(children) = children_of.get(&d) {
+                for c in children {
+                    if !reachable.contains(c) {
+                        queue.push(c.clone());
+                    }
+                }
+            }
         }
 
         let mut manifest_del_sks: Vec<&str> = Vec::new();
@@ -231,16 +256,12 @@ pub(super) async fn docker_gc(
                 continue;
             }
 
-            let digest = if let Some((_, d)) = sk.rsplit_once("/_manifests/") {
-                // Namespaced: "img/_manifests/sha256:abc" → "sha256:abc"
-                d
-            } else if let Some(d) = sk.strip_prefix("_manifests/") {
-                d
-            } else {
-                continue;
+            let digest = match digest_of(sk) {
+                Some(d) => d,
+                None => continue,
             };
 
-            if !tag_bf.check(digest.as_bytes()) {
+            if !reachable.contains(&digest) {
                 manifest_del_sks.push(sk);
                 manifest_del_sizes.push(record.size);
             }
