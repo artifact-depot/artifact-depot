@@ -538,6 +538,35 @@ export const api = {
     return handleResponse(resp)
   },
 
+  /** Fetch a Docker manifest by tag or digest, for the tag detail panel.
+   *  Uses the repo-scoped /v2 endpoint with the SPA's Bearer token (accepted
+   *  like any docker client). `image` is a path (keep its slashes). Returns the
+   *  parsed manifest plus the resolved manifest digest from the response. */
+  async getDockerManifest(
+    repo: string,
+    image: string,
+    reference: string,
+  ): Promise<{ data: any; digest: string }> {
+    const resp = await fetch(
+      `/repository/${encodeURIComponent(repo)}/v2/${image}/manifests/${encodeURIComponent(reference)}`,
+      {
+        headers: {
+          ...authHeaders(),
+          Accept: [
+            'application/vnd.docker.distribution.manifest.v2+json',
+            'application/vnd.docker.distribution.manifest.list.v2+json',
+            'application/vnd.oci.image.manifest.v1+json',
+            'application/vnd.oci.image.index.v1+json',
+          ].join(', '),
+        },
+      },
+    )
+    if (!resp.ok) throw new Error(`manifest fetch failed (${resp.status})`)
+    const digest = resp.headers.get('Docker-Content-Digest') || ''
+    const data = await resp.json()
+    return { data, digest }
+  },
+
   async deleteArtifact(repo: string, path: string): Promise<void> {
     const resp = await fetch(`/repository/${encodeURIComponent(repo)}/${path}`, {
       method: 'DELETE',

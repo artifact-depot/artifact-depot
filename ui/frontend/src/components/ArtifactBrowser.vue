@@ -64,6 +64,60 @@ async function copyPull(item: DisplayItem, e: Event) {
     /* clipboard unavailable (insecure context) */
   }
 }
+
+// --- Docker tag detail (manifest) ---
+// Fetched on drill-in via the /v2 endpoint (one request); layer/platform sizes
+// come straight from the manifest JSON, so there are no extra blob reads.
+const showManifestModal = ref(false)
+const manifestLoading = ref(false)
+const manifestError = ref('')
+const manifestTag = ref('')
+const manifestDigest = ref('')
+const manifestMediaType = ref('')
+const manifestIsList = ref(false)
+const manifestPlatforms = ref<{ platform: string; digest: string; size: number }[]>([])
+const manifestConfig = ref<{ digest: string; size: number } | null>(null)
+const manifestLayers = ref<{ digest: string; size: number }[]>([])
+const manifestTotal = ref(0)
+
+async function openTagDetail(item: DisplayItem) {
+  const image = prefix.value.replace(/\/+$/, '')
+  manifestTag.value = item.name
+  manifestError.value = ''
+  manifestDigest.value = ''
+  manifestMediaType.value = ''
+  manifestIsList.value = false
+  manifestPlatforms.value = []
+  manifestConfig.value = null
+  manifestLayers.value = []
+  manifestTotal.value = 0
+  showManifestModal.value = true
+  manifestLoading.value = true
+  try {
+    const { data, digest } = await api.getDockerManifest(props.repoName, image, item.name)
+    manifestDigest.value = digest
+    manifestMediaType.value = data.mediaType || ''
+    if (Array.isArray(data.manifests)) {
+      manifestIsList.value = true
+      manifestPlatforms.value = data.manifests.map((m: any) => ({
+        platform: m.platform
+          ? `${m.platform.os}/${m.platform.architecture}${m.platform.variant ? '/' + m.platform.variant : ''}`
+          : '(unknown)',
+        digest: m.digest,
+        size: m.size || 0,
+      }))
+    } else {
+      manifestConfig.value = data.config ? { digest: data.config.digest, size: data.config.size || 0 } : null
+      manifestLayers.value = (data.layers || []).map((l: any) => ({ digest: l.digest, size: l.size || 0 }))
+      manifestTotal.value = (manifestConfig.value?.size || 0) +
+        manifestLayers.value.reduce((s, l) => s + l.size, 0)
+    }
+  } catch (e: any) {
+    manifestError.value = e.message || 'Failed to load manifest'
+  } finally {
+    manifestLoading.value = false
+  }
+}
 const search = ref('')
 const isSearchMode = ref(false)
 const selectedArtifact = ref<Artifact | null>(null)
@@ -163,6 +217,10 @@ function downloadUrl(path: string): string {
 }
 
 function onRowClick(item: DisplayItem) {
+  if (item.kind === 'tag') {
+    openTagDetail(item)
+    return
+  }
   if (item.isDir) {
     navigateTo(item.path)
   } else {
@@ -681,6 +739,56 @@ watch(
       </template>
     </BaseModal>
 
+    <!-- Docker tag detail (manifest) -->
+    <BaseModal v-if="showManifestModal" max-width="640px" :show-close="true" @close="showManifestModal = false">
+      <h3 class="mono">{{ manifestTag }}</h3>
+      <p v-if="manifestLoading"><span class="loading-spinner"></span> Loading manifest...</p>
+      <p v-else-if="manifestError" class="error-text">{{ manifestError }}</p>
+      <template v-else>
+        <dl class="detail-list">
+          <dt>Digest</dt>
+          <dd class="mono">{{ manifestDigest || 'N/A' }}</dd>
+          <dt>Type</dt>
+          <dd>{{ manifestIsList ? 'Manifest list (multi-arch)' : 'Image manifest' }}</dd>
+          <dt v-if="!manifestIsList">Total size</dt>
+          <dd v-if="!manifestIsList">{{ formatSize(manifestTotal) }}</dd>
+          <dt v-if="manifestMediaType">Media type</dt>
+          <dd v-if="manifestMediaType" class="mono">{{ manifestMediaType }}</dd>
+        </dl>
+
+        <!-- Multi-arch: per-platform child manifests -->
+        <template v-if="manifestIsList">
+          <h4 class="manifest-section">Platforms ({{ manifestPlatforms.length }})</h4>
+          <table class="manifest-table">
+            <tbody>
+              <tr v-for="p in manifestPlatforms" :key="p.digest">
+                <td class="plat">{{ p.platform }}</td>
+                <td class="mono digest-cell">{{ p.digest }}</td>
+                <td class="size-cell">{{ formatSize(p.size) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </template>
+
+        <!-- Single image: config + layers -->
+        <template v-else>
+          <h4 class="manifest-section">Config + {{ manifestLayers.length }} layer(s)</h4>
+          <table class="manifest-table">
+            <tbody>
+              <tr v-if="manifestConfig">
+                <td class="mono digest-cell">{{ manifestConfig.digest }}</td>
+                <td class="size-cell">config</td>
+              </tr>
+              <tr v-for="(l, i) in manifestLayers" :key="i">
+                <td class="mono digest-cell">{{ l.digest }}</td>
+                <td class="size-cell">{{ formatSize(l.size) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </template>
+      </template>
+    </BaseModal>
+
     <!-- Delete dialog -->
     <ConfirmDialog
       v-if="showDeleteDialog"
@@ -949,6 +1057,36 @@ th {
 .detail-list .mono {
   font-family: monospace;
   font-size: 0.85rem;
+}
+.manifest-section {
+  margin: 1rem 0 0.4rem;
+  font-size: 0.85rem;
+  color: var(--color-text-secondary);
+}
+.manifest-table {
+  width: 100%;
+  table-layout: auto;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+.manifest-table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+.manifest-table .plat {
+  font-weight: 600;
+}
+.manifest-table .digest-cell {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 0;
+}
+.manifest-table .size-cell {
+  text-align: right;
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
 }
 .pagination-bar {
   display: flex;
