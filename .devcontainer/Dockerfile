@@ -20,9 +20,8 @@ RUN apt-get -y update && \
     apt-get -y --no-install-recommends install unminimize && \
     echo y | unminimize && \
     apt-get -y --no-install-recommends install \
-      openssh-client git npm curl wget vim make build-essential \
+      openssh-client git curl wget vim make build-essential \
       iproute2 python3 pipx default-jre-headless mold gh \
-      file \
       docker.io containerd nginx-light openssl \
       libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
       libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
@@ -33,18 +32,31 @@ RUN apt-get -y update && \
       fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf && \
     rm -rf /var/lib/apt/lists/*
 
-# CLI tooling, Rust toolchain, cargo workspace linters, reuse 3.x+
+# Node.js (matches the release image's node:24.14.0). Ubuntu 24.04's apt
+# `npm` pulls Node 18, which is EOL and too old for the frontend toolchain
+# (Vite 8 requires Node ^20.19 || >=22.12, and crashes on 18 with
+# "CustomEvent is not defined"). Install the official tarball directly, the
+# same way Helm/dynamodb-local are fetched below, rather than via apt.
+ENV NODE_VERSION=v24.14.0
+RUN case "$(uname -m)" in \
+        x86_64)  NODE_ARCH=x64 ;; \
+        aarch64) NODE_ARCH=arm64 ;; \
+        *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz" -o /tmp/node.tar.gz && \
+    tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 && \
+    rm -f /tmp/node.tar.gz && \
+    node --version && npm --version
+
+# CLI tooling, Rust toolchain, cargo workspace linters, reuse 3.x
 # (Ubuntu 24.04 ships reuse 2.1 via apt, which predates .gitignore support).
-# reuse needs an encoding detector at runtime; the `file` apt package above
-# provides the libmagic backend (without it, reuse >=6 aborts every lint with
-# NoEncodingModuleError).
 RUN npm install -g @openai/codex && \
     curl -fsSL https://claude.ai/install.sh | bash && \
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> /root/.bashrc && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.1 && \
     ln -s /root/.cargo/bin/* /usr/local/bin/ && \
     cargo install cargo-deny cargo-about && \
-    PIPX_BIN_DIR=/usr/local/bin pipx install reuse
+    PIPX_BIN_DIR=/usr/local/bin pipx install 'reuse[charset-normalizer]'
 
 # DynamoDB Local (for integration testing)
 ENV DYNAMODB_LOCAL_DIR=/usr/local/lib/dynamodb-local

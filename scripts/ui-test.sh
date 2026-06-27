@@ -138,7 +138,16 @@ echo "Ensuring Playwright browsers are installed..."
 # --- Run Playwright tests inside namespace ---
 echo "Running Playwright tests..."
 cd "$FRONTEND_DIR"
+# Run only the functional projects by default. The `screenshots` and
+# `observability` projects are doc-image generators driven on demand by
+# scripts/screenshots.sh (they self-skip without their *_OUT env vars), so
+# without this filter every run reports them as skipped. A caller that
+# passes its own --project (e.g. to run one project) overrides this default.
+PROJECT_ARGS=()
+if ! printf '%s\n' "${EXTRA_ARGS[@]}" | grep -q -- '--project'; then
+  PROJECT_ARGS=(--project=parallel --project=serial)
+fi
 ip netns exec "$NETNS" env \
   DEPOT_TEST_URL="${BASE_URL}" \
   DEPOT_UI_SKIP_SETUP=1 \
-  npx playwright test "${EXTRA_ARGS[@]}"
+  npx playwright test "${PROJECT_ARGS[@]}" "${EXTRA_ARGS[@]}"
