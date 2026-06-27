@@ -31,7 +31,7 @@ ruzstd = "0.8"
 # directly to pgp, so it must match pgp's rand version. (server/ and bench/ are
 # on rand 0.9.) Dependabot's group bump moves this to 0.9 — keep it at 0.8 until
 # pgp itself moves to rand 0.9.
-pgp = "0.19"
+pgp = "0.20"
 rand = "0.8"
 smallvec = "1"
 anyhow = "1"
