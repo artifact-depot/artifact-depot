@@ -6,6 +6,7 @@
 import { ref, computed, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, type Artifact, type DirInfo, type TaskInfo } from '../api'
+import { useSettingsStore } from '../stores/settingsStore'
 import BaseModal from './BaseModal.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import ResponsiveTable from './ResponsiveTable.vue'
@@ -37,6 +38,28 @@ const dockerDefault = computed(
 function toggleExpert() {
   expert.value = !expert.value
   load()
+}
+
+// `docker pull` is available through the default docker group (host-root
+// routing), so a tag's pull command is just <host>/<image>:<tag> — no per-repo
+// port. Only offer it when a default group is configured (else it wouldn't
+// resolve).
+const settingsStore = useSettingsStore()
+const hasDefaultDockerGroup = computed(() => !!settingsStore.settings?.default_docker_repo)
+const copiedTag = ref('')
+function pullCommand(tag: string): string {
+  const image = prefix.value.replace(/\/+$/, '')
+  return `docker pull ${window.location.host}/${image}:${tag}`
+}
+async function copyPull(item: DisplayItem, e: Event) {
+  e.stopPropagation()
+  try {
+    await navigator.clipboard.writeText(pullCommand(item.name))
+    copiedTag.value = item.name
+    setTimeout(() => { if (copiedTag.value === item.name) copiedTag.value = '' }, 1500)
+  } catch {
+    /* clipboard unavailable (insecure context) */
+  }
 }
 const search = ref('')
 const isSearchMode = ref(false)
@@ -568,9 +591,17 @@ watch(
             <td>{{ item.isDir ? 'Folder' : item.content_type }}</td>
             <td>{{ formatDate(item.updated_at) }}</td>
             <td>
-              <!-- Docker default view is read-only browsing; manage (download
-                   layers, delete) via Expert / raw storage. -->
-              <template v-if="dockerDefault" />
+              <!-- Docker default view: a tag offers its `docker pull` command;
+                   managing (raw layers, delete) is done via Expert. -->
+              <template v-if="dockerDefault && item.kind === 'tag'">
+                <button
+                  v-if="hasDefaultDockerGroup"
+                  class="action-btn pull-btn"
+                  :title="pullCommand(item.name)"
+                  @click="copyPull(item, $event)"
+                >{{ copiedTag === item.name ? 'Copied ✓' : 'Copy pull' }}</button>
+              </template>
+              <template v-else-if="dockerDefault" />
               <template v-else-if="item.isDir">
                 <button class="action-btn" @click="confirmDirDownload(item, $event)" title="Download directory">&#11015;</button>
                 <button class="action-btn action-delete" @click="confirmDirDelete(item, $event)" title="Delete directory">&#10005;</button>
@@ -870,6 +901,17 @@ th {
 }
 .action-delete:hover {
   color: var(--color-danger);
+}
+.pull-btn {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.pull-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
 }
 .btn-download {
   background: var(--color-primary);
