@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, type Repo, type UpdateRepoRequest } from '../api'
+import { api, isAdmin, type Repo, type UpdateRepoRequest } from '../api'
 import ArtifactBrowser from '../components/ArtifactBrowser.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import PageHeader from '../components/PageHeader.vue'
@@ -17,6 +17,9 @@ const repoName = route.params.name as string
 const repo = ref<Repo | null>(null)
 const error = ref('')
 const activeTab = ref<'browse' | 'manage'>('browse')
+// Managing a repo (edit settings, delete) is admin-only; non-admins never see
+// the tab. Backend still enforces the mutations regardless.
+const canManage = computed(() => isAdmin())
 
 // Manage tab state
 const saving = ref(false)
@@ -265,8 +268,10 @@ onMounted(async () => {
   <section>
     <PageHeader :title="repoName">
       <template #badges>
-        <span v-if="repo" class="badge" :class="typeClass(repo.repo_type)">{{ repo.repo_type }}</span>
-        <span v-if="repo" class="badge badge-outlined">{{ repo.format }}</span>
+        <span v-if="repo" class="repo-badges">
+          <span class="badge" :class="typeClass(repo.repo_type)">{{ repo.repo_type }}</span>
+          <span class="badge badge-outlined">{{ repo.format }}</span>
+        </span>
       </template>
     </PageHeader>
 
@@ -315,12 +320,12 @@ onMounted(async () => {
 
     <div v-if="repo" class="tab-bar">
       <button :class="{ active: activeTab === 'browse' }" @click="activeTab = 'browse'">Browse</button>
-      <button :class="{ active: activeTab === 'manage' }" @click="activeTab = 'manage'">Manage</button>
+      <button v-if="canManage" :class="{ active: activeTab === 'manage' }" @click="activeTab = 'manage'">Manage</button>
     </div>
 
     <artifact-browser v-if="repo && activeTab === 'browse'" :repo-name="repoName" :format="repo.format" />
 
-    <div v-if="repo && activeTab === 'manage'" class="manage-section">
+    <div v-if="repo && activeTab === 'manage' && canManage" class="manage-section">
       <form class="manage-form" @submit.prevent="save">
         <h3>Settings</h3>
 
@@ -557,6 +562,21 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* Repo detail card spans the full content width (overrides the global 700px
+   cap) so it lines up with the artifact table below; the field grid fills it. */
+.detail-card {
+  max-width: none;
+}
+.detail-table {
+  width: 100%;
+}
+/* Keep the type + format badges adjacent instead of letting the header's
+   space-between push them apart. */
+.repo-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
 /* Manage form */
 .manage-section {
   max-width: 640px;
