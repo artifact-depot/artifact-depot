@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { ref, computed, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, type Artifact, type DirInfo, type TaskInfo } from '../api'
+import { api, isAdmin, type Artifact, type DirInfo, type TaskInfo } from '../api'
 import { useSettingsStore } from '../stores/settingsStore'
 import BaseModal from './BaseModal.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
@@ -26,6 +26,9 @@ const prefix = computed(() => (route.query.path as string) || '')
 // hidden in the default view, and at an image level the _tags/ contents are
 // shown as tag rows. Expert view reveals the raw storage tree instead.
 const isDocker = computed(() => props.format === 'docker')
+// Expert view (raw storage + delete) is admin-only; gate the toggle on the
+// roles embedded in the JWT. Non-admins only ever see the default browse.
+const canExpert = computed(() => isDocker.value && isAdmin())
 const expert = ref(false)
 const BOOKKEEPING = ['_manifests', '_blobs', '_tags']
 // Set when the current prefix is a Docker image (its listing contains _tags/);
@@ -510,7 +513,7 @@ watch(
       <div class="header-actions">
         <input ref="fileInput" type="file" hidden @change="onFileSelected" />
         <button
-          v-if="isDocker"
+          v-if="canExpert"
           class="btn btn-expert"
           :class="{ 'btn-expert-on': expert }"
           :title="expert ? 'Showing raw storage (manifests, blobs)' : 'Show raw storage: manifests, blobs, and delete'"

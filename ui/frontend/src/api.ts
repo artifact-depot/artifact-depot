@@ -403,6 +403,26 @@ export function clearToken() {
   tokenRef.value = null
 }
 
+/** Role names embedded in the current JWT (added to the token at login so the
+ *  UI can gate admin-only affordances without a lookup). Reads `tokenRef`, so
+ *  it stays reactive inside computeds. Authorization is always re-checked
+ *  server-side; this only controls what the UI offers. */
+export function currentRoles(): string[] {
+  const t = tokenRef.value
+  if (!t) return []
+  try {
+    const payload = t.split('.')[1]
+    const json = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')))
+    return Array.isArray(json.roles) ? json.roles : []
+  } catch {
+    return []
+  }
+}
+
+export function isAdmin(): boolean {
+  return currentRoles().includes('admin')
+}
+
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { 'X-Requested-With': 'XMLHttpRequest' }
   const token = getToken()

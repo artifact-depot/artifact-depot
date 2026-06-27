@@ -286,7 +286,7 @@ impl TestApp {
     pub fn admin_token(&self) -> String {
         let gs: &[u8; 32] = self.jwt_secret.as_slice().try_into().unwrap();
         let key = auth::derive_signing_key(gs, &self.admin_token_secret);
-        auth::create_token("admin", &key, 86400).unwrap()
+        auth::create_token("admin", &key, 86400, vec!["admin".to_string()]).unwrap()
     }
 
     pub async fn token_for(&self, username: &str) -> String {
@@ -296,7 +296,7 @@ impl TestApp {
             .unwrap();
         let gs: &[u8; 32] = self.jwt_secret.as_slice().try_into().unwrap();
         let key = auth::derive_signing_key(gs, &user.token_secret);
-        auth::create_token(username, &key, 86400).unwrap()
+        auth::create_token(username, &key, 86400, user.roles.clone()).unwrap()
     }
 
     pub fn request(&self, method: Method, path: &str) -> Request<Body> {
