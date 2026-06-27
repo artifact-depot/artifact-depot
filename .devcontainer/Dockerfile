@@ -22,6 +22,7 @@ RUN apt-get -y update && \
     apt-get -y --no-install-recommends install \
       openssh-client git npm curl wget vim make build-essential \
       iproute2 python3 pipx default-jre-headless mold gh \
+      file \
       docker.io containerd nginx-light openssl \
       libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
       libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
@@ -32,8 +33,11 @@ RUN apt-get -y update && \
       fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf && \
     rm -rf /var/lib/apt/lists/*
 
-# CLI tooling, Rust toolchain, cargo workspace linters, reuse 3.x
+# CLI tooling, Rust toolchain, cargo workspace linters, reuse 3.x+
 # (Ubuntu 24.04 ships reuse 2.1 via apt, which predates .gitignore support).
+# reuse needs an encoding detector at runtime; the `file` apt package above
+# provides the libmagic backend (without it, reuse >=6 aborts every lint with
+# NoEncodingModuleError).
 RUN npm install -g @openai/codex && \
     curl -fsSL https://claude.ai/install.sh | bash && \
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> /root/.bashrc && \

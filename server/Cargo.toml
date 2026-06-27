@@ -89,7 +89,11 @@ rmp-serde = "1"
 aes-gcm = "0.10"
 arc-swap = "1"
 moka = { version = "0.12", features = ["sync"] }
-bloomfilter = "3"
+# Held at 1.x: bloomfilter 3.0 is a full API rewrite (sip_keys/bitmap/from_existing
+# removed, set/check now fallible). The blob-GC reaper relies on those internals to
+# build seed-identical shard filters and merge them; a mistranslation would treat
+# live blobs as orphans. Migrate in a dedicated, test-covered PR, not a group bump.
+bloomfilter = "1"
 gethostname = "1.1"
 
 [dev-dependencies]
@@ -97,7 +101,7 @@ depot-bench = { path = "../bench" }
 depot-test-support = { path = "../test-support" }
 # Enable test-support feature on depot-core for FailingKvStore / FailingBlobStore.
 depot-core = { path = "../core", features = ["test-support"] }
-rand_chacha = "0.10"
+rand_chacha = "0.9"
 wiremock = "0.6"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }

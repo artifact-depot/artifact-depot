@@ -105,15 +105,15 @@ pub fn parse_rpm(
         Ok(entries) => entries
             .iter()
             .map(|e| {
-                let file_type = if e.mode.file_type() == rpm::FileType::Dir {
+                let file_type = if e.file_type() == rpm::FileType::Dir {
                     "dir"
-                } else if e.flags.contains(rpm::FileFlags::GHOST) {
+                } else if e.flags().contains(rpm::FileFlags::GHOST) {
                     "ghost"
                 } else {
                     "file"
                 };
                 RpmFileEntry {
-                    path: e.path.to_string_lossy().to_string(),
+                    path: e.path().to_string_lossy().to_string(),
                     file_type: file_type.to_string(),
                 }
             })

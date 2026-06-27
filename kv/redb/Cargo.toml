@@ -13,7 +13,13 @@ depot-core = { path = "../../core" }
 async-trait = "0.1"
 blake3 = "1"
 futures = "0.3"
-redb = "4"
+# Held at 2.x: redb 3.0+ removed support for the v2 on-disk file format and
+# reads only v3. depot opens existing databases with Database::create() and
+# never calls Database::upgrade(), so every deployed single-node store is v2.
+# Moving to redb 4 would make depot fail to open the DB on restart until an
+# operator runs a one-time v2->v3 upgrade from a redb-2.6 build. Do that
+# migration in a dedicated PR with an operator runbook, not a group bump.
+redb = "2"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing = "0.1"
 

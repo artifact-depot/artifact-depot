@@ -23,3 +23,33 @@ updates:
       cargo:
         patterns:
           - "*"
+    # These three are deliberately held below their latest major/minor because
+    # the jump is a breaking API change coupled to something we can't move yet.
+    # Dependabot rewrites the version *requirement* itself, so a Cargo.toml pin
+    # is not enough — without these rules it re-proposes the bump every week.
+    # Patch updates (the third semver component) are still allowed for security
+    # fixes. Drop the relevant entry once its blocker is resolved.
+    ignore:
+      # rand stays split: 0.8 in format/apt (pgp 0.19 needs rand_core 0.6),
+      # 0.9 in server/bench. Block minor/major so both lines only get patches.
+      - dependency-name: "rand"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # rand_chacha 0.10 pulls rand_core 0.10, which is incompatible with
+      # rand 0.9 (rand_core 0.9). Keep it on 0.9 until rand itself moves.
+      - dependency-name: "rand_chacha"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # bloomfilter 3.x is a full API rewrite; the blob-GC reaper depends on
+      # 1.x internals. Unblock when the dedicated migration PR lands.
+      - dependency-name: "bloomfilter"
+        update-types:
+          - "version-update:semver-major"
+      # redb 3.0+ reads only the v3 on-disk format; deployed stores are v2 and
+      # depot never runs Database::upgrade(). Bumping breaks startup on existing
+      # single-node installs. Needs a dedicated PR with a v2->v3 operator runbook.
+      - dependency-name: "redb"
+        update-types:
+          - "version-update:semver-major"

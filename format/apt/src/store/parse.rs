@@ -88,7 +88,7 @@ fn decompress_control_tar(name: &str, data: &[u8]) -> error::Result<Vec<u8>> {
             .map_err(|e| error::DepotError::Internal(format!("xz decompress failed: {e}")))?;
         Ok(out)
     } else if name.ends_with(".zst") {
-        let mut decoder = ruzstd::StreamingDecoder::new(data)
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(data)
             .map_err(|e| error::DepotError::Internal(format!("zstd decompress failed: {e}")))?;
         let mut out = Vec::new();
         decoder.read_to_end(&mut out)?;
