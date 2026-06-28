@@ -1281,6 +1281,7 @@ max_artifact_bytes = 12345
             upstream_auth: None,
             content_disposition: None,
             repodata_depth: None,
+            signing_key: None,
         }
     }
 

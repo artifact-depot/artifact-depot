@@ -31,7 +31,7 @@ pub fn metadata_entry(path: String, sha256: String, size: u64) -> ReleaseFileEnt
     ReleaseFileEntry::new(path, sha256, size)
 }
 pub use parse::{parse_deb, pool_path, pool_prefix, DebControl};
-pub use signing::{generate_gpg_keypair, sign_release_pub};
+pub use signing::{generate_gpg_keypair, public_key_from_secret, sign_release_pub};
 pub use store::AptStore;
 pub use synthetic::build_synthetic_deb;
 

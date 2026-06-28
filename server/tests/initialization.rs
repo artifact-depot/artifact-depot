@@ -55,6 +55,7 @@ async fn test_init_visible_through_rest_api() {
             upstream_auth: None,
             content_disposition: None,
             repodata_depth: None,
+            signing_key: None,
         }],
         users: vec![CreateUserRequest {
             username: "ci".into(),

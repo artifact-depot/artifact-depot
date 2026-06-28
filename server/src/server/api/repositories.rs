@@ -43,6 +43,10 @@ pub struct CreateRepoRequest {
     pub upstream_auth: Option<UpstreamAuth>,
     pub content_disposition: Option<ContentDisposition>,
     pub repodata_depth: Option<u32>,
+    /// APT only: armored PGP secret key to use for repository signing. When
+    /// omitted, hosted apt repos auto-generate a fresh signing key on creation.
+    #[serde(default)]
+    pub signing_key: Option<String>,
 }
 
 impl CreateRepoRequest {
@@ -280,6 +284,20 @@ pub async fn create_repo(
         Err(e) => return e.into_response(),
     };
 
+    let is_apt = format_config.artifact_format() == ArtifactFormat::Apt;
+    // Validate an explicitly-supplied signing key before persisting anything, so
+    // a malformed key fails the request cleanly rather than leaving an unsigned
+    // repo behind.
+    if let Some(ref key) = req.signing_key {
+        if !is_apt {
+            return DepotError::BadRequest("signing_key is only valid for apt repositories".into())
+                .into_response();
+        }
+        if let Err(e) = depot_format_apt::store::public_key_from_secret(key) {
+            return e.into_response();
+        }
+    }
+
     // For Yum proxy repos, validate that all members have the same repodata_depth.
     if format_config.artifact_format() == ArtifactFormat::Yum {
         if let RepoKind::Proxy { ref members, .. } = kind {
@@ -325,6 +343,26 @@ pub async fn create_repo(
     }
     match service::put_repo(state.repo.kv.as_ref(), &config).await {
         Ok(()) => {
+            // Provision the apt signing key: import the supplied key, or
+            // auto-generate one for hosted repos. Best-effort — the repo is
+            // already created, and a missing key can be added later via the
+            // signing-key API, so a failure is logged rather than fatal.
+            if is_apt {
+                let fs = state.format_state();
+                let result = match req.signing_key.as_deref() {
+                    Some(key) => depot_format_apt::api::import_repo_signing_key(&fs, &config, key)
+                        .await
+                        .map(Some),
+                    None => depot_format_apt::api::ensure_repo_signing_key(&fs, &config).await,
+                };
+                if let Err(e) = result {
+                    tracing::warn!(
+                        repo = %config.name,
+                        error = %e,
+                        "failed to provision apt signing key on repo creation"
+                    );
+                }
+            }
             let resp = RepoResponse::from(config);
             state.bg.event_bus.publish(
                 crate::server::infra::event_bus::Topic::Repos,
@@ -334,6 +372,114 @@ pub async fn create_repo(
         }
         Err(e) => e.into_response(),
     }
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ImportSigningKeyRequest {
+    /// Armored PGP secret (private) key to use for repository signing.
+    pub signing_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SigningKeyResponse {
+    /// Armored PGP public key that clients install (via `signed-by`) to verify
+    /// the repository's `InRelease` / `Release.gpg` signatures.
+    pub public_key: String,
+}
+
+/// Generate a fresh signing key for an apt repository, replacing any existing
+/// one and re-signing already-published metadata.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repositories/{name}/signing-key",
+    params(("name" = String, Path, description = "Repository name")),
+    responses(
+        (status = 200, description = "New signing key generated", body = SigningKeyResponse),
+        (status = 400, description = "Not an apt repository"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "Repository not found"),
+    ),
+    tag = "repositories"
+)]
+pub async fn rotate_signing_key(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = state.auth.backend.require_admin(&user.0).await {
+        return e.into_response();
+    }
+    let config = match load_apt_repo(&state, &name).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let fs = state.format_state();
+    match depot_format_apt::api::rotate_repo_signing_key(&fs, &config).await {
+        Ok(public_key) => (StatusCode::OK, Json(SigningKeyResponse { public_key })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Import an externally-supplied signing key for an apt repository, replacing any
+/// existing one and re-signing already-published metadata.
+#[utoipa::path(
+    put,
+    path = "/api/v1/repositories/{name}/signing-key",
+    params(("name" = String, Path, description = "Repository name")),
+    request_body = ImportSigningKeyRequest,
+    responses(
+        (status = 200, description = "Signing key imported", body = SigningKeyResponse),
+        (status = 400, description = "Not an apt repository, or invalid key"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "Repository not found"),
+    ),
+    tag = "repositories"
+)]
+pub async fn import_signing_key(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(name): Path<String>,
+    Json(req): Json<ImportSigningKeyRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = state.auth.backend.require_admin(&user.0).await {
+        return e.into_response();
+    }
+    if req.signing_key.trim().is_empty() {
+        return DepotError::BadRequest("signing_key is required".into()).into_response();
+    }
+    let config = match load_apt_repo(&state, &name).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let fs = state.format_state();
+    match depot_format_apt::api::import_repo_signing_key(&fs, &config, &req.signing_key).await {
+        Ok(public_key) => (StatusCode::OK, Json(SigningKeyResponse { public_key })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Load a repository, returning a ready-to-send error response if it does not
+/// exist or is not an apt repository (signing keys are apt-only).
+async fn load_apt_repo(
+    state: &AppState,
+    name: &str,
+) -> Result<RepoConfig, axum::response::Response> {
+    let config = match service::get_repo(state.repo.kv.as_ref(), name).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return Err(
+                DepotError::NotFound(format!("repository '{name}' not found")).into_response(),
+            )
+        }
+        Err(e) => return Err(e.into_response()),
+    };
+    if config.format() != ArtifactFormat::Apt {
+        return Err(DepotError::BadRequest(
+            "signing keys are only supported for apt repositories".into(),
+        )
+        .into_response());
+    }
+    Ok(config)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

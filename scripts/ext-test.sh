@@ -18,10 +18,11 @@ source "$SCRIPT_DIR/net-helpers.sh"
 
 case "${1:-}" in
   apt)
-    # Verify Docker is available
+    # Skip gracefully when Docker is unavailable (matches docker-auth), so the
+    # suite stays green on machines without Docker.
     if ! command -v docker &>/dev/null; then
-      echo "ERROR: docker is not available. Install docker.io or ensure Docker is in PATH."
-      exit 1
+      echo "Skipping APT integration tests (docker not available)"
+      exit 0
     fi
 
     PORT=18080
@@ -38,14 +39,21 @@ case "${1:-}" in
     }
     trap cleanup EXIT
 
-    # Build depot
+    ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+    # Build the binaries up front so compilation never races the readiness
+    # loop below. (cargo run would recompile inside the timed window — feature
+    # unification differs from `cargo build -p depot-server` — and the server
+    # would miss its 30s deadline before it ever started.)
     echo "=== Building depot ==="
-    cargo build -p depot-server
+    cargo build --bin depot --bin depot-bench
 
     # Write temp config
     cat > "$TMP_DIR/depot.toml" <<TOML
-listen = "0.0.0.0:${PORT}"
 default_admin_password = "admin"
+
+[http]
+listen = "0.0.0.0:${PORT}"
 
 [kv_store]
 type = "redb"
@@ -58,7 +66,7 @@ TOML
 
     # Start depot server
     echo "=== Starting depot server on port ${PORT} ==="
-    cargo run --bin depot -- -c "$TMP_DIR/depot.toml" &
+    "$ROOT/target/debug/depot" -c "$TMP_DIR/depot.toml" &
     SERVER_PID=$!
 
     echo "Waiting for depot server..."
@@ -91,7 +99,7 @@ TOML
 
     # Seed demo data (creates apt-packages repo with 4 synthetic .debs)
     echo "=== Seeding demo data ==="
-    cargo run --bin depot-bench -- demo --url "http://localhost:${PORT}"
+    "$ROOT/target/debug/depot-bench" demo --url "http://localhost:${PORT}"
 
     # Pre-check: verify InRelease and public key are accessible
     echo "=== Pre-checks ==="
@@ -106,33 +114,47 @@ TOML
     curl -sf "http://localhost:${PORT}/repository/apt-packages/public.key" > "$TMP_DIR/depot.asc"
     echo "GPG key fetched ($(wc -c < "$TMP_DIR/depot.asc") bytes)."
 
-    # Run Docker container with apt-get test
+    # Run Docker container with apt-get test.
+    #
+    # The container talks ONLY to depot (no upstream Debian mirror), so the test
+    # needs no internet access: we wipe the base image's sources and point apt at
+    # the depot repo alone. The depot public key is installed in its armored
+    # (.asc) form — modern apt verifies signed-by keyrings in armored format
+    # directly, and gpgv (apt's verifier) ships in the base image — so no gnupg
+    # install is required. Crucially we do NOT pass --allow-unauthenticated: a
+    # successful `apt-get update` and `apt-get install` here means real apt
+    # cryptographically verified depot's InRelease signature against the key.
     echo "=== Running apt-get test in Docker container ==="
+    # Pass the key via an env var rather than a bind mount: the Docker daemon
+    # may not share this host's filesystem (e.g. docker-in-docker), in which
+    # case a `-v file` mount silently materializes as an empty directory.
     docker run --name "$CONTAINER_NAME" --network=host \
-      -v "$TMP_DIR/depot.asc:/tmp/depot.asc:ro" \
+      -e "DEPOT_PUBKEY=$(cat "$TMP_DIR/depot.asc")" \
       debian:bookworm-slim \
       /bin/bash -exc "
-        # Install gnupg for key dearmoring
-        apt-get update -qq
-        apt-get install -y -qq gnupg >/dev/null 2>&1
+        # Trust depot via its armored public key.
+        install -d /etc/apt/keyrings
+        printf '%s\n' \"\$DEPOT_PUBKEY\" > /etc/apt/keyrings/depot.asc
 
-        # Import depot GPG key
-        gpg --dearmor < /tmp/depot.asc > /etc/apt/trusted.gpg.d/depot.gpg
-
-        # Add depot APT source
-        echo 'deb [signed-by=/etc/apt/trusted.gpg.d/depot.gpg] http://localhost:${PORT}/repository/apt-packages stable main' \
+        # Use depot as the sole apt source (no internet needed).
+        rm -f /etc/apt/sources.list
+        rm -f /etc/apt/sources.list.d/*
+        echo 'deb [signed-by=/etc/apt/keyrings/depot.asc] http://localhost:${PORT}/repository/apt-packages stable main' \
           > /etc/apt/sources.list.d/depot.list
 
-        # Update package lists (exercises InRelease + Packages.gz)
+        # Update package lists — this is the signature gate: apt fetches
+        # InRelease and verifies it against depot's key, failing loudly on a
+        # bad or missing signature.
         apt-get update
 
-        # Verify depot repo is visible
+        # Verify depot repo is visible.
         apt-cache policy hello
 
-        # Install packages from depot (downloads .debs from pool)
-        apt-get install -y --allow-unauthenticated hello goodbye libfoo
+        # Install packages from depot (downloads .debs from pool), fully
+        # authenticated — no --allow-unauthenticated.
+        apt-get install -y hello goodbye libfoo
 
-        # Verify all three are installed
+        # Verify all three are installed.
         dpkg -l hello goodbye libfoo
         echo '=== All APT packages installed successfully ==='
       "

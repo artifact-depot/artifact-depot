@@ -74,6 +74,27 @@ repo_type = "hosted"
 format = "raw"
 store = "local-files"
 
+# A hosted APT repository. Hosted apt repos are GPG-signed by default: depot
+# auto-generates a signing key on creation and signs InRelease / Release.gpg, so
+# clients can verify with `deb [signed-by=...]` pointing at the repo's
+# `/repository/<name>/public.key`. To sign with an existing key instead (e.g. to
+# match another mirror, or share one key across a fleet), provide its armored
+# secret key via `signing_key` — depot derives and serves the public half:
+#
+#   signing_key = """
+#   -----BEGIN PGP PRIVATE KEY BLOCK-----
+#   ...
+#   -----END PGP PRIVATE KEY BLOCK-----
+#   """
+#
+# The same key can also be rotated/imported later via the
+# POST/PUT /api/v1/repositories/<name>/signing-key endpoints.
+[[initialization.repositories]]
+name = "hosted-apt"
+repo_type = "hosted"
+format = "apt"
+store = "local-files"
+
 # --- Users -----------------------------------------------------------------
 
 # A service-account user. The plaintext `password` is hashed with Argon2

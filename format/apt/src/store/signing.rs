@@ -43,6 +43,23 @@ pub fn generate_gpg_keypair(repo_name: &str) -> error::Result<(String, String)> 
     Ok((private_armor, public_armor))
 }
 
+/// Derive the armored public key from an armored secret (private) key.
+///
+/// Used when importing an externally-supplied signing key: the operator provides
+/// only the private half, and we need the public half to serve at `public.key`
+/// and to let `apt` verify the signature. Doubles as validation — an unparseable
+/// or non-secret key is rejected here before anything is stored.
+pub fn public_key_from_secret(secret_key_armor: &str) -> error::Result<String> {
+    use pgp::composed::{Deserializable, SignedPublicKey, SignedSecretKey};
+
+    let (secret_key, _) = SignedSecretKey::from_string(secret_key_armor)
+        .map_err(|e| DepotError::BadRequest(format!("failed to parse signing key: {e}")))?;
+    let public_key: SignedPublicKey = secret_key.into();
+    public_key
+        .to_armored_string(Default::default())
+        .map_err(|e| DepotError::BadRequest(format!("failed to armor public key: {e}")))
+}
+
 /// Sign a Release file, producing (InRelease clearsigned, Release.gpg detached).
 pub(super) fn sign_release(
     signing_key_armor: &str,
