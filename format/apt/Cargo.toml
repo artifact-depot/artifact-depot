@@ -26,12 +26,11 @@ flate2 = "1"
 ar = "0.9"
 lzma-rs = "0.3"
 ruzstd = "0.8"
-# rand is pinned to 0.8 here because pgp 0.19 still depends on rand 0.8 (rand_core
+# rand is pinned to 0.8 here because pgp 0.20 still depends on rand 0.8 (rand_core
 # 0.6) for its Rng/CryptoRng signing bounds; the RNG in signing.rs is handed
 # directly to pgp, so it must match pgp's rand version. (server/ and bench/ are
-# on rand 0.9.) Dependabot's group bump moves this to 0.9 — keep it at 0.8 until
-# pgp itself moves to rand 0.9.
-pgp = "0.19"
+# on rand 0.9.) Keep it at 0.8 until pgp itself moves to rand 0.9.
+pgp = "0.20"
 rand = "0.8"
 smallvec = "1"
 anyhow = "1"
