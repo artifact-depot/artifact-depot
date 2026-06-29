@@ -239,41 +239,59 @@ TOML
 
     SYSTEM_CA="/usr/local/share/ca-certificates/depot-test.crt"
     DOCKERD_ARGS=""
+
+    # Isolated docker client config so `docker login` stores the credential in a
+    # plaintext config.json rather than invoking a credential helper. The dev
+    # user's default config sets credsStore=secretservice, whose helper needs a
+    # D-Bus secret service that isn't running headless ('docker-credential-
+    # secretservice not found'). Scoped here; removed with TMP_DIR.
+    export DOCKER_CONFIG="$TMP_DIR/docker"
+    mkdir -p "$DOCKER_CONFIG"
+    echo '{}' > "$DOCKER_CONFIG/config.json"
+
     cleanup() {
       echo "Cleaning up..."
       nginx -s stop -c "$TMP_DIR/nginx.conf" 2>/dev/null || true
       [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
       [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null || true
-      [ -n "$CTR_PID" ] && kill "$CTR_PID" 2>/dev/null || true
-      [ -n "$CTR_PID" ] && wait "$CTR_PID" 2>/dev/null || true
+      # containerd runs under sudo (see launch), so kill it as root by its
+      # unique per-test config path; then reap the local sudo wrapper.
+      if [ -n "$CTR_PID" ]; then
+        as_root pkill -f "containerd -c $TMP_DIR/containerd-config.toml" 2>/dev/null || true
+        wait "$CTR_PID" 2>/dev/null || true
+      fi
       docker logout "$REGISTRY" 2>/dev/null || true
       docker rmi "$REGISTRY/docker-auth-test/testimg:v1" 2>/dev/null || true
       if [ -f "$SYSTEM_CA" ]; then
-        rm -f "$SYSTEM_CA"
-        update-ca-certificates --fresh >/dev/null 2>&1 || true
+        as_root rm -f "$SYSTEM_CA"
+        as_root update-ca-certificates --fresh >/dev/null 2>&1 || true
         if [ -n "$DOCKERD_ARGS" ]; then
           restart_dockerd
         fi
       fi
-      rm -rf "$TMP_DIR"
+      # containerd (run as root) leaves root-owned metadata/blobs/snapshots
+      # under $TMP_DIR, so remove the tree as root. No-op ownership-wise in CI.
+      as_root rm -rf "$TMP_DIR"
     }
     trap cleanup EXIT
 
+    # dockerd runs as root (started via sudo; see start-dockerd.sh), so killing
+    # and relaunching it — and reading its root-owned log — go through as_root,
+    # which is a no-op when this script itself runs as root (CI).
     restart_dockerd() {
       local pid
       pid=$(pgrep -x dockerd | head -1)
       if [ -n "$pid" ]; then
-        kill "$pid" 2>/dev/null || true
-        while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+        as_root kill "$pid" 2>/dev/null || true
+        while as_root kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
       fi
-      # shellcheck disable=SC2086
-      nohup dockerd $DOCKERD_ARGS >/var/log/dockerd.log 2>&1 &
+      as_root sh -c "nohup dockerd $DOCKERD_ARGS >/var/log/dockerd.log 2>&1 &"
       for _ in $(seq 1 30); do
         docker info >/dev/null 2>&1 && return 0
         sleep 1
       done
       echo "  FAIL: dockerd did not become ready after restart"
-      tail -30 /var/log/dockerd.log
+      as_root tail -30 /var/log/dockerd.log
       return 1
     }
 
@@ -327,6 +345,15 @@ pid ${TMP_DIR}/nginx.pid;
 events { worker_connections 64; }
 http {
     access_log ${TMP_DIR}/nginx-access.log;
+    # Keep all temp/scratch dirs under TMP_DIR. nginx otherwise defaults to the
+    # compiled-in /var/lib/nginx/* paths, which only root can create — so the
+    # non-root dev container (and any non-root run) fails at startup with
+    # 'mkdir() "/var/lib/nginx/body" failed (13: Permission denied)'.
+    client_body_temp_path ${TMP_DIR}/nginx-body;
+    proxy_temp_path ${TMP_DIR}/nginx-proxy;
+    fastcgi_temp_path ${TMP_DIR}/nginx-fastcgi;
+    uwsgi_temp_path ${TMP_DIR}/nginx-uwsgi;
+    scgi_temp_path ${TMP_DIR}/nginx-scgi;
     server {
         listen ${PORT_HTTPS} ssl;
         server_name localhost;
@@ -512,14 +539,31 @@ server = "https://${REGISTRY}"
   ca = "$TMP_DIR/cert.pem"
 HOSTS
 
+    # Disable the CRI plugin: this test only does `ctr images pull` (content +
+    # snapshotter), never CRI/kubelet. Left enabled, CRI tries to create the
+    # CNI conf dir (/etc/cni), which fails for a non-root user with
+    # 'mkdir /etc/cni: permission denied' and aborts containerd startup. ctr
+    # pulls don't need CNI, so dropping the plugin removes the root requirement.
+    # uid/gid: containerd chowns its grpc + ttrpc sockets to these (default
+    # 0:0). A non-root user can't chown to root, so it aborts with
+    # 'chown ...sock.ttrpc: operation not permitted'. Setting them to the
+    # caller makes it a chown-to-self (a no-op as root in CI, where id is 0:0).
     cat > "$TMP_DIR/containerd-config.toml" <<CTR_TOML
 version = 2
 root = "$CTR_ROOT"
 state = "$CTR_STATE"
+disabled_plugins = ["io.containerd.grpc.v1.cri"]
 [grpc]
   address = "$CTR_SOCK"
+  uid = $(id -u)
+  gid = $(id -g)
 CTR_TOML
-    containerd -c "$TMP_DIR/containerd-config.toml" > "$TMP_DIR/containerd.log" 2>&1 &
+    # containerd runs as root: unpacking image layers calls mount(2), which
+    # needs CAP_SYS_ADMIN — a non-root process lacks it even in a privileged
+    # container (the container's caps don't apply to a uid!=0 process). The
+    # uid/gid in the config above make root-containerd hand the socket to the
+    # caller, so `ctr` below still runs unprivileged. No-op direct run in CI.
+    as_root containerd -c "$TMP_DIR/containerd-config.toml" > "$TMP_DIR/containerd.log" 2>&1 &
     CTR_PID=$!
 
     for i in $(seq 1 10); do
@@ -560,14 +604,15 @@ CTR_TOML
       exit 0
     fi
     DOCKERD_ARGS=$(tr '\0' ' ' < "/proc/$DOCKERD_PID/cmdline" | sed 's/^[^ ]* //; s/ *$//')
-    cp "$TMP_DIR/cert.pem" "$SYSTEM_CA"
-    update-ca-certificates >/dev/null 2>&1
+    as_root cp "$TMP_DIR/cert.pem" "$SYSTEM_CA"
+    as_root update-ca-certificates >/dev/null 2>&1
     restart_dockerd || exit 1
 
     if echo "pullpass123" | docker login -u testpull --password-stdin "$REGISTRY" >/dev/null 2>&1; then
       echo "  PASS: docker login succeeded"
     else
       echo "  FAIL: docker login failed"
+      echo "pullpass123" | docker login -u testpull --password-stdin "$REGISTRY" 2>&1 || true
       exit 1
     fi
 

@@ -10,15 +10,17 @@
 # This replaces the old network-namespace approach (scripts/ns-helpers.sh).
 # Namespaces were only ever used here as a "private localhost" so parallel
 # suites and worktrees could each bind a fixed port (8080 / 8000) without
-# colliding. `ip netns` needs CAP_SYS_ADMIN, which the non-root devcontainer
-# cannot obtain (setcap is stripped on exec under the nested overlay, and
-# unprivileged user namespaces are blocked from writing uid_map), so those
-# suites could only run as root.
+# colliding. That ran non-root too (via `sudo ip netns` — the dev container
+# grants NOPASSWD sudo), so it was never truly "root-only"; but it required
+# privilege and leaked namespaces and orphaned server processes whenever a run
+# was interrupted.
 #
 # Giving each server a free ephemeral port instead provides the same
-# collision-free isolation with zero privilege, so the suites now run
-# identically whether invoked as root (CI) or as the developer (devcontainer).
-# No sudo, no namespaces, no runuser environment dance.
+# collision-free isolation with NO privilege and nothing to leak, so the
+# port-based suites (ui, dynamodb) run identically as root (CI) or as the
+# developer — no sudo, no namespaces, no runuser dance. The one irreducibly
+# privileged integration test, docker-auth (it starts root-owned containerd /
+# dockerd and installs a CA into the system trust store), uses as_root below.
 
 # pick_free_port
 # Echo a currently-unused TCP port. The kernel assigns one via bind(:0); we
@@ -35,3 +37,18 @@ print(s.getsockname()[1])
 s.close()
 PY
 }
+
+# as_root <cmd...>
+# Run a command with real root privileges: directly when already root (CI runs
+# `make` as root in the builder image), otherwise via passwordless sudo (the
+# dev-non-root container grants the developer NOPASSWD: ALL by design). A few
+# integration steps are irreducibly privileged — installing a self-signed CA
+# into the system trust store and restarting the root-owned Docker daemon — and
+# this lets those run unchanged whether invoked as root or as the developer.
+# Server processes themselves do NOT use this: they bind a free port as the
+# caller (see pick_free_port) so their files stay caller-owned.
+if [ "$(id -u)" -eq 0 ]; then
+  as_root() { "$@"; }
+else
+  as_root() { sudo -n "$@"; }
+fi

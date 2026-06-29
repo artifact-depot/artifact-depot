@@ -58,20 +58,28 @@ and `/var/lib/docker` is a named volume so pulled images survive rebuilds. The
 dev-non-root stage bakes `/etc/docker/daemon.json` marking the loopback registry
 insecure, matching CI's `dockerd --insecure-registry 127.0.0.0/8`.
 
-**What passes here.** Lint, build, `cargo test`, and every integration suite —
-`test-docker-auth`, `test-apt`, `test-ui`, and `test-dynamodb` — all pass in
-this container, identically to root/CI. The full suite is reachable non-root.
+**What passes here.** The full `make test` suite — lint, build, `cargo test`,
+and the `test-ui`, `test-dynamodb`, and `test-docker-auth` integration suites —
+passes non-root in this container, identically to root/CI. (`test-apt` is a
+separate `scripts/ext-test.sh apt` mode, not part of `make test`, and is
+maintained elsewhere.)
 
-`test-ui` and `test-dynamodb` used to be the exception: they ran their servers
-inside a network namespace (`ip netns`) purely to get a private `localhost` so
-parallel suites wouldn't fight over a fixed port. `ip netns` needs root
-capabilities the non-root user can't obtain here (the nested overlayfs stores
-file capabilities but doesn't honor them at `exec`, so `setcap` can't help, and
-unprivileged user namespaces are blocked from writing `uid_map`). They now bind
-a **free ephemeral port on the host loopback** instead (see
+`test-ui` and `test-dynamodb` give each server a **free ephemeral port on the
+host loopback** (see
 [`scripts/net-helpers.sh`](https://github.com/artifact-depot/artifact-depot/blob/main/scripts/net-helpers.sh)),
-which gives the same collision-free isolation with no namespace and no
-privilege — so the netns machinery, and the root requirement, are gone.
+which keeps parallel suites/worktrees from colliding with **no privilege**. They
+previously used a network namespace for that isolation — which *did* work
+non-root (via `sudo ip netns`, since this container grants passwordless sudo),
+but it required privilege and leaked namespaces/processes when a run was
+interrupted; free ports need neither.
+
+`test-docker-auth` is the one suite with irreducibly privileged steps: it starts
+a root-owned `containerd` and `dockerd` and installs a self-signed CA into the
+system trust store. Those specific steps run via the container's passwordless
+`sudo` (see the `as_root` helper in `net-helpers.sh`), while `ctr` and `docker`
+themselves run as the dev user via the `docker` group. This is exactly why the
+dev-non-root container is **privileged with NOPASSWD sudo** — not a workaround,
+but what lets the daemon-based test run the same way whether root or non-root.
 
 Select it with **Dev Containers: Reopen in Container → "artifact-depot (dev-non-root)"**.
 
