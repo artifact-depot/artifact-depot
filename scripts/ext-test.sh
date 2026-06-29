@@ -5,15 +5,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # External-dependency integration test runner.
-# Starts infrastructure in a network namespace, runs tests, cleans up.
+# Starts infrastructure on free loopback ports, runs tests, cleans up.
+# No network namespaces, so every mode runs as root (CI) or non-root.
 #
 # Usage:
-#   sudo bash scripts/ext-test.sh dynamodb [extra cargo test args...]
+#   bash scripts/ext-test.sh dynamodb [extra cargo test args...]
 #   bash scripts/ext-test.sh apt
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/ns-helpers.sh"
+source "$SCRIPT_DIR/net-helpers.sh"
 
 case "${1:-}" in
   apt)
@@ -148,7 +149,6 @@ TOML
       exit 0
     fi
 
-    NETNS=$(make_netns_name "depot-dynamodb-test")
     DATA_DIR=$(mktemp -d)
     JAVA_PID=""
 
@@ -156,29 +156,27 @@ TOML
       echo "Cleaning up..."
       [ -n "$JAVA_PID" ] && kill "$JAVA_PID" 2>/dev/null || true
       [ -n "$JAVA_PID" ] && wait "$JAVA_PID" 2>/dev/null || true
-      ip netns del "$NETNS" 2>/dev/null || true
       rm -rf "$DATA_DIR"
     }
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    sweep_leaked_namespaces
-
     # Build test binary BEFORE starting infra.
     echo "Building DynamoDB test binary..."
     DEPOT_INSTRUMENT_FRONTEND=1 cargo test -q --features dynamodb --no-run 2>&1 | tail -1
 
-    # Create network namespace with loopback
-    ip netns del "$NETNS" 2>/dev/null || true
-    ip netns add "$NETNS"
-    ip netns exec "$NETNS" ip link set lo up
+    # DynamoDB Local only takes -port (it binds all interfaces), so a free
+    # ephemeral port is what keeps parallel suites/worktrees from colliding —
+    # no namespace, no root. See net-helpers.sh.
+    DYNAMO_PORT=$(pick_free_port)
+    DYNAMO_ENDPOINT="http://127.0.0.1:${DYNAMO_PORT}"
 
-    # Start DynamoDB Local in netns
-    ip netns exec "$NETNS" java \
+    # Start DynamoDB Local
+    java \
       -Djava.library.path="$DYNAMODB_LOCAL_DIR/DynamoDBLocal_lib" \
       -jar "$DYNAMODB_LOCAL_JAR" \
-      -port 8000 -inMemory \
+      -port "$DYNAMO_PORT" -inMemory \
       > "$DATA_DIR/dynamodb.log" 2>&1 &
     JAVA_PID=$!
 
@@ -187,7 +185,7 @@ TOML
     for i in $(seq 1 30); do
       # DynamoDB Local returns 400 on bare GET (missing auth token), so
       # check for any HTTP response rather than requiring 2xx.
-      HTTP_CODE=$(ip netns exec "$NETNS" curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/ 2>/dev/null || echo "000")
+      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${DYNAMO_ENDPOINT}/" 2>/dev/null || echo "000")
       if [ "$HTTP_CODE" != "000" ]; then
         echo "DynamoDB Local ready."
         break
@@ -201,12 +199,12 @@ TOML
       sleep 1
     done
 
-    # Run tests inside the same netns
+    # Run tests against DynamoDB Local
     shift
     echo "Running integration tests against DynamoDB Local..."
-    ip netns exec "$NETNS" env \
+    env \
       DEPOT_TEST_KV=dynamodb \
-      DEPOT_TEST_DYNAMODB_ENDPOINT=http://127.0.0.1:8000 \
+      DEPOT_TEST_DYNAMODB_ENDPOINT="$DYNAMO_ENDPOINT" \
       AWS_ACCESS_KEY_ID=fakeAccessKeyId \
       AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey \
       AWS_DEFAULT_REGION=us-east-1 \

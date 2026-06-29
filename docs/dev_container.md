@@ -58,14 +58,20 @@ and `/var/lib/docker` is a named volume so pulled images survive rebuilds. The
 dev-non-root stage bakes `/etc/docker/daemon.json` marking the loopback registry
 insecure, matching CI's `dockerd --insecure-registry 127.0.0.0/8`.
 
-**What passes here, and what doesn't.** Lint, build, `cargo test`, and the
-`test-docker-auth` / `test-apt` integration suites all pass in this container.
-The two **netns-based** e2e suites — `test-ui` and `test-dynamodb` — do **not**:
-they use `ip netns`, which needs root capabilities the non-root user can't
-obtain here (this dev container's nested overlayfs stores file capabilities but
-doesn't honor them at `exec`, so `setcap` can't help). Run those two in the
-default root/privileged container or in CI, which is the source of truth for the
-full suite.
+**What passes here.** Lint, build, `cargo test`, and every integration suite —
+`test-docker-auth`, `test-apt`, `test-ui`, and `test-dynamodb` — all pass in
+this container, identically to root/CI. The full suite is reachable non-root.
+
+`test-ui` and `test-dynamodb` used to be the exception: they ran their servers
+inside a network namespace (`ip netns`) purely to get a private `localhost` so
+parallel suites wouldn't fight over a fixed port. `ip netns` needs root
+capabilities the non-root user can't obtain here (the nested overlayfs stores
+file capabilities but doesn't honor them at `exec`, so `setcap` can't help, and
+unprivileged user namespaces are blocked from writing `uid_map`). They now bind
+a **free ephemeral port on the host loopback** instead (see
+[`scripts/net-helpers.sh`](https://github.com/artifact-depot/artifact-depot/blob/main/scripts/net-helpers.sh)),
+which gives the same collision-free isolation with no namespace and no
+privilege — so the netns machinery, and the root requirement, are gone.
 
 Select it with **Dev Containers: Reopen in Container → "artifact-depot (dev-non-root)"**.
 

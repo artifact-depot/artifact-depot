@@ -13,9 +13,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-source "$SCRIPT_DIR/ns-helpers.sh"
+source "$SCRIPT_DIR/net-helpers.sh"
 
-DYNAMO_NETNS=$(make_netns_name "depot-cov-dynamodb")
 DATA_DIR=$(mktemp -d)
 DYNAMO_PID=""
 
@@ -26,14 +25,11 @@ LLVM_COV="$LLVM_TOOLS_DIR/llvm-cov"
 cleanup() {
   [ -n "$DYNAMO_PID" ] && kill "$DYNAMO_PID" 2>/dev/null || true
   [ -n "$DYNAMO_PID" ] && wait "$DYNAMO_PID" 2>/dev/null || true
-  ip netns del "$DYNAMO_NETNS" 2>/dev/null || true
   rm -rf "$DATA_DIR"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-
-sweep_leaked_namespaces
 
 # --- Compile instrumented test binaries (once) ---
 # Setting DEPOT_INSTRUMENT_FRONTEND makes build.rs use npm run build:test
@@ -92,24 +88,26 @@ DYNAMO_TEST_PID=""
 
 if [ -f "$DYNAMODB_LOCAL_JAR" ]; then
   echo "=== Starting DynamoDB Local infrastructure ==="
-  ip netns del "$DYNAMO_NETNS" 2>/dev/null || true
-  ip netns add "$DYNAMO_NETNS"
-  ip netns exec "$DYNAMO_NETNS" ip link set lo up
+  # DynamoDB Local only takes -port (it binds all interfaces), so a free
+  # ephemeral port is what keeps parallel suites/worktrees from colliding —
+  # no namespace, no root. See net-helpers.sh.
+  DYNAMO_PORT=$(pick_free_port)
+  DYNAMO_ENDPOINT="http://127.0.0.1:${DYNAMO_PORT}"
 
-  ip netns exec "$DYNAMO_NETNS" java \
+  java \
     -Djava.library.path="$DYNAMODB_LOCAL_DIR/DynamoDBLocal_lib" \
     -jar "$DYNAMODB_LOCAL_JAR" \
-    -port 8000 -inMemory \
+    -port "$DYNAMO_PORT" -inMemory \
     > "$DATA_DIR/dynamodb.log" 2>&1 &
   DYNAMO_PID=$!
 
   echo "Waiting for DynamoDB Local..."
   for i in $(seq 1 60); do
-    if ip netns exec "$DYNAMO_NETNS" ss -tlnp 'sport = :8000' 2>/dev/null | grep -q LISTEN; then
+    if ss -tln "sport = :${DYNAMO_PORT}" 2>/dev/null | grep -q LISTEN; then
       break
     fi
     if [ "$i" -eq 60 ]; then
-      echo "ERROR: DynamoDB Local did not bind port 8000 within 60s"
+      echo "ERROR: DynamoDB Local did not bind port ${DYNAMO_PORT} within 60s"
       exit 1
     fi
     sleep 1
@@ -120,9 +118,9 @@ if [ -f "$DYNAMODB_LOCAL_JAR" ]; then
   DYNAMO_LOG="$DATA_DIR/dynamodb-test.log"
   (
     while IFS= read -r bin; do
-      ip netns exec "$DYNAMO_NETNS" env \
+      env \
         DEPOT_TEST_KV=dynamodb \
-        DEPOT_TEST_DYNAMODB_ENDPOINT=http://127.0.0.1:8000 \
+        DEPOT_TEST_DYNAMODB_ENDPOINT="$DYNAMO_ENDPOINT" \
         AWS_ACCESS_KEY_ID=fakeAccessKeyId \
         AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey \
         AWS_DEFAULT_REGION=us-east-1 \
