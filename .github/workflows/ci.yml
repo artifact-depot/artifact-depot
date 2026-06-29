@@ -18,8 +18,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   DEPOT_INSTRUMENT_FRONTEND: "1"
-  DOCKER_MIRROR: repository.mdh.quantum.com/
-  APT_MIRROR: repository.mdh.quantum.com/repository/pkgs/ubuntu
+  # Optional registry mirror for base images, configured per-environment as a
+  # repository/org Actions variable (empty -> pull from Docker Hub directly).
+  # Kept out of the source so no environment-specific host is hardcoded here.
+  DOCKER_MIRROR: ${{ vars.DOCKER_MIRROR }}
 
 jobs:
   ci:
@@ -34,18 +36,24 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build devcontainer image
+      # Build the shared toolchain stage from the root Dockerfile — the same
+      # `builder` the release image and dev container are built on, so CI,
+      # dev, and releases can never drift on the Node/Rust toolchain.
+      - name: Build CI toolchain image
         uses: docker/build-push-action@v6
         with:
-          context: .devcontainer
-          file: .devcontainer/Dockerfile
+          context: .
+          file: Dockerfile
+          target: builder
           load: true
           tags: depot-dev:ci
+          # No APT_MIRROR: the builder is Debian (the apt mirror was an Ubuntu
+          # path for the old devcontainer). Debian apt uses deb.debian.org
+          # directly, the same as the release-build job below.
           build-args: |
             DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
-            APT_MIRROR=${{ env.APT_MIRROR }}
 
-      - name: Start devcontainer
+      - name: Start container
         run: |
           docker run -d --name dev \
             --privileged \
@@ -56,7 +64,7 @@ jobs:
             depot-dev:ci \
             sleep infinity
 
-      - name: Start dockerd inside devcontainer
+      - name: Start dockerd inside container
         run: |
           # --insecure-registry 127.0.0.0/8 lets the docker-auth integration
           # test (and any future loopback registry tests) talk to a depot
@@ -71,65 +79,17 @@ jobs:
             echo "dockerd did not become ready"; tail -50 /var/log/dockerd.log; exit 1
           '
 
-      # --- Lints (each step runs even if a previous one failed) ---
-      # REUSE, cargo fmt, and cargo-deny run before npm ci and any
-      # compilation so they see a clean tree (the reuse 2.x package
-      # in the devcontainer does not respect .gitignore).
+      # Lint + build + full test suite, exactly as a developer runs it
+      # locally (CLAUDE.md: "run `make` to lint, build, and test
+      # everything"). `make` resolves to `all` -> `test`, which depends on
+      # notices, the debug build (frontend included via build.rs), all five
+      # lint checks, then cargo/UI/DynamoDB/docker-auth tests. dockerd is
+      # already running and DYNAMODB_LOCAL_DIR is baked into the image, so
+      # the e2e/integration suites find what they need.
+      - name: Lint, build, and test (make)
+        run: docker exec dev make
 
-      - name: Lint - REUSE compliance
-        if: success() || failure()
-        run: docker exec dev reuse lint
-
-      - name: Lint - cargo fmt
-        if: success() || failure()
-        run: docker exec dev cargo fmt --check
-
-      - name: Lint - cargo-deny licenses
-        if: success() || failure()
-        run: docker exec dev cargo deny check licenses
-
-      - name: Install frontend deps
-        run: docker exec -w /workspace/ui/frontend dev npm ci
-
-      - name: Lint - cargo clippy
-        if: success() || failure()
-        run: docker exec dev cargo clippy --all-targets -- -D warnings
-
-      - name: Lint - npm license-checker
-        if: success() || failure()
-        run: docker exec -w /workspace/ui/frontend dev npx --yes license-checker --failOn 'GPL-2.0;GPL-3.0;AGPL-3.0;AGPL-1.0;SSPL-1.0;EUPL-1.1;EUPL-1.2'
-
-      # --- Notices (prerequisite of build) ---
-
-      - name: Notices - cargo
-        run: docker exec dev bash scripts/generate-notices-cargo.sh
-
-      - name: Notices - npm
-        run: docker exec dev bash scripts/generate-notices-npm.sh
-
-      - name: Notices - combined
-        run: docker exec dev bash scripts/generate-notices.sh
-
-      # --- Build ---
-
-      - name: Build - cargo build
-        run: docker exec dev cargo build
-
-      # --- Tests ---
-
-      - name: Test - cargo test
-        run: docker exec dev cargo test -q
-
-      - name: Test - UI (Playwright in netns)
-        run: docker exec dev bash scripts/ui-test.sh --skip-build
-
-      - name: Test - DynamoDB
-        run: docker exec -e DYNAMODB_LOCAL_DIR=/usr/local/lib/dynamodb-local dev bash scripts/ext-test.sh dynamodb
-
-      - name: Test - Docker auth
-        run: docker exec dev bash scripts/ext-test.sh docker-auth
-
-      - name: Stop devcontainer
+      - name: Stop container
         if: always()
         run: docker rm -f dev || true
 

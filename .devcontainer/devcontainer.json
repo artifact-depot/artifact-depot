@@ -1,7 +1,9 @@
 {
 	"name": "artifact-depot",
 	"build": {
-		"dockerfile": "Dockerfile",
+		"context": "..",
+		"dockerfile": "../Dockerfile",
+		"target": "dev",
 		"args": {
 			"DOCKER_MIRROR": "",
 			"APT_MIRROR": ""
@@ -11,12 +13,21 @@
 		"vscode": {
 			"settings": {},
 			"extensions": [
-				"anthropic.claude-code"
+				"anthropic.claude-code",
+				"eamodio.gitlens",
+				"rust-lang.rust-analyzer",
+				"Vue.volar",
+				"redhat.vscode-yaml",
+				"timonwong.shellcheck",
+				"exiasr.hadolint"
 			]
 		}
 	},
-	"initializeCommand": "mkdir -p \"${localEnv:HOME}${localEnv:USERPROFILE}/.claude\"",
+	// /workspace is a named volume so sibling clones, scratch dirs, and
+	// container-side worktrees persist across rebuilds; the repo bind-mounts
+	// into it at /workspace/artifact-depot (see workspaceMount below).
 	"mounts": [
+		"source=artifact-depot-workspace,target=/workspace,type=volume",
 		"source=artifact-depot-worktrees,target=/worktrees,type=volume",
 		"source=artifact-depot-build,target=/build,type=volume"
 	],
@@ -33,6 +44,6 @@
 		}
 	},
 	"privileged": true,
-	"workspaceMount": "source=${localWorkspaceFolder},target=/artifact-depot,type=bind",
-	"workspaceFolder": "/artifact-depot"
+	"workspaceMount": "source=${localWorkspaceFolder},target=/workspace/artifact-depot,type=bind",
+	"workspaceFolder": "/workspace/artifact-depot"
 }
