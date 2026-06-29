@@ -137,6 +137,104 @@ async function openTagDetail(item: DisplayItem) {
     manifestLoading.value = false
   }
 }
+
+// --- Lazy tag-size fill for the browse list ---
+// A tag is a zero-byte pointer; its real image size lives in the manifest
+// (config + layers). Resolving it is one cheap manifest read, but doing that
+// for every tag up front fans out to hundreds of requests on images with many
+// tags. So each tag row resolves its size only when it scrolls into view, with
+// a small concurrency cap — the browse list never blocks.
+type TagSize = number | 'err'
+const tagSizes = ref<Record<string, TagSize>>({})
+const tagSizePending = new Set<string>()
+const tagSizeQueue: string[] = []
+let tagSizeInFlight = 0
+const TAG_SIZE_MAX_CONCURRENT = 6
+
+function resetTagSizes() {
+  tagSizes.value = {}
+  tagSizePending.clear()
+  tagSizeQueue.length = 0
+  tagSizeInFlight = 0
+}
+
+function tagSizeLabel(tag: string): string | null {
+  const v = tagSizes.value[tag]
+  return typeof v === 'number' ? formatSize(v) : null
+}
+
+function enqueueTagSize(tag: string) {
+  if (tag in tagSizes.value || tagSizePending.has(tag) || tagSizeQueue.includes(tag)) return
+  tagSizeQueue.push(tag)
+  pumpTagSizeQueue()
+}
+
+function pumpTagSizeQueue() {
+  while (tagSizeInFlight < TAG_SIZE_MAX_CONCURRENT && tagSizeQueue.length) {
+    const tag = tagSizeQueue.shift() as string
+    tagSizeInFlight++
+    tagSizePending.add(tag)
+    computeTagSize(tag).finally(() => {
+      tagSizeInFlight--
+      tagSizePending.delete(tag)
+      pumpTagSizeQueue()
+    })
+  }
+}
+
+function sumManifestBytes(m: any): number {
+  return (m?.config?.size || 0) + (m?.layers || []).reduce((s: number, l: any) => s + (l.size || 0), 0)
+}
+
+async function computeTagSize(tag: string) {
+  const image = prefix.value.replace(/\/+$/, '')
+  try {
+    const { data } = await api.getDockerManifest(props.repoName, image, tag)
+    let total = 0
+    if (Array.isArray(data.manifests)) {
+      // Multi-arch: sum config+layers across each per-arch child manifest.
+      const children = await Promise.all(
+        data.manifests.map((m: any) =>
+          api.getDockerManifest(props.repoName, image, m.digest).then(r => r.data).catch(() => null)),
+      )
+      total = children.reduce((s: number, c: any) => s + sumManifestBytes(c), 0)
+    } else {
+      total = sumManifestBytes(data)
+    }
+    tagSizes.value = { ...tagSizes.value, [tag]: total }
+  } catch {
+    tagSizes.value = { ...tagSizes.value, [tag]: 'err' }
+  }
+}
+
+// One shared observer; tag rows register via v-tagsize and resolve their size
+// the first time they enter the viewport.
+const tagSizeObserver =
+  typeof IntersectionObserver !== 'undefined'
+    ? new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            if (e.isIntersecting) {
+              const tag = (e.target as HTMLElement).dataset.tagsize
+              if (tag) enqueueTagSize(tag)
+            }
+          }
+        },
+        { rootMargin: '150px' },
+      )
+    : null
+onUnmounted(() => tagSizeObserver?.disconnect())
+
+const vTagsize = {
+  mounted(el: HTMLElement, binding: { value: string }) {
+    el.dataset.tagsize = binding.value
+    tagSizeObserver?.observe(el)
+  },
+  unmounted(el: HTMLElement) {
+    tagSizeObserver?.unobserve(el)
+  },
+}
+
 const search = ref('')
 const isSearchMode = ref(false)
 const selectedArtifact = ref<Artifact | null>(null)
@@ -339,6 +437,7 @@ async function load() {
     // its tags so they can be shown in place of the bookkeeping dirs.
     atImage.value = false
     dockerTagItems.value = []
+    resetTagSizes()
     if (dockerDefault.value && dirs.value.some(d => d.name === '_tags')) {
       atImage.value = true
       const tagsPrefix = prefix.value + '_tags/'
@@ -664,8 +763,16 @@ watch(
             </td>
             <td>
               <template v-if="item.isDir">
-                {{ formatSize(item.total_bytes || 0) }}
-                <span v-if="!isDocker" class="dir-count">({{ item.artifact_count }} items)</span>
+                <span v-if="isDocker" class="size-dash" title="Docker layers are content-addressed and shared across images at the repo level, so they aren't counted per image — open an image to see its size">&mdash;</span>
+                <template v-else>
+                  {{ formatSize(item.total_bytes || 0) }}
+                  <span class="dir-count">({{ item.artifact_count }} items)</span>
+                </template>
+              </template>
+              <template v-else-if="item.kind === 'tag'">
+                <span v-if="tagSizeLabel(item.name)">{{ tagSizeLabel(item.name) }}</span>
+                <span v-else v-tagsize="item.name" class="size-dash"
+                      :title="tagSizes[item.name] === 'err' ? 'Could not read this tag\'s manifest' : 'Resolving image size…'">&mdash;</span>
               </template>
               <template v-else>{{ formatSize(item.size) }}</template>
             </td>
@@ -1043,6 +1150,10 @@ th {
   color: var(--color-text-faint);
   font-size: 0.8rem;
   margin-left: 0.3rem;
+}
+.size-dash {
+  color: var(--color-text-faint);
+  cursor: help;
 }
 .action-btn {
   background: none;
