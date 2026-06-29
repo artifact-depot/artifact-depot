@@ -128,14 +128,16 @@ Set one variable to opt in; leave it unset and nothing happens.
    quoting issues. **Never commit your key.**)
 3. Rebuild/reopen the dev-non-root container. The `beyond-compare` `postCreateCommand`
    runs [`.devcontainer/install-bcompare.sh`](https://github.com/artifact-depot/artifact-depot/blob/main/.devcontainer/install-bcompare.sh),
-   which installs Beyond Compare 5, licenses it (writes `/etc/BC5Key.txt`), and
-   points `git difftool` / `git mergetool` at it.
+   which installs Beyond Compare 5 and licenses it (writes `/etc/BC5Key.txt`).
+   `git difftool` / `git mergetool` use it via `diff.tool=bc` / `merge.tool=bc`
+   from your host `~/.gitconfig` (copied into the container by VS Code).
 
 The **GUI** (`git difftool`) needs a forwarded display. On Linux, VS Code
 forwards a Wayland socket automatically and the wrapper falls back to it. For
-the crisp X11 path, also export `XAUTH_B64` (base64 of a wildcard-family X
-cookie from your host) in `~/.dev_aliases`; otherwise it uses Wayland. The
-install + license itself works with no display.
+the crisp X11 (xcb) path, authorize the host X server for local clients once
+with `xhost +local:` on the host — persist it via a GNOME autostart entry on
+Wayland (`~/.config/autostart/`), or `~/.xprofile` on an X11 session. Otherwise
+it uses Wayland. The install + license itself works with no display.
 
 ## Under the hood — the Dockerfile stages
 

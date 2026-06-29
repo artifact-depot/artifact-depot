@@ -28,14 +28,6 @@
 # git's bc diff/merge tool invokes `bcompare` (installed here), so once this has
 # run `git difftool` / `git mergetool` open Beyond Compare (a forwarded display
 # is required for the GUI; see the docs).
-#
-# Optional, also opt-in: XAUTH_B64. When the container forwards the host X
-# socket but not its auth cookie, the crisp xcb path is auth-walled and BCompare
-# falls back to (fuzzier) Wayland. Set XAUTH_B64 to the base64 of a
-# wildcard-family X cookie extracted on the host (see the docs) and this writes
-# it to ~/.artifact-depot.xauth and points BCompare's XAUTHORITY at it, so xcb
-# authorizes. Unset -> Wayland. Kept here (not in devcontainer.json) so only BC
-# users incur any of it.
 set -euo pipefail
 
 if [ -z "${BC5_LICENSE_KEY_B64:-}" ]; then
@@ -75,31 +67,19 @@ fi
 # Replace it with a fallback list so the backend is chosen by an actual runtime
 # connection test rather than guessed:
 #   QT_QPA_PLATFORM="xcb;wayland" -- Qt uses xcb when the X server (DISPLAY) is
-#       reachable AND authorized (see the cookie block); otherwise it falls
-#       through to wayland automatically.
+#       reachable AND authorized; otherwise it falls through to wayland
+#       automatically. For the crisp xcb path, authorize the host X server for
+#       local clients once with `xhost +local:` (see docs/dev_container.md).
 #   LIBGL_ALWAYS_SOFTWARE=1 -- on the wayland path the GPU render node is often
 #       not accessible to the dev user, so force Mesa software rendering;
 #       harmless on the xcb path.
 exports='export LIBGL_ALWAYS_SOFTWARE=1; export QT_QPA_PLATFORM="xcb;wayland"'
 
-# Optional X11 authorization for the crisp xcb path (opt-in via XAUTH_B64).
-if [ -n "${XAUTH_B64:-}" ]; then
-    if printf '%s' "$XAUTH_B64" | base64 -d > "$HOME/.artifact-depot.xauth" 2>/dev/null; then
-        chmod 0600 "$HOME/.artifact-depot.xauth"
-        exports="$exports; export XAUTHORITY=\"$HOME/.artifact-depot.xauth\""
-        echo "[bcompare] wrote X11 auth cookie to ~/.artifact-depot.xauth (xcb authorized)"
-    else
-        rm -f "$HOME/.artifact-depot.xauth"
-        echo "[bcompare] WARN: XAUTH_B64 is not valid base64 -- ignoring (will use Wayland)"
-    fi
-fi
-
 # Idempotent in both directions: match Scooter's pristine line (restored by the
 # .deb on install/upgrade) OR a line we patched on a previous run, and rewrite
 # it to the freshly computed $exports.
 if grep -qE '^(export QT_QPA_PLATFORM=xcb$|export LIBGL_ALWAYS_SOFTWARE=1; export QT_QPA_PLATFORM=)' /usr/bin/bcompare; then
-    case "$exports" in *XAUTHORITY*) cookie_note=" + X11 cookie";; *) cookie_note="";; esac
-    echo "[bcompare] patching wrapper: QT platform fallback + software GL${cookie_note}"
+    echo "[bcompare] patching wrapper: QT platform fallback + software GL"
     # '|' is the regex alternation, so use '@' as the s/// delimiter.
     sudo sed -i -E "s@^(export QT_QPA_PLATFORM=xcb\$|export LIBGL_ALWAYS_SOFTWARE=1; export QT_QPA_PLATFORM=).*@$exports@" /usr/bin/bcompare
 fi
@@ -109,10 +89,11 @@ echo "[bcompare] writing license to /etc/BC5Key.txt"
 printf '%s' "$BC5_LICENSE_KEY_B64" | base64 -d | sudo tee /etc/BC5Key.txt >/dev/null
 sudo chmod 0644 /etc/BC5Key.txt
 
-# Point git's diff/merge tool at Beyond Compare.
-git config --global diff.tool bc
-git config --global merge.tool bc
-git config --global difftool.bc.path /usr/bin/bcompare
-git config --global mergetool.bc.path /usr/bin/bcompare
+# Deliberately NO `git config` here. Running `git config --global` at
+# postCreate creates ~/.gitconfig, which makes VS Code's copyGitConfig skip
+# copying the host ~/.gitconfig (it won't overwrite an existing file) -- so the
+# developer's identity and aliases never make it into the container. The host
+# gitconfig already sets diff.tool/merge.tool=bc; with the bcompare binary on
+# PATH that is all git needs. (The qb dev container works exactly this way.)
 
-echo "[bcompare] done -- 'git difftool' / 'git mergetool' will use Beyond Compare"
+echo "[bcompare] done -- 'git difftool' / 'git mergetool' use Beyond Compare via your host ~/.gitconfig"
