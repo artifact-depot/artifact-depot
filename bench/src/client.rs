@@ -49,6 +49,12 @@ pub struct RepoResponse {
     /// Logical size of those records in bytes (shared blobs counted per-repo).
     #[serde(default)]
     pub total_bytes: u64,
+    /// Retention: expire artifacts older than this many days (by creation).
+    #[serde(default)]
+    pub cleanup_max_age_days: Option<u32>,
+    /// Retention: expire artifacts not accessed within this many days.
+    #[serde(default)]
+    pub cleanup_max_unaccessed_days: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

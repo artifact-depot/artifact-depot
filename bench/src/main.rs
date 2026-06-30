@@ -177,6 +177,11 @@ enum Command {
         /// Use staging copy (leave the source intact) instead of move
         #[arg(long, default_value_t = false)]
         copy: bool,
+
+        /// Print the full per-tag move list (default shows only the summary +
+        /// removals; moves are summarized by destination)
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
     },
 
     /// Audit a group repo for tags cloaked by an earlier member (shadowing)
@@ -312,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
             rules,
             apply,
             copy,
+            verbose,
         } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -328,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
                     apply,
                     copy,
                     insecure,
+                    verbose,
                 },
             )
             .await?;

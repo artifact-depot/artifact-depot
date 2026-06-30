@@ -1,0 +1,127 @@
+# First-party Docker image classification for the `released` (x.y.z) rule.
+#
+# Generated from each project's `.gitlab-ci.yml` publish_release job on
+# gitlab.mdh.quantum.com (default branch `develop`):
+#
+#   myriad        myriad/myriad         -O ${DOCKER_EXTERNAL}=release(insight)  / ${DOCKER_INTERNAL}=release_aux
+#   qkp           quantum/qkp           -O ${DOCKER_REPO}=release(insight)      / ${DOCKER_REPO_AUX}=release_aux
+#   orchestrator  quantum/orchestrator  -O ${DOCKER_EXTERNAL}=release(insight)  / ${DOCKER_INTERNAL}=release_aux
+#
+# The split applies ONLY to x.y.z release tags (prerelease/latest publish every
+# image to the prerelease repo regardless). An image listed here as `insight`
+# ships to the customer-facing upstream insight registry (mirrored by the
+# docker-insight cache); its copies in the drained source repos are redundant.
+# An image listed as `aux` belongs in docker-release-aux.
+#
+# IMPORTANT — these are a snapshot of the *current* pipeline. Tags in the source
+# repos were built over the projects' whole history, under older pipeline rules,
+# so an image may be absent here (added/removed/renamed since). Any x.y.z tag
+# whose image is on NEITHER list is reported as "Needs classification" (never
+# moved or deleted) so it can be triaged and added to the right list. Regenerate
+# from the CI files when the pipeline changes.
+
+# ---- INSIGHT images (x.y.z → upstream insight `docker-release`) --------------
+# Source copies are redundant; dropped only when the same digest is confirmed
+# upstream, and never out of the cache repo itself.
+insight_images = [
+  # myriad (23)
+  "myriad/api_alert_manager",
+  "myriad/api_internal",
+  "myriad/api_server",
+  "myriad/api_worker",
+  "myriad/bootstrap",
+  "myriad/crashd_analyzer",
+  "myriad/crashd_collector",
+  "myriad/ds_compactor",
+  "myriad/filesvc_local",
+  "myriad/fs_scrubber",
+  "myriad/nas_master",
+  "myriad/nas_chimera",
+  "myriad/nas_nfs",
+  "myriad/nas_smb",
+  "myriad/master",
+  "myriad/client",
+  "myriad/metrics",
+  "myriad/ds_explorer",
+  "myriad/perf_mcp",
+  "myriad/vidio_svc",
+  "myriad/s3",
+  "myriad/target",
+  "myriad/tools",
+  # qkp (3 + arch variants)
+  "qkp/quantum_leaf",
+  "qkp/quantum_mgmt",
+  "qkp/quantum_mgmt_cba",
+  "qkp/quantum_mgmt_cba_x86_64",
+  # quantum-orchestrator (2)
+  "quantum-orchestrator/orchestrator",
+  "quantum-orchestrator/orchestrator_self_updater",
+]
+
+# ---- AUX images (x.y.z → docker-release-aux) ---------------------------------
+aux_images = [
+  # myriad (32)
+  "myriad/api_alert_manager_debug",
+  "myriad/api_internal_debug",
+  "myriad/api_server_debug",
+  "myriad/api_worker_debug",
+  "myriad/base_myriad",
+  "myriad/base_myriad_python",
+  "myriad/builder_elbencho_ubuntu22",
+  "myriad/builder_ubuntu22",
+  "myriad/dev",
+  "myriad/ds_compactor_debug",
+  "myriad/filesvc_local_debug",
+  "myriad/fs_scrubber_debug",
+  "myriad/master_debug",
+  "myriad/mdmp_process",
+  "myriad/metrics_debug",
+  "myriad/ds_explorer_debug",
+  "myriad/vidio_svc_debug",
+  "myriad/nas_chimera_debug",
+  "myriad/nas_nfs_debug",
+  "myriad/nas_smb_debug",
+  "myriad/pipreqs",
+  "myriad/pysyntax",
+  "myriad/symbol_exporter",
+  "myriad/s3_debug",
+  "myriad/target_debug",
+  "myriad/teclient",
+  "myriad/test",
+  "myriad/test_debug",
+  "myriad/test_exec",
+  "myriad/test_exec_db",
+  "myriad/test_exec_web",
+  "myriad/uncrustifier",
+  # myriad arch-suffixed builder variants (per-arch image names in the data;
+  # the CI lists only the base builder_ubuntu22 / builder_elbencho_ubuntu22)
+  "myriad/builder_elbencho_ubuntu22_arm64",
+  "myriad/builder_elbencho_ubuntu22_x86_64",
+  "myriad/builder_ubuntu22_arm64",
+  "myriad/builder_ubuntu22_x86_64",
+  # qkp (14 + arch variants)
+  "qkp/builder_go",
+  "qkp/builder_ubuntu22",
+  "qkp/builder_pytest_ubuntu22",
+  "qkp/builder_sonic_202111",
+  "qkp/builder_ovmf_ubuntu2004",
+  "qkp/builder_nvme_sed_tool",
+  "qkp/image_builder",
+  "qkp/imager",
+  "qkp/storage_node_base",
+  "qkp/storage_node",
+  "qkp/pipreqs_ubuntu22",
+  "qkp/pipreqs_sonic",
+  "qkp/pysyntax_ubuntu22",
+  "qkp/pysyntax_sonic",
+  # qkp arch-suffixed builder/tooling variants (per-arch names in the data)
+  "qkp/builder_ovmf_ubuntu2004_x86_64",
+  "qkp/builder_sonic_202111_x86_64",
+  "qkp/builder_ubuntu22_x86_64",
+  "qkp/pipreqs_sonic_x86_64",
+  "qkp/pipreqs_ubuntu22_x86_64",
+  "qkp/pysyntax_sonic_x86_64",
+  "qkp/pysyntax_ubuntu22_x86_64",
+  # quantum-orchestrator (1)
+  "quantum-orchestrator/builder",
+]

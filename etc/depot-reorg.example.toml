@@ -47,12 +47,19 @@ developer  = '[a-z][a-z0-9]*-\d+'
 # --------------------------------------------------------------------------
 [[group]]
 format               = "docker"
-source_repos         = ["docker-internal", "docker-external"]
+# Repos to scan and re-home. List the destinations here too (prerelease /
+# development-local / release-aux): an artifact already misfiled in a dest gets
+# re-classified to where it belongs, and a tag already in its correct repo is
+# skipped (self-move guard), so a second run converges to ~0 moves.
+source_repos         = [
+    "docker-internal", "docker-external",
+    "docker-prerelease", "docker-development-local", "docker-release-aux",
+]
 first_party_prefixes = ["myriad/", "qkp/", "quantum-orchestrator/"]
 purge_repos          = ["docker-upstream"]   # dead cache (upstream gone): emptied wholesale
 # Retired/renamed namespaces — every tag under these is deleted from the source
 # repos (e.g. the project was renamed to quantum-orchestrator/).
-delete_prefixes      = ["orchestrator/", "quantum_orchestrator/"]
+retired_prefixes      = ["orchestrator/", "quantum_orchestrator/"]
 
   # Ordered; first matching rule wins.
 
@@ -62,22 +69,30 @@ delete_prefixes      = ["orchestrator/", "quantum_orchestrator/"]
   action = "move"
   dest   = "docker-prerelease"
 
-  # x.y.z released → reconcile against insight (the canonical release registry,
-  # a cache we never write to). Insight-presence is the primary-vs-supplementary
-  # discriminator, so no hand-maintained image list is needed:
-  #   absent from insight            → supplementary → move to docker-release-aux
-  #   present, same content digest   → redundant dup → delete from source
-  #   present, different digest      → not the same image → left for review
-  #   present, different digest      → not the same image. The script does NOT
-  #     guess which copy is right — `on_mismatch = "ask"` makes a dry-run print
-  #     the build-time/digest evidence, and `--apply` prompt you per tag before
-  #     deleting the source. Omit it (or set "leave") to just report and skip.
+  # x.y.z released → classify by the EXPLICIT per-image pipeline rule. Each
+  # first-party image is published to exactly one of two release destinations by
+  # its project's `.gitlab-ci.yml` publish_release job — no overlap, and NOT
+  # inferable from cache presence:
+  #   aux_images     → docker-release-aux (move there; that is its home)
+  #   insight_images → shipped to the customer-facing upstream insight registry
+  #                    (mirrored by the docker-insight cache); the source copy is
+  #                    redundant, so it's verified against `insight_repo` and:
+  #                      same digest      → drop the source copy (never out of the
+  #                                         cache itself — only copies elsewhere)
+  #                      different digest → review (on_mismatch); never auto-decided
+  #                      absent upstream  → flag, never dropped (may be the only copy)
+  #   neither list   → "needs classification": reported with evidence, never
+  #                    moved/deleted. The lists are a snapshot of today's pipeline;
+  #                    historical tags built under older rules may need triage and
+  #                    adding to the right list. The lists live in the include file
+  #                    below (regenerate from the CI files when the pipeline changes).
   [[group.rule]]
-  match       = "released"
-  action      = "reconcile"
-  check       = "docker-insight"
-  dest        = "docker-release-aux"
-  on_mismatch = "ask"
+  match        = "released"
+  action       = "classify"
+  aux_dest     = "docker-release-aux"
+  insight_repo = "docker-insight"
+  classes_file = "depot-reorg.image-classes.toml"
+  on_mismatch  = "ask"
 
   # rolling develop tag → prerelease repo
   [[group.rule]]
