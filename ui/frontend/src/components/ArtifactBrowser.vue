@@ -108,6 +108,19 @@ async function downloadManifest(item: DisplayItem, e: Event) {
   }
 }
 
+// Delete visibility: admin-only everywhere; Docker tags additionally require
+// Expert; Docker namespace/image folders in the default view have no delete.
+function canDelete(item: DisplayItem): boolean {
+  if (!isAdmin()) return false
+  if (item.kind === 'tag') return expert.value
+  if (item.isDir) return !isDocker.value || expert.value
+  return true
+}
+function deleteItem(item: DisplayItem, e: Event) {
+  if (item.isDir) confirmDirDelete(item, e)
+  else confirmDelete(item.path, e)
+}
+
 // --- Docker tag detail (manifest) ---
 // Fetched on drill-in via the /v2 endpoint (one request); layer/platform sizes
 // come straight from the manifest JSON, so there are no extra blob reads.
@@ -391,6 +404,20 @@ const displayItems = computed((): DisplayItem[] => {
 
   return [...dirItems, ...fileItems]
 })
+
+// Whether any visible row renders an action (Copy pull / Download / Delete).
+// When nothing in view has one (e.g. a page of Docker namespaces/images with no
+// delete rights), the actions column is dropped so it doesn't waste width.
+const showActionsColumn = computed(() =>
+  displayItems.value.some(item => {
+    const copyPull = item.kind === 'tag' && hasDefaultDockerGroup.value
+    // Docker image folders aren't downloadable (you pull images, not tar the
+    // raw storage) — only tags are. Non-docker folders download normally.
+    const download =
+      item.kind === 'tag' || (item.isDir && !isDocker.value) || !item.isDir
+    return copyPull || download || canDelete(item)
+  }),
+)
 
 function downloadUrl(path: string): string {
   return api.downloadUrl(props.repoName, path)
@@ -796,12 +823,20 @@ watch(
     <ResponsiveTable v-else-if="displayItems.length > 0">
       <table>
         <colgroup>
-          <col style="width: auto;" />
-          <col style="width: 10rem;" />
-          <col :style="{ width: isDocker ? '9rem' : '16rem' }" />
-          <col style="width: 13rem;" />
-          <col style="width: 13rem;" />
-          <col style="width: 13rem;" />
+          <!-- Name is a FIXED width (fits a long Supermicro download name;
+               longer ellipsizes) so every folder lays out identically. Size,
+               Type and the actions column shrink to their content (width:1% +
+               nowrap), and the two un-sized date columns float — absorbing the
+               leftover width and filling the row (right-aligned, see CSS). The
+               actions column holds all actions as a flex row: hidden ones
+               collapse to nothing, shown ones expand, so it's narrow when Expert
+               is off and widens only for the actions Expert reveals. -->
+          <col style="width: 36rem;" />
+          <col style="width: 1%;" />
+          <col style="width: 1%;" />
+          <col />
+          <col />
+          <col v-if="showActionsColumn" style="width: 1%;" />
         </colgroup>
         <thead>
           <tr>
@@ -810,7 +845,7 @@ watch(
             <th>{{ isDocker ? 'Type' : 'Content Type' }}</th>
             <th>Created/Modified</th>
             <th>Last Accessed</th>
-            <th></th>
+            <th v-if="showActionsColumn"></th>
           </tr>
         </thead>
         <tbody>
@@ -849,31 +884,23 @@ watch(
             </td>
             <td>{{ formatDate(item.updated_at) }}</td>
             <td>{{ item.last_accessed_at ? formatDate(item.last_accessed_at) : '—' }}</td>
-            <td>
-              <!-- Docker tag: Copy pull + Download for everyone (both modes);
-                   Delete only with Expert on AND admin. -->
-              <template v-if="item.kind === 'tag'">
+            <td v-if="showActionsColumn">
+              <!-- Flex row: only the buttons that apply are rendered, and each
+                   takes just its own width — an absent Copy pull / Download /
+                   Delete leaves no reserved gap (so a Delete-only row sits tight
+                   against the date, not pushed right by phantom slots). -->
+              <div class="row-actions">
                 <button
-                  v-if="hasDefaultDockerGroup"
+                  v-if="isDocker && item.kind === 'tag' && hasDefaultDockerGroup"
                   class="act-link"
                   :title="pullCommand(item.name)"
                   @click="copyPull(item, $event)"
                 >{{ copiedTag === item.name ? 'Copied ✓' : 'Copy pull' }}</button>
-                <button class="act-link" title="Download manifest" @click="downloadManifest(item, $event)">Download</button>
-                <button v-if="expert && isAdmin()" class="act-link act-delete" @click="confirmDelete(item.path, $event)" title="Delete tag">Delete</button>
-              </template>
-              <!-- Docker namespace/image folder in the default (non-expert) view: no actions. -->
-              <template v-else-if="dockerDefault && !expert && item.isDir" />
-              <!-- Directory (non-docker, or docker bookkeeping revealed in Expert). -->
-              <template v-else-if="item.isDir">
-                <button class="act-link" @click="confirmDirDownload(item, $event)" title="Download directory">Download</button>
-                <button v-if="isAdmin()" class="act-link act-delete" @click="confirmDirDelete(item, $event)" title="Delete directory">Delete</button>
-              </template>
-              <!-- Raw file. -->
-              <template v-else>
-                <a :href="downloadUrl(item.path)" target="_blank" class="act-link" title="Download" @click.stop>Download</a>
-                <button v-if="isAdmin()" class="act-link act-delete" @click="confirmDelete(item.path, $event)" title="Delete">Delete</button>
-              </template>
+                <button v-if="item.kind === 'tag'" class="act-link" title="Download manifest" @click="downloadManifest(item, $event)">Download</button>
+                <button v-else-if="item.isDir && !isDocker" class="act-link" title="Download directory" @click="confirmDirDownload(item, $event)">Download</button>
+                <a v-else-if="!item.isDir" :href="downloadUrl(item.path)" target="_blank" class="act-link" title="Download" @click.stop>Download</a>
+                <button v-if="canDelete(item)" class="act-link act-delete" :title="item.isDir ? 'Delete directory' : 'Delete'" @click="deleteItem(item, $event)">Delete</button>
+              </div>
             </td>
           </tr>
         </tbody>
@@ -1184,11 +1211,13 @@ watch(
   color: var(--color-text-disabled);
   margin: 0 0.25rem;
 }
-/* Override global table: this component needs fixed layout and tighter padding.
-   Width is bounded by the centered `main` container (see App.vue), so the
-   table fills its panel without stretching across an ultra-wide monitor. */
+/* Auto layout so each column sizes to its content (see the colgroup): Name,
+   Size, Type and the actions column shrink to fit, and the two date columns
+   absorb the leftover width. When Expert turns on, the actions column is just
+   the (content-sized) Delete link added on the right — the rest is unchanged. */
 table {
-  table-layout: fixed;
+  table-layout: auto;
+  width: 100%;
 }
 .type-label {
   text-transform: capitalize;
@@ -1211,6 +1240,17 @@ table {
 .act-delete {
   color: var(--color-danger);
 }
+/* Pack the actions with flex so only rendered buttons take space — an absent
+   Copy pull / Download / Delete collapses instead of leaving a reserved gap.
+   (Trades cross-row column alignment for no phantom whitespace.) */
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.row-actions .act-link {
+  margin: 0;
+}
 th, td {
   padding: 0.5rem 0.75rem;
   white-space: nowrap;
@@ -1219,6 +1259,18 @@ th, td {
 }
 th {
   font-size: 0.85rem;
+}
+/* Name is a fixed 36rem (see colgroup); this keeps a longer name clipped to
+   that width with an ellipsis rather than stretching the column. */
+td:first-child, th:first-child {
+  max-width: 36rem;
+}
+/* Right-align the two date columns (Created/Modified, Last Accessed) so, as
+   they absorb the leftover width, each value stays against the next column
+   rather than leaving a gap before it. */
+th:nth-child(4), td:nth-child(4),
+th:nth-child(5), td:nth-child(5) {
+  text-align: right;
 }
 .item-icon {
   margin-right: 0.4rem;
