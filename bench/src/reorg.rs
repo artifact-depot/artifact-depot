@@ -1115,21 +1115,25 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                 .entry((m.dest.clone(), m.image.clone(), m.tag.clone()))
                 .or_default() += 1;
         }
-        // Build dates are only needed to DECIDE the multi-source-empty-dest case
-        // (pick the newest); the no-clobber case is decided without them (keep the
-        // dest). So resolve build dates ONLY for genuine multi-source collisions
-        // where the dest is empty — bounded to the ambiguous tags (e.g. rolling
-        // `develop`), not the potentially huge no-clobber set. No-clobber age is
-        // shown cheaply via the existing `[pulled DATE]` usage annotation.
+        // Build (create) dates for every colliding tag — both the source copy and
+        // the kept copy — so the report compares the two by CREATE date (the
+        // meaningful signal; last-pulled is not). Resolved only for tags actually
+        // in a collision (bounded), not the whole move set.
         let mut ts: HashMap<(String, String, String), Option<String>> = HashMap::new();
         for m in &resolved.moves {
             let key = (m.dest.clone(), m.image.clone(), m.tag.clone());
-            let multi = !present.contains(&key) && srcs_per_key.get(&key).copied().unwrap_or(0) > 1;
-            if !multi {
+            let collides =
+                present.contains(&key) || srcs_per_key.get(&key).copied().unwrap_or(0) > 1;
+            if !collides {
                 continue;
             }
             let v = resolve_created_ts(client, &m.source_repo, &m.image, &m.tag).await;
             ts.insert((m.source_repo.clone(), m.image.clone(), m.tag.clone()), v);
+        }
+        // The kept dest copy of each no-clobber collision (one per `present` key).
+        for (dest, image, tag) in &present {
+            let v = resolve_created_ts(client, dest, image, tag).await;
+            ts.insert((dest.clone(), image.clone(), tag.clone()), v);
         }
         let moves = std::mem::take(&mut resolved.moves);
         let (kept, superseded) = resolve_move_collisions(moves, &present, &ts);
@@ -1566,50 +1570,79 @@ fn print_remaining(
         "\n================ Remaining after reorg — first-party only ({}) ================",
         first_party_prefixes.join(", ")
     );
+    println!("Each repo's leftovers are grouped by WHY they stay (one reason per tag).");
 
-    let fp_left: Vec<&TagRef> = p
-        .mismatched
-        .iter()
-        .map(|m| &m.tag)
-        .chain(&p.kept)
-        .chain(&p.leaves)
-        .chain(&p.insight_absent)
-        .chain(p.needs_classification.iter().map(|t| &t.tag))
-        .chain(p.superseded.iter().map(|s| &s.tag))
-        .collect();
+    // Every reason a first-party tag is left in its source repo — one bucket per
+    // reason so the operator can see at a glance why each remains. A tag is in
+    // exactly one of these.
+    let reasons: Vec<(&str, Vec<&TagRef>)> = vec![
+        (
+            "superseded — move skipped to avoid clobbering the dest / a newer source",
+            p.superseded.iter().map(|s| &s.tag).collect(),
+        ),
+        (
+            "insight image absent upstream — NOT dropped (may be the only copy)",
+            p.insight_absent.iter().collect(),
+        ),
+        (
+            "needs classification — released image on neither insight nor aux list",
+            p.needs_classification.iter().map(|t| &t.tag).collect(),
+        ),
+        (
+            "reconcile mismatch — present in the check repo with a different digest (review)",
+            p.mismatched.iter().map(|m| &m.tag).collect(),
+        ),
+        (
+            "kept — already present in the check repo",
+            p.kept.iter().collect(),
+        ),
+        ("unmatched — no rule matched", p.leaves.iter().collect()),
+    ];
 
     let mut source_repos: std::collections::BTreeSet<&str> = Default::default();
     for t in p
         .remaining_third_party
         .iter()
-        .chain(fp_left.iter().copied())
+        .chain(reasons.iter().flat_map(|(_, v)| v.iter().copied()))
     {
         source_repos.insert(t.source_repo.as_str());
     }
 
     for repo in &source_repos {
-        let fp: Vec<&TagRef> = fp_left
-            .iter()
-            .copied()
-            .filter(|t| t.source_repo == *repo)
-            .collect();
         let tp_count = p
             .remaining_third_party
             .iter()
             .filter(|t| t.source_repo == *repo)
             .count();
-        if fp.is_empty() {
+        // The reason buckets restricted to this repo (non-empty only).
+        let here: Vec<(&str, Vec<&TagRef>)> = reasons
+            .iter()
+            .map(|(label, tags)| {
+                (
+                    *label,
+                    tags.iter()
+                        .copied()
+                        .filter(|t| t.source_repo == *repo)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .filter(|(_, tags)| !tags.is_empty())
+            .collect();
+        let total: usize = here.iter().map(|(_, t)| t.len()).sum();
+        if total == 0 {
             println!(
                 "\n{repo}: no first-party tags left ✓  ({tp_count} third-party tag(s) also stay, not shown)"
             );
             continue;
         }
         println!(
-            "\n{repo}: {} first-party tag(s) left  ({tp_count} third-party tag(s) also stay, not shown):",
-            fp.len()
+            "\n{repo}: {total} first-party tag(s) left  ({tp_count} third-party tag(s) also stay, not shown):",
         );
-        for (img, tags) in by_image(&fp) {
-            println!("       {img}: {}", tags.join(", "));
+        for (label, tags) in &here {
+            println!("  [{}] — {} tag(s):", label, tags.len());
+            for (img, tags) in by_image(tags) {
+                println!("       {img}: {}", tags.join(", "));
+            }
         }
     }
 
@@ -2016,33 +2049,30 @@ fn print_plan(
         }
     }
 
-    // Superseded — moves auto-dropped to avoid a clobber/duplicate, with the age
-    // evidence behind each decision (this copy's build date vs the kept copy's).
+    // Superseded — moves auto-dropped to avoid a clobber/duplicate. The decision
+    // is by CREATE date: this copy's create date vs the kept copy's, both shown.
     if !p.superseded.is_empty() {
         println!(
             "\nSuperseded ({} tag(s)) — move skipped to avoid a clobber/duplicate; left in source \
-             (not deleted). 'kept' is the copy that wins; build dates shown for audit:",
+             (not deleted). Compared by create date (dropped copy vs kept copy):",
             p.superseded.len()
         );
-        // Show build dates when resolved (the multi-source tie-break); otherwise
-        // the appended [pulled DATE] usage annotation carries the age.
-        let built = |o: &Option<String>| {
+        let created = |o: &Option<String>| {
             o.as_deref()
-                .map(|s| format!(" (built {})", s.get(0..10).unwrap_or(s)))
-                .unwrap_or_default()
+                .map(|s| s.get(0..10).unwrap_or(s).to_string())
+                .unwrap_or_else(|| "?".to_string())
         };
         for s in &p.superseded {
-            let note = atime_note(usage_repo, atimes, &s.tag.image, &s.tag.tag);
             println!(
-                "       {}/{}:{}{} -> {} dest {} — kept {}{}{note}",
+                "       {}/{}:{} (created {}) -> {} dest {} — kept {} (created {})",
                 s.tag.source_repo,
                 s.tag.image,
                 s.tag.tag,
-                built(&s.own_built),
+                created(&s.own_built),
                 verb,
                 s.dest,
                 s.kept,
-                built(&s.winner_built),
+                created(&s.winner_built),
             );
         }
     }
@@ -2563,9 +2593,9 @@ mod tests {
 
     const SAMPLE: &str = r#"
         [patterns]
-        released   = '\d+\.\d+\.\d+'
-        prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+'
-        develop    = 'develop'
+        released   = '\d+\.\d+\.\d+(-(linux|windows|darwin)_[a-z0-9_]+)?'
+        prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+(-(linux|windows|darwin)_[a-z0-9_]+)?'
+        develop    = 'develop(-(linux|windows|darwin)_[a-z0-9_]+)?'
         ci         = 'ci-.+-\d+'
         developer  = '[a-z][a-z0-9]*-\d+'
 
@@ -2622,6 +2652,44 @@ mod tests {
         let groups = compile_groups(&rules, Path::new(".")).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].rules.len(), 6);
+    }
+
+    #[test]
+    fn arch_suffixed_tags_route_like_their_base() {
+        let g = sample_group();
+        // A platform component tag routes exactly like its base tag, so a
+        // multi-arch family stays together instead of falling to the catch-all.
+        assert_eq!(
+            decide(&g, "myriad/dev", "1.4.0-dev.80-linux_amd64"),
+            Decision::Move("docker-prerelease")
+        );
+        assert_eq!(
+            decide(&g, "myriad/dev", "1.4.0-dev.80-linux_arm64_v8"),
+            Decision::Move("docker-prerelease")
+        );
+        assert_eq!(
+            decide(&g, "qkp/leaf", "develop-linux_amd64"),
+            Decision::Move("docker-prerelease")
+        );
+        // released x.y.z component → same reconcile as the bare release.
+        assert_eq!(
+            decide(&g, "myriad/api_server", "1.5.0-linux_amd64"),
+            Decision::Reconcile {
+                check: "docker-insight",
+                absent: AbsentDest::MoveTo("docker-release-aux"),
+                on_mismatch: MismatchPolicy::Leave,
+            }
+        );
+        // The bare index tag still routes as before.
+        assert_eq!(
+            decide(&g, "myriad/dev", "1.4.0-dev.80"),
+            Decision::Move("docker-prerelease")
+        );
+        // A non-platform suffix is NOT swallowed (still catch-all).
+        assert_eq!(
+            decide(&g, "myriad/dev", "1.4.0-dev.80-canal13"),
+            Decision::Move("docker-development-local")
+        );
     }
 
     #[test]

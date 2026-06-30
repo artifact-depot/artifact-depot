@@ -34,10 +34,16 @@ cache_repo     = "docker-insight"
 upstream_url   = "https://insight.quantum.com:8081"
 upstream_repos = ["docker-external", "docker-release"]
 
+# A buildx pipeline tags each platform separately (e.g. `1.4.0-dev.80-linux_amd64`,
+# `…-linux_arm64_v8`) AND stitches them into a bare manifest-list/index tag
+# (`1.4.0-dev.80`). The optional trailing `(-<os>_<arch>)?` makes a platform
+# component tag route exactly like its base tag, so a multi-arch family stays
+# together (e.g. the components follow their index into docker-prerelease) instead
+# of falling to the catch-all.
 [patterns]
-released   = '\d+\.\d+\.\d+'
-prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+'
-develop    = 'develop'
+released   = '\d+\.\d+\.\d+(-(linux|windows|darwin)_[a-z0-9_]+)?'
+prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+(-(linux|windows|darwin)_[a-z0-9_]+)?'
+develop    = 'develop(-(linux|windows|darwin)_[a-z0-9_]+)?'
 ci         = 'ci-.+-\d+'
 developer  = '[a-z][a-z0-9]*-\d+'
 
