@@ -449,6 +449,24 @@ pub struct PlannedMove {
     pub class: String,
 }
 
+/// A move that was dropped because executing it would have clobbered a copy
+/// already in the destination, or duplicated a sibling source whose copy was
+/// kept instead. Left in source, reported — never deleted. Carries the build
+/// dates of both the dropped copy and the winning copy so the dry-run can show
+/// the age evidence behind the auto-resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersededItem {
+    pub tag: TagRef,
+    pub dest: String,
+    /// Where the winning copy lives (the dest, or the source repo that was kept).
+    pub kept: String,
+    /// Build date (config `created`, date only) of this dropped copy; `None` if
+    /// unresolved.
+    pub own_built: Option<String>,
+    /// Build date of the winning copy that was kept instead.
+    pub winner_built: Option<String>,
+}
+
 /// A delete gated on absence from a presence-check repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConditionalDelete {
@@ -585,6 +603,105 @@ fn build_group_plan(
         }
     }
     plan
+}
+
+/// Resolve move collisions so a move never clobbers a copy already in the
+/// destination, and several sources never clobber each other at one dest. Pure
+/// (no I/O) so it is unit-tested; the caller supplies the precomputed inputs.
+///
+/// For each distinct `(dest, image, tag)`:
+/// - if `present` contains it (the dest already holds that tag) → **supersede
+///   every move** (never clobber the authoritative dest copy, e.g. a pipeline-
+///   published rolling `develop`);
+/// - else if a single source moves it → keep the move;
+/// - else (several sources, dest empty) → keep the **newest** by `created`
+///   timestamp from `ts` (RFC3339; a missing entry sorts oldest) and supersede
+///   the rest.
+///
+/// `present` is keyed by `(dest, image, tag)`; `ts` by `(repo, image, tag)` and
+/// must cover every source candidate plus, for a present collision, the dest
+/// copy (keyed by the dest repo). Superseded moves are returned separately (left
+/// in source, reported) carrying both copies' build dates for the report.
+fn resolve_move_collisions(
+    moves: Vec<PlannedMove>,
+    present: &std::collections::HashSet<(String, String, String)>,
+    ts: &HashMap<(String, String, String), Option<String>>,
+) -> (Vec<PlannedMove>, Vec<SupersededItem>) {
+    let mut by_key: BTreeMap<(String, String, String), Vec<PlannedMove>> = BTreeMap::new();
+    for m in moves {
+        by_key
+            .entry((m.dest.clone(), m.image.clone(), m.tag.clone()))
+            .or_default()
+            .push(m);
+    }
+    let age = |repo: &str, image: &str, tag: &str| -> Option<String> {
+        ts.get(&(repo.to_string(), image.to_string(), tag.to_string()))
+            .cloned()
+            .flatten()
+    };
+    let mut kept = Vec::new();
+    let mut superseded = Vec::new();
+    for ((dest, image, tag), mut cands) in by_key {
+        // No-clobber: the dest already holds this tag → keep it, drop every move.
+        if present.contains(&(dest.clone(), image.clone(), tag.clone())) {
+            let winner_built = age(&dest, &image, &tag);
+            for m in cands {
+                let own_built = age(&m.source_repo, &m.image, &m.tag);
+                superseded.push(SupersededItem {
+                    dest: m.dest,
+                    kept: format!("existing copy in {dest}"),
+                    own_built,
+                    winner_built: winner_built.clone(),
+                    tag: TagRef {
+                        source_repo: m.source_repo,
+                        image: m.image,
+                        tag: m.tag,
+                    },
+                });
+            }
+            continue;
+        }
+        if cands.len() == 1 {
+            kept.push(cands.pop().unwrap());
+            continue;
+        }
+        // Several sources, dest empty: keep the newest by build date (None sorts
+        // oldest); first wins ties for determinism.
+        let mut best = 0usize;
+        for i in 1..cands.len() {
+            let a = age(&cands[i].source_repo, &cands[i].image, &cands[i].tag).unwrap_or_default();
+            let b = age(
+                &cands[best].source_repo,
+                &cands[best].image,
+                &cands[best].tag,
+            )
+            .unwrap_or_default();
+            if a > b {
+                best = i;
+            }
+        }
+        let winner_repo = cands[best].source_repo.clone();
+        let winner_built = age(&winner_repo, &image, &tag);
+        for (i, m) in cands.into_iter().enumerate() {
+            if i == best {
+                kept.push(m);
+            } else {
+                let own_built = age(&m.source_repo, &m.image, &m.tag);
+                superseded.push(SupersededItem {
+                    dest: m.dest,
+                    kept: format!("newer copy in {winner_repo}"),
+                    own_built,
+                    winner_built: winner_built.clone(),
+                    tag: TagRef {
+                        source_repo: m.source_repo,
+                        image: m.image,
+                        tag: m.tag,
+                    },
+                });
+            }
+        }
+    }
+    (kept, superseded)
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +841,9 @@ struct ResolvedPlan {
     /// Released tags whose image is on neither classify list — reported with
     /// evidence so the operator can assign each to insight or aux. Never touched.
     needs_classification: Vec<TriageItem>,
+    /// Moves dropped to avoid clobbering an existing dest copy / duplicating a
+    /// sibling source (auto-resolved: keep dest, else newest). Left in source.
+    superseded: Vec<SupersededItem>,
     /// Tags in source repos the reorg never touches because their image is not
     /// first-party — they stay put. Tracked only to report the post-reorg residual.
     remaining_third_party: Vec<TagRef>,
@@ -768,6 +888,10 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
     preflight_repos(client, &groups, rules.usage_repo.as_deref()).await?;
 
     let mut resolved = ResolvedPlan::default();
+    // Each scanned repo's current `(image, tag)` set — reused to detect, with no
+    // extra I/O, whether a move's destination already holds the tag (no-clobber).
+    let mut inventories: HashMap<String, std::collections::HashSet<(String, String)>> =
+        HashMap::new();
 
     for group in &groups {
         if group.format != "docker" {
@@ -789,6 +913,10 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
             .collect();
         for (repo, is_purge) in scan {
             let inv = list_repo_tags(client, repo).await?;
+            inventories
+                .entry(repo.clone())
+                .or_default()
+                .extend(inv.iter().cloned());
             // Non-first-party tags. Retired-prefix tags and the remainder in a
             // purge repo are FLAGGED for the operator (reported, not deleted);
             // third-party in a regular source repo stays untouched. First-party
@@ -954,6 +1082,61 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         }
     }
 
+    // No-clobber + de-dup of moves (auto-resolved; the operator audits the plan).
+    // A move must never overwrite a copy already in the destination (e.g. a
+    // pipeline-published rolling `develop`), and several sources must not clobber
+    // each other at one dest. Decide which single copy "wins" using build dates,
+    // and report the rest as superseded (left in source, never deleted).
+    {
+        // Which (dest, image, tag) the destination already holds — from the
+        // scanned inventories (no extra I/O for repos we already listed; HEAD as
+        // a fallback for any dest that wasn't scanned).
+        let mut present: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        let mut dest_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for m in &resolved.moves {
+            dest_keys.insert((m.dest.clone(), m.image.clone(), m.tag.clone()));
+        }
+        for (dest, image, tag) in &dest_keys {
+            let here = match inventories.get(dest) {
+                Some(set) => set.contains(&(image.clone(), tag.clone())),
+                None => insight_has(client, dest, image, tag).await.unwrap_or(false),
+            };
+            if here {
+                present.insert((dest.clone(), image.clone(), tag.clone()));
+            }
+        }
+        // Build dates needed to explain/resolve collisions: every source copy of
+        // a colliding tag, plus the dest copy when the dest already holds it.
+        // Count sources per (dest, image, tag) to find the multi-source collisions.
+        let mut srcs_per_key: HashMap<(String, String, String), usize> = HashMap::new();
+        for m in &resolved.moves {
+            *srcs_per_key
+                .entry((m.dest.clone(), m.image.clone(), m.tag.clone()))
+                .or_default() += 1;
+        }
+        // Build dates are only needed to DECIDE the multi-source-empty-dest case
+        // (pick the newest); the no-clobber case is decided without them (keep the
+        // dest). So resolve build dates ONLY for genuine multi-source collisions
+        // where the dest is empty — bounded to the ambiguous tags (e.g. rolling
+        // `develop`), not the potentially huge no-clobber set. No-clobber age is
+        // shown cheaply via the existing `[pulled DATE]` usage annotation.
+        let mut ts: HashMap<(String, String, String), Option<String>> = HashMap::new();
+        for m in &resolved.moves {
+            let key = (m.dest.clone(), m.image.clone(), m.tag.clone());
+            let multi = !present.contains(&key) && srcs_per_key.get(&key).copied().unwrap_or(0) > 1;
+            if !multi {
+                continue;
+            }
+            let v = resolve_created_ts(client, &m.source_repo, &m.image, &m.tag).await;
+            ts.insert((m.source_repo.clone(), m.image.clone(), m.tag.clone()), v);
+        }
+        let moves = std::mem::take(&mut resolved.moves);
+        let (kept, superseded) = resolve_move_collisions(moves, &present, &ts);
+        resolved.moves = kept;
+        resolved.superseded = superseded;
+    }
+
     // Optional: annotate the plan with last-accessed (usage) data from the
     // configured usage repo (e.g. the docker proxy). Report-only — never alters
     // what gets moved/deleted. One browse call per distinct image.
@@ -977,6 +1160,9 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         }
         for t in &resolved.needs_classification {
             images.insert(t.tag.image.clone());
+        }
+        for s in &resolved.superseded {
+            images.insert(s.tag.image.clone());
         }
         for image in images {
             match client.image_tag_atimes(usage_repo, &image).await {
@@ -1389,6 +1575,7 @@ fn print_remaining(
         .chain(&p.leaves)
         .chain(&p.insight_absent)
         .chain(p.needs_classification.iter().map(|t| &t.tag))
+        .chain(p.superseded.iter().map(|s| &s.tag))
         .collect();
 
     let mut source_repos: std::collections::BTreeSet<&str> = Default::default();
@@ -1573,6 +1760,21 @@ fn print_overview(
             p.already_placed
         );
     }
+    // Superseded — moves dropped to avoid clobbering the dest / duplicating a
+    // sibling source. Auto-resolved (keep dest, else newest); left in source.
+    if !p.superseded.is_empty() {
+        let clobber = p
+            .superseded
+            .iter()
+            .filter(|s| s.kept.starts_with("existing copy"))
+            .count();
+        let dup = p.superseded.len() - clobber;
+        println!(
+            "  Superseded{:>6} tag(s) — move skipped, left in source (not deleted): \
+             {clobber} would-clobber-dest, {dup} duplicate-of-newer-source",
+            p.superseded.len()
+        );
+    }
     println!(
         "  Unmatched {:>6} tag(s) — no rule matched{}",
         p.leaves.len(),
@@ -1598,11 +1800,12 @@ fn print_overview(
         .count();
     let flagged = p.purges.len() + p.prefix_deletes.len();
     println!(
-        "  On --apply: {} move(s) · {} drop(s) · {} prompt(s) · {} flagged (untouched)",
+        "  On --apply: {} move(s) · {} drop(s) · {} prompt(s) · {} flagged · {} superseded (untouched)",
         p.moves.len(),
         p.deletes.len(),
         asks,
-        flagged
+        flagged,
+        p.superseded.len(),
     );
 }
 
@@ -1810,6 +2013,37 @@ fn print_plan(
                 ts.sort();
                 println!("       {img}: {}", ts.join(", "));
             }
+        }
+    }
+
+    // Superseded — moves auto-dropped to avoid a clobber/duplicate, with the age
+    // evidence behind each decision (this copy's build date vs the kept copy's).
+    if !p.superseded.is_empty() {
+        println!(
+            "\nSuperseded ({} tag(s)) — move skipped to avoid a clobber/duplicate; left in source \
+             (not deleted). 'kept' is the copy that wins; build dates shown for audit:",
+            p.superseded.len()
+        );
+        // Show build dates when resolved (the multi-source tie-break); otherwise
+        // the appended [pulled DATE] usage annotation carries the age.
+        let built = |o: &Option<String>| {
+            o.as_deref()
+                .map(|s| format!(" (built {})", s.get(0..10).unwrap_or(s)))
+                .unwrap_or_default()
+        };
+        for s in &p.superseded {
+            let note = atime_note(usage_repo, atimes, &s.tag.image, &s.tag.tag);
+            println!(
+                "       {}/{}:{}{} -> {} dest {} — kept {}{}{note}",
+                s.tag.source_repo,
+                s.tag.image,
+                s.tag.tag,
+                built(&s.own_built),
+                verb,
+                s.dest,
+                s.kept,
+                built(&s.winner_built),
+            );
         }
     }
 
@@ -2231,10 +2465,11 @@ fn print_mismatch_evidence(m: &MismatchInfo) {
     println!("            -> {}", m.assessment());
 }
 
-/// Resolve an image's build time = its config blob's `created` field (date only).
-/// Descends one level into a manifest list / OCI index. Best-effort: `None` on
-/// any miss, so a mismatch is still reported (just without the date).
-async fn resolve_built(
+/// Resolve an image's full build timestamp = its config blob's `created` field
+/// (RFC3339). Descends one level into a manifest list / OCI index. Best-effort:
+/// `None` on any miss. RFC3339 sorts lexically = chronologically, so the raw
+/// string is directly comparable for "newest".
+async fn resolve_created_ts(
     client: &DepotClient,
     repo: &str,
     image: &str,
@@ -2265,7 +2500,19 @@ async fn resolve_built(
     let c: serde_json::Value = serde_json::from_slice(&blob).ok()?;
     c.get("created")
         .and_then(|v| v.as_str())
-        .map(|s| s.get(0..10).unwrap_or(s).to_string())
+        .map(|s| s.to_string())
+}
+
+/// Resolve an image's build time as a date only (`YYYY-MM-DD`) for display.
+async fn resolve_built(
+    client: &DepotClient,
+    repo: &str,
+    image: &str,
+    reference: &str,
+) -> Option<String> {
+    resolve_created_ts(client, repo, image, reference)
+        .await
+        .map(|s| s.get(0..10).unwrap_or(&s).to_string())
 }
 
 /// Shorten a `sha256:…` digest for display.
@@ -2816,5 +3063,106 @@ mod tests {
         assert!(mk(true, true).hint().contains("INSIGHT"));
         assert!(mk(true, false).hint().contains("INSIGHT"));
         assert!(mk(false, false).hint().contains("AUX"));
+    }
+
+    // Move-collision resolution: never clobber an existing dest copy; when the
+    // dest is empty but several sources collide, keep the newest by build date.
+    #[test]
+    fn move_collisions_never_clobber_and_keep_newest() {
+        let mv = |src: &str, img: &str, tag: &str, dest: &str| PlannedMove {
+            source_repo: src.into(),
+            image: img.into(),
+            tag: tag.into(),
+            dest: dest.into(),
+            class: "develop".into(),
+        };
+        let moves = vec![
+            // (a) dest already has master:develop -> both sources superseded.
+            mv(
+                "docker-internal",
+                "myriad/master",
+                "develop",
+                "docker-prerelease",
+            ),
+            mv(
+                "docker-development-local",
+                "myriad/master",
+                "develop",
+                "docker-prerelease",
+            ),
+            // (b) dest empty for client:develop; two sources -> keep the newer.
+            mv(
+                "docker-internal",
+                "myriad/client",
+                "develop",
+                "docker-prerelease",
+            ),
+            mv(
+                "docker-development-local",
+                "myriad/client",
+                "develop",
+                "docker-prerelease",
+            ),
+            // (c) dest empty, single source -> kept as-is.
+            mv(
+                "docker-internal",
+                "myriad/lonely",
+                "develop",
+                "docker-prerelease",
+            ),
+        ];
+        let mut present = std::collections::HashSet::new();
+        present.insert((
+            "docker-prerelease".to_string(),
+            "myriad/master".to_string(),
+            "develop".to_string(),
+        ));
+        let mut ts: HashMap<(String, String, String), Option<String>> = HashMap::new();
+        // client: development-local copy is newer than the internal copy.
+        ts.insert(
+            (
+                "docker-internal".into(),
+                "myriad/client".into(),
+                "develop".into(),
+            ),
+            Some("2026-05-01T00:00:00Z".into()),
+        );
+        ts.insert(
+            (
+                "docker-development-local".into(),
+                "myriad/client".into(),
+                "develop".into(),
+            ),
+            Some("2026-06-20T00:00:00Z".into()),
+        );
+
+        let (kept, superseded) = resolve_move_collisions(moves, &present, &ts);
+
+        // Kept: client (from development-local, newer) + lonely. master: none.
+        assert_eq!(kept.len(), 2, "kept: {kept:?}");
+        assert!(kept
+            .iter()
+            .any(|m| m.image == "myriad/client" && m.source_repo == "docker-development-local"));
+        assert!(kept.iter().any(|m| m.image == "myriad/lonely"));
+        assert!(!kept.iter().any(|m| m.image == "myriad/master"));
+
+        // Superseded: 2 master (clobber) + 1 client (older).
+        assert_eq!(superseded.len(), 3);
+        let master_clobber = superseded
+            .iter()
+            .filter(|s| s.tag.image == "myriad/master")
+            .count();
+        assert_eq!(master_clobber, 2);
+        assert!(superseded
+            .iter()
+            .all(|s| s.tag.image != "myriad/master" || s.kept.contains("existing copy")));
+        let client_loser = superseded
+            .iter()
+            .find(|s| s.tag.image == "myriad/client")
+            .expect("client loser");
+        assert_eq!(client_loser.tag.source_repo, "docker-internal");
+        assert!(client_loser
+            .kept
+            .contains("newer copy in docker-development-local"));
     }
 }
