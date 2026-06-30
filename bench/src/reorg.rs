@@ -545,6 +545,8 @@ pub struct Plan {
     pub triage: Vec<TagRef>,
     /// Tags already in their correct repo (self-move skipped) — convergence signal.
     pub already_placed: usize,
+    /// Per-rule-class breakdown of `already_placed`, for the by-rule report.
+    pub already_placed_by_class: HashMap<String, usize>,
 }
 
 /// Build a plan for one group from its `(image, tag)` inventory. Pure: no I/O.
@@ -569,6 +571,10 @@ fn build_group_plan(
             // move — skip the self-move rather than churn it.
             Decision::Move(dest) if dest == source_repo => {
                 plan.already_placed += 1;
+                *plan
+                    .already_placed_by_class
+                    .entry(move_class(group, image, tag).to_string())
+                    .or_default() += 1;
             }
             Decision::Move(dest) => plan.moves.push(PlannedMove {
                 source_repo: source_repo.to_string(),
@@ -649,7 +655,7 @@ fn resolve_move_collisions(
                 let own_built = age(&m.source_repo, &m.image, &m.tag);
                 superseded.push(SupersededItem {
                     dest: m.dest,
-                    kept: format!("existing copy in {dest}"),
+                    kept: "the existing copy already there".to_string(),
                     own_built,
                     winner_built: winner_built.clone(),
                     tag: TagRef {
@@ -689,7 +695,7 @@ fn resolve_move_collisions(
                 let own_built = age(&m.source_repo, &m.image, &m.tag);
                 superseded.push(SupersededItem {
                     dest: m.dest,
-                    kept: format!("newer copy in {winner_repo}"),
+                    kept: format!("the newer copy in {winner_repo}"),
                     own_built,
                     winner_built: winner_built.clone(),
                     tag: TagRef {
@@ -844,11 +850,24 @@ struct ResolvedPlan {
     /// Moves dropped to avoid clobbering an existing dest copy / duplicating a
     /// sibling source (auto-resolved: keep dest, else newest). Left in source.
     superseded: Vec<SupersededItem>,
-    /// Tags in source repos the reorg never touches because their image is not
-    /// first-party — they stay put. Tracked only to report the post-reorg residual.
-    remaining_third_party: Vec<TagRef>,
     /// Count of tags already in their correct repo (self-move skipped).
     already_placed: usize,
+    /// Per-rule-class breakdown of `already_placed`, for the by-rule report.
+    already_placed_by_class: HashMap<String, usize>,
+    /// Create dates (config `created`, date only) resolved for the bounded
+    /// decision sections (redundant drops, insight-absent), keyed by
+    /// `(source_repo, image, tag)`. Looked up by the by-rule report.
+    created: HashMap<(String, String, String), String>,
+}
+
+impl ResolvedPlan {
+    /// The resolved create date for a tag, or `?` if unresolved.
+    fn created_date(&self, t: &TagRef) -> String {
+        self.created
+            .get(&(t.source_repo.clone(), t.image.clone(), t.tag.clone()))
+            .cloned()
+            .unwrap_or_else(|| "?".to_string())
+    }
 }
 
 /// A released tag whose image is on neither classify list, with the evidence the
@@ -860,8 +879,6 @@ struct TriageItem {
     upstream_present: bool,
     /// True when present upstream AND the digest matches the source copy.
     upstream_same_digest: bool,
-    /// Source image build date (config `created`, date only); `None` if unresolved.
-    source_built: Option<String>,
 }
 
 impl TriageItem {
@@ -919,8 +936,8 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                 .extend(inv.iter().cloned());
             // Non-first-party tags. Retired-prefix tags and the remainder in a
             // purge repo are FLAGGED for the operator (reported, not deleted);
-            // third-party in a regular source repo stays untouched. First-party
-            // is handled by build_group_plan below.
+            // third-party in a regular source repo is none of our business and is
+            // ignored. First-party is handled by build_group_plan below.
             for (image, tag) in &inv {
                 if group.is_first_party(image) {
                     continue;
@@ -934,12 +951,14 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                     resolved.prefix_deletes.push(tagref);
                 } else if is_purge {
                     resolved.purges.push(tagref);
-                } else {
-                    resolved.remaining_third_party.push(tagref);
                 }
+                // third-party in a regular source repo: ignored (not reported).
             }
             let plan = build_group_plan(group, &inv, repo);
             resolved.already_placed += plan.already_placed;
+            for (k, v) in plan.already_placed_by_class {
+                *resolved.already_placed_by_class.entry(k).or_default() += v;
+            }
             resolved.moves.extend(plan.moves);
             resolved.deletes.extend(plan.deletes);
             resolved.leaves.extend(plan.leaves);
@@ -987,11 +1006,37 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                                 });
                             } else {
                                 resolved.already_placed += 1;
+                                *resolved
+                                    .already_placed_by_class
+                                    .entry(
+                                        move_class(group, &rec.tag.image, &rec.tag.tag).to_string(),
+                                    )
+                                    .or_default() += 1;
                             }
                         }
                         // Insight image the upstream lacks: don't move it to aux,
-                        // and don't drop the only copy — flag for review.
-                        AbsentAction::Flag => resolved.insight_absent.push(rec.tag),
+                        // and don't drop the only copy — flag for review. Record
+                        // its create date for the report.
+                        AbsentAction::Flag => {
+                            if let Some(c) = resolve_built(
+                                client,
+                                &rec.tag.source_repo,
+                                &rec.tag.image,
+                                &rec.tag.tag,
+                            )
+                            .await
+                            {
+                                resolved.created.insert(
+                                    (
+                                        rec.tag.source_repo.clone(),
+                                        rec.tag.image.clone(),
+                                        rec.tag.tag.clone(),
+                                    ),
+                                    c,
+                                );
+                            }
+                            resolved.insight_absent.push(rec.tag);
+                        }
                     }
                     continue;
                 }
@@ -1015,6 +1060,23 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                             "identical digest already in {} (redundant duplicate)",
                             rec.check_repo
                         );
+                        if let Some(c) = resolve_built(
+                            client,
+                            &rec.tag.source_repo,
+                            &rec.tag.image,
+                            &rec.tag.tag,
+                        )
+                        .await
+                        {
+                            resolved.created.insert(
+                                (
+                                    rec.tag.source_repo.clone(),
+                                    rec.tag.image.clone(),
+                                    rec.tag.tag.clone(),
+                                ),
+                                c,
+                            );
+                        }
                         resolved.deletes.push(DeleteItem {
                             tag: rec.tag,
                             reason,
@@ -1070,13 +1132,10 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                 } else {
                     (false, false)
                 };
-                let source_built =
-                    resolve_built(client, &tag.source_repo, &tag.image, &tag.tag).await;
                 resolved.needs_classification.push(TriageItem {
                     tag,
                     upstream_present: present,
                     upstream_same_digest: same_digest,
-                    source_built,
                 });
             }
         }
@@ -1141,32 +1200,15 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         resolved.superseded = superseded;
     }
 
-    // Optional: annotate the plan with last-accessed (usage) data from the
-    // configured usage repo (e.g. the docker proxy). Report-only — never alters
-    // what gets moved/deleted. One browse call per distinct image.
+    // Last-accessed (usage) data from the configured usage repo, used ONLY by the
+    // destination-retention `max_unaccessed` check (that policy is defined by
+    // last-pull). Not shown per-tag anywhere — plan listings use create dates.
+    // One browse per distinct MOVED image (the only tags retention examines).
     let mut atimes: HashMap<(String, String), String> = HashMap::new();
     if let Some(usage_repo) = rules.usage_repo.as_deref() {
         let mut images: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for m in &resolved.moves {
             images.insert(m.image.clone());
-        }
-        for d in &resolved.deletes {
-            images.insert(d.tag.image.clone());
-        }
-        for t in resolved.kept.iter().chain(&resolved.leaves) {
-            images.insert(t.image.clone());
-        }
-        for m in &resolved.mismatched {
-            images.insert(m.tag.image.clone());
-        }
-        for t in &resolved.insight_absent {
-            images.insert(t.image.clone());
-        }
-        for t in &resolved.needs_classification {
-            images.insert(t.tag.image.clone());
-        }
-        for s in &resolved.superseded {
-            images.insert(s.tag.image.clone());
         }
         for image in images {
             match client.image_tag_atimes(usage_repo, &image).await {
@@ -1184,20 +1226,15 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
     }
 
     // Which tag classes (rule `match` names) route to each move destination —
-    // lets the summary explain *why* the move counts land where they do. Also
-    // capture the classes in rule order (catch-all last), so the verbose move
-    // list prints groups in the same order the rules are evaluated.
+    // lets the summary explain *why* the move counts land where they do, and the
+    // regex behind each class for the by-rule detail header.
     let mut dest_classes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut class_order: Vec<String> = Vec::new();
     let mut class_patterns: BTreeMap<String, String> = BTreeMap::new();
     for g in &rules.group {
         for r in &g.rules {
             let class = class_label(&r.match_).to_string();
-            if !class_order.contains(&class) {
-                class_order.push(class.clone());
-            }
             // Resolve the rule's `match` to its regex source (a named pattern, or
-            // the inline regex itself) so the verbose plan can show it.
+            // the inline regex itself) so the by-rule plan can show it.
             class_patterns.entry(class.clone()).or_insert_with(|| {
                 rules
                     .patterns
@@ -1215,12 +1252,10 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
 
     print_plan(
         &resolved,
+        &groups,
         cfg.copy,
-        rules.usage_repo.as_deref(),
-        &atimes,
         cfg.verbose,
         &dest_classes,
-        &class_order,
         &class_patterns,
     );
 
@@ -1308,7 +1343,7 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
             }
         }
         let prefixes: Vec<String> = prefixes.into_iter().collect();
-        print_remaining(&resolved, &cache_contents, &prefixes);
+        print_residuals(&resolved, &cache_contents, &prefixes);
 
         // Retention safety: warn if a destination's cleanup policy would expire
         // the tags we're about to move there (a re-file silently becoming a delete).
@@ -1325,12 +1360,7 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         // Repeat the plan summary down here next to the repository/remaining
         // data, so a reader who scrolled the detail doesn't have to jump back to
         // the top to recall the counts.
-        print_overview(
-            &resolved,
-            cfg.copy,
-            rules.usage_repo.as_deref(),
-            &dest_classes,
-        );
+        print_overview(&resolved, cfg.copy, &dest_classes);
 
         println!("\nDry run — no changes made. Re-run with --apply to execute.");
         return Ok(());
@@ -1535,144 +1565,69 @@ fn report(
     }
 }
 
-/// Report what remains after the reorg, restricted to **first-party** images
-/// (those under a configured `first_party_prefixes` namespace) and listing each
-/// artifact with its actual tags — so anything under your own projects that a
-/// rule didn't route stands out (and you can tell whether more rules are needed).
-/// Third-party images that stay are summarized as a single count, not listed.
-/// Source repos show the tags left in place (reconcile-mismatch / conditional-
-/// keep / unmatched); check repos (caches the reorg never writes to) show the
-/// first-party artifacts they currently serve, for reference.
-fn print_remaining(
+/// Report the repo-level residuals the per-rule plan doesn't cover: what's left
+/// in the drained purge repos, under retired prefixes, the untouched third-party
+/// remainder in regular source repos, and the cache repos' first-party contents
+/// for reference. Each is grouped by the reason it stays. (First-party tags left
+/// by a rule are shown per-rule in the by-rule plan, not here.)
+fn print_residuals(
     p: &ResolvedPlan,
     cache_contents: &BTreeMap<String, Vec<TagRef>>,
     first_party_prefixes: &[String],
 ) {
-    let is_fp = |image: &str| {
-        first_party_prefixes
-            .iter()
-            .any(|pre| image.starts_with(pre.as_str()))
-    };
-
-    // Group a set of tag refs by image, with sorted tags per image.
-    let by_image = |tags: &[&TagRef]| -> BTreeMap<String, Vec<String>> {
-        let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for t in tags {
-            m.entry(t.image.clone()).or_default().push(t.tag.clone());
+    // Purge repos (drained): first-party was re-homed by the rules; the
+    // non-first-party remainder is stale public-cache content — counted only
+    // (not your namespaces; not listed, never auto-deleted). The count is just
+    // the "is it empty of value yet" signal before removing the repo wholesale.
+    if !p.purges.is_empty() {
+        println!("\n================ Purge repos (drained) — what's left ================");
+        let mut by_repo: BTreeMap<&str, usize> = BTreeMap::new();
+        for t in &p.purges {
+            *by_repo.entry(t.source_repo.as_str()).or_default() += 1;
         }
-        for v in m.values_mut() {
-            v.sort();
+        for (repo, n) in &by_repo {
+            println!(
+                "  {repo}: first-party re-homed ✓; {n} non-first-party tag(s) remain \
+                 (stale public-cache content, not shown). Once the first-party re-home is \
+                 confirmed, delete the repo (or its contents) wholesale.",
+            );
         }
-        m
-    };
-
-    println!(
-        "\n================ Remaining after reorg — first-party only ({}) ================",
-        first_party_prefixes.join(", ")
-    );
-    println!("Each repo's leftovers are grouped by WHY they stay (one reason per tag).");
-
-    // Every reason a first-party tag is left in its source repo — one bucket per
-    // reason so the operator can see at a glance why each remains. A tag is in
-    // exactly one of these.
-    let reasons: Vec<(&str, Vec<&TagRef>)> = vec![
-        (
-            "superseded — move skipped to avoid clobbering the dest / a newer source",
-            p.superseded.iter().map(|s| &s.tag).collect(),
-        ),
-        (
-            "insight image absent upstream — NOT dropped (may be the only copy)",
-            p.insight_absent.iter().collect(),
-        ),
-        (
-            "needs classification — released image on neither insight nor aux list",
-            p.needs_classification.iter().map(|t| &t.tag).collect(),
-        ),
-        (
-            "reconcile mismatch — present in the check repo with a different digest (review)",
-            p.mismatched.iter().map(|m| &m.tag).collect(),
-        ),
-        (
-            "kept — already present in the check repo",
-            p.kept.iter().collect(),
-        ),
-        ("unmatched — no rule matched", p.leaves.iter().collect()),
-    ];
-
-    let mut source_repos: std::collections::BTreeSet<&str> = Default::default();
-    for t in p
-        .remaining_third_party
-        .iter()
-        .chain(reasons.iter().flat_map(|(_, v)| v.iter().copied()))
-    {
-        source_repos.insert(t.source_repo.as_str());
     }
 
-    for repo in &source_repos {
-        let tp_count = p
-            .remaining_third_party
-            .iter()
-            .filter(|t| t.source_repo == *repo)
-            .count();
-        // The reason buckets restricted to this repo (non-empty only).
-        let here: Vec<(&str, Vec<&TagRef>)> = reasons
-            .iter()
-            .map(|(label, tags)| {
-                (
-                    *label,
-                    tags.iter()
-                        .copied()
-                        .filter(|t| t.source_repo == *repo)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .filter(|(_, tags)| !tags.is_empty())
-            .collect();
-        let total: usize = here.iter().map(|(_, t)| t.len()).sum();
-        if total == 0 {
-            println!(
-                "\n{repo}: no first-party tags left ✓  ({tp_count} third-party tag(s) also stay, not shown)"
-            );
-            continue;
+    // Retired prefixes: every tag under a retired namespace, left for review.
+    if !p.prefix_deletes.is_empty() {
+        println!("\n================ Retired prefixes — what's left ================");
+        let mut by_repo: BTreeMap<&str, Vec<&TagRef>> = BTreeMap::new();
+        for t in &p.prefix_deletes {
+            by_repo.entry(t.source_repo.as_str()).or_default().push(t);
         }
-        println!(
-            "\n{repo}: {total} first-party tag(s) left  ({tp_count} third-party tag(s) also stay, not shown):",
-        );
-        for (label, tags) in &here {
-            println!("  [{}] — {} tag(s):", label, tags.len());
-            for (img, tags) in by_image(tags) {
-                println!("       {img}: {}", tags.join(", "));
+        for (repo, tags) in &by_repo {
+            println!("\n{repo}: {} tag(s) left:", tags.len());
+            println!(
+                "  [under a retired namespace (retired_prefixes) — NOT deleted, review] — {} tag(s):",
+                tags.len()
+            );
+            for (img, ts) in tags_by_image(tags) {
+                println!("       {img}: {}", ts.join(", "));
             }
         }
     }
 
-    for (repo, tags) in cache_contents {
-        let fp: Vec<&TagRef> = tags.iter().filter(|t| is_fp(&t.image)).collect();
-        println!(
-            "\n{repo} (cache — untouched) — {} first-party tag(s):",
-            fp.len()
-        );
-        for (img, tags) in by_image(&fp) {
-            println!("       {img}: {}", tags.join(", "));
+    // Cache/check repos — never written to; shown for reference.
+    if !cache_contents.is_empty() {
+        let is_fp = |image: &str| {
+            first_party_prefixes
+                .iter()
+                .any(|pre| image.starts_with(pre.as_str()))
+        };
+        println!("\n================ Cache repos (untouched — reference) ================");
+        for (repo, tags) in cache_contents {
+            let fp: Vec<&TagRef> = tags.iter().filter(|t| is_fp(&t.image)).collect();
+            println!("\n{repo}: {} first-party tag(s) it serves:", fp.len());
+            for (img, ts) in tags_by_image(&fp) {
+                println!("       {img}: {}", ts.join(", "));
+            }
         }
-    }
-}
-
-/// Format the last-accessed annotation for a tag line. Empty when no usage repo
-/// is configured; otherwise `[pulled DATE]` if the usage repo served the tag, or
-/// `[absent from <repo>]` if it has no copy (a strong "stale, safe to drop" hint).
-fn atime_note(
-    usage_repo: Option<&str>,
-    atimes: &HashMap<(String, String), String>,
-    image: &str,
-    tag: &str,
-) -> String {
-    match usage_repo {
-        Some(ur) => match atimes.get(&(image.to_string(), tag.to_string())) {
-            Some(date) => format!("  [pulled {date}]"),
-            None => format!("  [absent from {ur}]"),
-        },
-        None => String::new(),
     }
 }
 
@@ -1689,17 +1644,9 @@ fn class_label(m: &str) -> &str {
 /// route there), the three distinct removal kinds spelled out, then
 /// review/kept/unmatched. Printed at the top and again at the bottom (beside the
 /// repository/remaining data) so the counts are visible without scrolling.
-fn print_overview(
-    p: &ResolvedPlan,
-    copy: bool,
-    usage_repo: Option<&str>,
-    dest_classes: &BTreeMap<String, Vec<String>>,
-) {
+fn print_overview(p: &ResolvedPlan, copy: bool, dest_classes: &BTreeMap<String, Vec<String>>) {
     let verb = if copy { "copy" } else { "move" };
     println!("================ Reorg plan ({verb}) — summary ================");
-    if let Some(ur) = usage_repo {
-        println!("Usage annotations '[pulled DATE]' show last access from '{ur}'.");
-    }
 
     // Moves grouped by destination, annotated with the routing tag classes so
     // the per-destination counts are self-explanatory.
@@ -1743,7 +1690,7 @@ fn print_overview(
     // Insight images the upstream unexpectedly lacks — flagged, never dropped.
     if !p.insight_absent.is_empty() {
         println!(
-            "  Insight ⚠ {:>6} tag(s) — insight image ABSENT upstream; NOT dropped (may be the only copy)",
+            "  Restore?  {:>6} tag(s) — insight image ABSENT upstream; restore-to-insight candidate (review), never dropped",
             p.insight_absent.len()
         );
     }
@@ -1799,7 +1746,7 @@ fn print_overview(
         let clobber = p
             .superseded
             .iter()
-            .filter(|s| s.kept.starts_with("existing copy"))
+            .filter(|s| s.kept.contains("existing copy"))
             .count();
         let dup = p.superseded.len() - clobber;
         println!(
@@ -1919,268 +1866,285 @@ async fn print_destination_retention(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_plan(
     p: &ResolvedPlan,
+    groups: &[CompiledGroup],
     copy: bool,
-    usage_repo: Option<&str>,
-    atimes: &HashMap<(String, String), String>,
     verbose: bool,
     dest_classes: &BTreeMap<String, Vec<String>>,
-    class_order: &[String],
     class_patterns: &BTreeMap<String, String>,
 ) {
-    let verb = if copy { "copy" } else { "move" };
-    let del_note = if copy { " (skipped: --copy)" } else { "" };
-
     // One-screen summary up top (the caller repeats it at the bottom, beside the
     // repository/remaining data, so you needn't scroll back up).
-    print_overview(p, copy, usage_repo, dest_classes);
+    print_overview(p, copy, dest_classes);
+    // Then the per-rule detail: for each rule, what MOVES, what's REMOVED, and
+    // what's NOT MOVING (with the reason).
+    print_by_rule(p, groups, copy, verbose, class_patterns);
+}
 
-    // The per-tag move list is large (often thousands of lines). Show it only
-    // with --verbose, so the consequential sections (removals, mismatches) stay
-    // visible without scrolling. The summary already breaks moves down by dest.
-    if verbose {
-        // Group by the matching rule (class) so you can audit each rule's exact
-        // effect. Print groups in rule-evaluation order (catch-all last), not
-        // alphabetically. Each class routes to one destination.
-        let mut by_class: BTreeMap<&str, Vec<&PlannedMove>> = BTreeMap::new();
-        for m in &p.moves {
-            by_class.entry(m.class.as_str()).or_default().push(m);
-        }
-        // Rule order first, then any leftover classes (e.g. "unmatched") after.
-        let mut ordered: Vec<&str> = class_order
-            .iter()
-            .map(|c| c.as_str())
-            .filter(|c| by_class.contains_key(c))
-            .collect();
-        for c in by_class.keys() {
-            if !ordered.contains(c) {
-                ordered.push(c);
+/// Group a set of tag refs by image, sorted tags per image.
+fn tags_by_image(tags: &[&TagRef]) -> BTreeMap<String, Vec<String>> {
+    let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for t in tags {
+        m.entry(t.image.clone()).or_default().push(t.tag.clone());
+    }
+    for v in m.values_mut() {
+        v.sort();
+    }
+    m
+}
+
+/// Rule-centric plan detail. Walks each group's rules in evaluation order and,
+/// for each, prints what it MOVES, what it REMOVEs (deletes), and what it leaves
+/// NOT MOVING — every "not moving" outcome under its own reason. Outcomes are
+/// attributed to a rule by re-running the matcher (`image,tag → rule class`), so
+/// the flat plan buckets need no per-rule bookkeeping. Moves and the (large)
+/// already-in-place set are counts unless `--verbose`; the small not-moving
+/// reasons always list.
+fn print_by_rule(
+    p: &ResolvedPlan,
+    groups: &[CompiledGroup],
+    copy: bool,
+    verbose: bool,
+    class_patterns: &BTreeMap<String, String>,
+) {
+    let did = if copy { "copied" } else { "moved" };
+    let created = |o: &Option<String>| {
+        o.as_deref()
+            .map(|s| s.get(0..10).unwrap_or(s).to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+
+    println!("\n================ Plan by rule ================");
+    println!("Per rule: what MOVES, what's REMOVED (deleted), and what's NOT MOVING (by reason).");
+
+    for g in groups {
+        // The matched-rule class of a first-party tag within this group.
+        let class_of = |image: &str, tag: &str| -> Option<String> {
+            g.is_first_party(image)
+                .then(|| move_class(g, image, tag).to_string())
+        };
+        for r in &g.rules {
+            let class = r.class.as_str();
+            let same = |c: Option<String>| c.as_deref() == Some(class);
+
+            let moves: Vec<&PlannedMove> = p.moves.iter().filter(|m| m.class == class).collect();
+            let removed: Vec<&DeleteItem> = p
+                .deletes
+                .iter()
+                .filter(|d| same(class_of(&d.tag.image, &d.tag.tag)))
+                .collect();
+            let superseded: Vec<&SupersededItem> = p
+                .superseded
+                .iter()
+                .filter(|s| same(class_of(&s.tag.image, &s.tag.tag)))
+                .collect();
+            let insight_absent: Vec<&TagRef> = p
+                .insight_absent
+                .iter()
+                .filter(|t| same(class_of(&t.image, &t.tag)))
+                .collect();
+            let needs: Vec<&TriageItem> = p
+                .needs_classification
+                .iter()
+                .filter(|t| same(class_of(&t.tag.image, &t.tag.tag)))
+                .collect();
+            let mism: Vec<&MismatchInfo> = p
+                .mismatched
+                .iter()
+                .filter(|m| same(class_of(&m.tag.image, &m.tag.tag)))
+                .collect();
+            let kept: Vec<&TagRef> = p
+                .kept
+                .iter()
+                .filter(|t| same(class_of(&t.image, &t.tag)))
+                .collect();
+            let placed = p.already_placed_by_class.get(class).copied().unwrap_or(0);
+
+            if moves.is_empty()
+                && removed.is_empty()
+                && superseded.is_empty()
+                && insight_absent.is_empty()
+                && needs.is_empty()
+                && mism.is_empty()
+                && kept.is_empty()
+                && placed == 0
+            {
+                continue;
             }
-        }
-        println!(
-            "\nPlanned {verb}s ({} tag(s)) — grouped by matching rule:",
-            p.moves.len()
-        );
-        for class in ordered {
-            let moves = &by_class[class];
-            let dest = moves.first().map(|m| m.dest.as_str()).unwrap_or("?");
+
             let pat = class_patterns
                 .get(class)
                 .map(|p| format!(" /{p}/"))
                 .unwrap_or_default();
-            println!("  rule '{class}'{pat} → {dest} ({} tag(s)):", moves.len());
-            for m in moves {
-                let note = atime_note(usage_repo, atimes, &m.image, &m.tag);
-                println!("       {}/{}:{}{note}", m.source_repo, m.image, m.tag);
-            }
-        }
-    } else if !p.moves.is_empty() {
-        println!(
-            "\nPlanned {verb}s: {} tag(s) — summarized by destination above \
-             (re-run with --verbose for the full per-tag list, grouped by rule).",
-            p.moves.len()
-        );
-    }
-
-    println!(
-        "\nDrop — redundant duplicates{del_note} ({} tag(s)):",
-        p.deletes.len()
-    );
-    // Group by the recorded reason so each delete explains itself (redundant
-    // duplicate already in the check repo / absent from the check repo / matched
-    // an explicit delete rule) rather than appearing as an unexplained list.
-    let mut by_reason: BTreeMap<&str, Vec<&DeleteItem>> = BTreeMap::new();
-    for d in &p.deletes {
-        by_reason.entry(d.reason.as_str()).or_default().push(d);
-    }
-    for (reason, items) in &by_reason {
-        println!("  {reason} — {} tag(s):", items.len());
-        for d in items {
-            let note = atime_note(usage_repo, atimes, &d.tag.image, &d.tag.tag);
-            println!(
-                "       {}/{}:{}{note}",
-                d.tag.source_repo, d.tag.image, d.tag.tag
-            );
-        }
-    }
-
-    if !p.purges.is_empty() {
-        let mut by_repo: BTreeMap<&str, usize> = BTreeMap::new();
-        for t in &p.purges {
-            *by_repo.entry(t.source_repo.as_str()).or_default() += 1;
-        }
-        println!(
-            "\nFlagged — third-party remainder in drained purge repo(s) ({} tag(s) across {} repo(s)) \
-             — NOT deleted; first-party was re-homed, this is what's left to review:",
-            p.purges.len(),
-            by_repo.len()
-        );
-        for (repo, n) in &by_repo {
-            println!("  {repo}: {n} tag(s)");
-        }
-    }
-
-    if !p.prefix_deletes.is_empty() {
-        // Retired-prefix tags — flagged for review, NOT deleted. Listed in full
-        // (grouped by repo then image) since these are the ones to eyeball.
-        println!(
-            "\nFlagged — retired-prefix tags (retired_prefixes) ({} tag(s)) — NOT deleted, review:",
-            p.prefix_deletes.len()
-        );
-        let mut by_repo: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
-        for t in &p.prefix_deletes {
-            by_repo
-                .entry(t.source_repo.as_str())
-                .or_default()
-                .entry(t.image.as_str())
-                .or_default()
-                .push(t.tag.as_str());
-        }
-        for (repo, by_img) in &by_repo {
-            let n: usize = by_img.values().map(|v| v.len()).sum();
-            println!("  {repo} ({n} tag(s)):");
-            for (img, tags) in by_img {
-                let mut ts = tags.clone();
-                ts.sort();
-                println!("       {img}: {}", ts.join(", "));
-            }
-        }
-    }
-
-    // Superseded — moves auto-dropped to avoid a clobber/duplicate. The decision
-    // is by CREATE date: this copy's create date vs the kept copy's, both shown.
-    if !p.superseded.is_empty() {
-        println!(
-            "\nSuperseded ({} tag(s)) — move skipped to avoid a clobber/duplicate; left in source \
-             (not deleted). Compared by create date (dropped copy vs kept copy):",
-            p.superseded.len()
-        );
-        let created = |o: &Option<String>| {
-            o.as_deref()
-                .map(|s| s.get(0..10).unwrap_or(s).to_string())
-                .unwrap_or_else(|| "?".to_string())
-        };
-        for s in &p.superseded {
-            println!(
-                "       {}/{}:{} (created {}) -> {} dest {} — kept {} (created {})",
-                s.tag.source_repo,
-                s.tag.image,
-                s.tag.tag,
-                created(&s.own_built),
-                verb,
-                s.dest,
-                s.kept,
-                created(&s.winner_built),
-            );
-        }
-    }
-
-    if !p.kept.is_empty() {
-        println!(
-            "\nKept ({} tag(s)) — already present in the check repo, left in place:",
-            p.kept.len()
-        );
-        for k in &p.kept {
-            let note = atime_note(usage_repo, atimes, &k.image, &k.tag);
-            println!("       {}/{}:{}{note}", k.source_repo, k.image, k.tag);
-        }
-    }
-
-    if !p.mismatched.is_empty() {
-        let asks = p
-            .mismatched
-            .iter()
-            .filter(|m| m.on_mismatch == MismatchPolicy::Ask)
-            .count();
-        println!(
-            "\nReconcile mismatch ({} tag(s)) — in the check repo but a DIFFERENT digest. \
-             {} will prompt for a decision on --apply; the rest are left for review:",
-            p.mismatched.len(),
-            asks
-        );
-        for m in &p.mismatched {
-            let note = atime_note(usage_repo, atimes, &m.tag.image, &m.tag.tag);
-            println!(
-                "       {}/{}:{}{note}",
-                m.tag.source_repo, m.tag.image, m.tag.tag
-            );
-            print_mismatch_evidence(m);
-        }
-    }
-
-    // Insight images the upstream unexpectedly lacks — flagged, never dropped.
-    if !p.insight_absent.is_empty() {
-        println!(
-            "\nInsight absent ({} tag(s)) — classified INSIGHT but absent upstream; NOT dropped \
-             (the source copy may be the only one) — review:",
-            p.insight_absent.len()
-        );
-        let mut by_repo: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
-        for t in &p.insight_absent {
-            by_repo
-                .entry(t.source_repo.as_str())
-                .or_default()
-                .entry(t.image.as_str())
-                .or_default()
-                .push(t.tag.as_str());
-        }
-        for (repo, by_img) in &by_repo {
-            println!("  {repo}:");
-            for (img, tags) in by_img {
-                let mut ts = tags.clone();
-                ts.sort();
-                println!("       {img}: {}", ts.join(", "));
-            }
-        }
-    }
-
-    // Needs classification — released image on neither classify list. Reported
-    // with evidence (upstream presence + a hint) so each can be assigned to the
-    // insight or aux list. Never moved or deleted.
-    if !p.needs_classification.is_empty() {
-        println!(
-            "\nNeeds classification ({} tag(s)) — released image on NEITHER classify list; \
-             add each image to insight_images or aux_images, then re-run (not moved/deleted):",
-            p.needs_classification.len()
-        );
-        // Group by image so the operator decides per image, not per tag, with the
-        // shared hint shown once.
-        let mut by_image: BTreeMap<&str, (Vec<&TriageItem>, &TriageItem)> = BTreeMap::new();
-        for t in &p.needs_classification {
-            let e = by_image
-                .entry(t.tag.image.as_str())
-                .or_insert_with(|| (Vec::new(), t));
-            e.0.push(t);
-        }
-        for (image, (items, sample)) in &by_image {
-            println!("  {image} — {} ({}):", sample.hint(), items.len());
-            for t in items {
-                let built = t
-                    .source_built
+            // Name the repo(s) this rule targets in the header, so it's clear
+            // where a rule sends things even when nothing actually moves (e.g. a
+            // develop rule whose tags are all already in place / superseded).
+            let target = match r.action {
+                Action::Move | Action::Reconcile => r
+                    .dest
                     .as_deref()
-                    .map(|b| format!("  [built {b}]"))
-                    .unwrap_or_default();
-                let note = atime_note(usage_repo, atimes, &t.tag.image, &t.tag.tag);
+                    .map(|d| format!(" → {d}"))
+                    .unwrap_or_default(),
+                Action::Classify => format!(
+                    " → {} (aux) · verify vs {} (insight)",
+                    r.aux_dest.as_deref().unwrap_or("?"),
+                    r.insight_repo.as_deref().unwrap_or("?"),
+                ),
+                Action::DeleteIfAbsent => r
+                    .check
+                    .as_deref()
+                    .map(|c| format!(" → delete from source if absent from {c}"))
+                    .unwrap_or_default(),
+                Action::Delete => " → delete from source".to_string(),
+                Action::Leave => " → leave in place".to_string(),
+            };
+            println!("\nrule '{class}'{pat}{target}");
+
+            // MOVE — count by default; list under --verbose.
+            if !moves.is_empty() {
+                let dest = moves[0].dest.as_str();
+                if verbose {
+                    println!("   MOVE → {dest}: {} tag(s):", moves.len());
+                    for m in &moves {
+                        println!("        {}/{}:{}", m.source_repo, m.image, m.tag);
+                    }
+                } else {
+                    println!(
+                        "   MOVE → {dest}: {} tag(s)  (--verbose to list)",
+                        moves.len()
+                    );
+                }
+            }
+
+            // REMOVE — deletes from source, grouped by the recorded reason, each
+            // tag annotated with its create date.
+            if !removed.is_empty() {
+                let skip = if copy { " (skipped: --copy)" } else { "" };
                 println!(
-                    "       {}/{}:{}{built}{note}",
-                    t.tag.source_repo, t.tag.image, t.tag.tag
+                    "   REMOVE — delete from source{skip}: {} tag(s):",
+                    removed.len()
                 );
+                let mut by_reason: BTreeMap<&str, Vec<&DeleteItem>> = BTreeMap::new();
+                for d in &removed {
+                    by_reason.entry(d.reason.as_str()).or_default().push(d);
+                }
+                for (reason, items) in &by_reason {
+                    println!("     · {reason} — {} tag(s):", items.len());
+                    for d in items {
+                        println!(
+                            "          {}/{}:{} (created {})",
+                            d.tag.source_repo,
+                            d.tag.image,
+                            d.tag.tag,
+                            p.created_date(&d.tag)
+                        );
+                    }
+                }
+            }
+
+            // NOT MOVING — every reason as its own line.
+            if placed > 0
+                || !superseded.is_empty()
+                || !insight_absent.is_empty()
+                || !needs.is_empty()
+                || !mism.is_empty()
+                || !kept.is_empty()
+            {
+                println!("   NOT MOVING:");
+                if placed > 0 {
+                    println!("     · already in place (self-move skipped) — {placed} tag(s)");
+                }
+                if !superseded.is_empty() {
+                    println!(
+                        "     · superseded — would clobber the dest / duplicate a newer source — {} tag(s):",
+                        superseded.len()
+                    );
+                    for s in &superseded {
+                        println!(
+                            "          {}/{}:{} (created {}) — NOT {did} to {}; kept {} (created {})",
+                            s.tag.source_repo,
+                            s.tag.image,
+                            s.tag.tag,
+                            created(&s.own_built),
+                            s.dest,
+                            s.kept,
+                            created(&s.winner_built),
+                        );
+                    }
+                }
+                if !insight_absent.is_empty() {
+                    println!(
+                        "     · insight image absent upstream — restore-to-insight candidate (review; may have been intentionally pruned), never dropped — {} tag(s):",
+                        insight_absent.len()
+                    );
+                    for t in &insight_absent {
+                        println!(
+                            "          {}/{}:{} (created {})",
+                            t.source_repo,
+                            t.image,
+                            t.tag,
+                            p.created_date(t)
+                        );
+                    }
+                }
+                if !needs.is_empty() {
+                    println!(
+                        "     · needs classification — on neither insight nor aux list — {} tag(s):",
+                        needs.len()
+                    );
+                    let mut by_image: BTreeMap<&str, (Vec<&str>, &TriageItem)> = BTreeMap::new();
+                    for t in &needs {
+                        let e = by_image
+                            .entry(t.tag.image.as_str())
+                            .or_insert_with(|| (Vec::new(), t));
+                        e.0.push(t.tag.tag.as_str());
+                    }
+                    for (image, (mut tags, sample)) in by_image {
+                        tags.sort();
+                        println!(
+                            "          {image} — {} — {}",
+                            sample.hint(),
+                            tags.join(", ")
+                        );
+                    }
+                }
+                if !mism.is_empty() {
+                    let asks = mism
+                        .iter()
+                        .filter(|m| m.on_mismatch == MismatchPolicy::Ask)
+                        .count();
+                    println!(
+                        "     · reconcile mismatch — different digest, review ({asks} prompt on --apply) — {} tag(s):",
+                        mism.len()
+                    );
+                    for m in &mism {
+                        println!(
+                            "          {}/{}:{}",
+                            m.tag.source_repo, m.tag.image, m.tag.tag
+                        );
+                        print_mismatch_evidence(m);
+                    }
+                }
+                if !kept.is_empty() {
+                    println!(
+                        "     · kept — already present in the check repo — {} tag(s)",
+                        kept.len()
+                    );
+                }
             }
         }
     }
 
-    if p.leaves.is_empty() {
-        println!("\nUnclassified: none.");
-    } else {
+    // Tags that matched NO rule (only when there is no catch-all rule).
+    if !p.leaves.is_empty() {
         println!(
-            "\nUnclassified ({} tag(s)) — no rule matched, left in place:",
+            "\nrule '(none)' — unmatched, no rule applied — {} tag(s):",
             p.leaves.len()
         );
-        for l in &p.leaves {
-            let note = atime_note(usage_repo, atimes, &l.image, &l.tag);
-            println!("       {}/{}:{}{note}", l.source_repo, l.image, l.tag);
+        let refs: Vec<&TagRef> = p.leaves.iter().collect();
+        for (img, tags) in tags_by_image(&refs) {
+            println!("        {img}: {}", tags.join(", "));
         }
     }
 }
@@ -2440,17 +2404,22 @@ async fn check_cache_authority(
     let nr: usize = non_release.values().map(|v| v.len()).sum();
     let rf: usize = release_fmt.values().map(|v| v.len()).sum();
     println!(
-        "  {n} tag(s) in '{}' NOT upstream — candidates for deletion (NOT auto-deleted, review):",
+        "  {n} tag(s) in '{}' NOT upstream (NOT auto-changed, review):",
         authority.cache_repo
     );
     if nr > 0 {
-        println!("    non-release ({nr}) — not x.y.z; high-confidence pollution to delete:");
+        println!(
+            "    non-release ({nr}) — not x.y.z; high-confidence pollution to DELETE from cache:"
+        );
         for (img, ts) in &non_release {
             println!("       {img}: {}", ts.join(", "));
         }
     }
     if rf > 0 {
-        println!("    release-format ({rf}) — x.y.z but absent upstream; review before deleting:");
+        println!(
+            "    release-format ({rf}) — x.y.z in cache but absent upstream; RESTORE-to-insight candidate \
+             OR delete from cache — review:"
+        );
         for (img, ts) in &release_fmt {
             println!("       {img}: {}", ts.join(", "));
         }
@@ -2481,13 +2450,13 @@ fn cache_pollution(
 /// interactive `ask` prompt.
 fn print_mismatch_evidence(m: &MismatchInfo) {
     println!(
-        "            source ({}): built {}  [{}]",
+        "            source ({}): created {}  [{}]",
         m.tag.source_repo,
         m.source_built.as_deref().unwrap_or("?"),
         short(&m.source_digest)
     );
     println!(
-        "            check  ({}): built {}  [{}]",
+        "            check  ({}): created {}  [{}]",
         m.check_repo,
         m.check_built.as_deref().unwrap_or("?"),
         short(&m.check_digest)
@@ -2569,27 +2538,6 @@ fn prompt_yes_no(question: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn atime_note_formats() {
-        let mut m = HashMap::new();
-        m.insert(
-            ("myriad/dev".to_string(), "develop".to_string()),
-            "2026-06-25".to_string(),
-        );
-        // No usage repo configured → no annotation.
-        assert_eq!(atime_note(None, &m, "myriad/dev", "develop"), "");
-        // Present in the usage repo → last-pull date.
-        assert_eq!(
-            atime_note(Some("docker"), &m, "myriad/dev", "develop"),
-            "  [pulled 2026-06-25]"
-        );
-        // Absent from the usage repo → flagged (stale hint).
-        assert_eq!(
-            atime_note(Some("docker"), &m, "myriad/dev", "missing"),
-            "  [absent from docker]"
-        );
-    }
 
     const SAMPLE: &str = r#"
         [patterns]
@@ -3126,7 +3074,6 @@ mod tests {
             },
             upstream_present: present,
             upstream_same_digest: same,
-            source_built: None,
         };
         assert!(mk(true, true).hint().contains("INSIGHT"));
         assert!(mk(true, false).hint().contains("INSIGHT"));
