@@ -35,8 +35,10 @@ const BOOKKEEPING = ['_manifests', '_blobs', '_tags']
 // holds the tag rows fetched from _tags/.
 const atImage = ref(false)
 const dockerTagItems = ref<DisplayItem[]>([])
+// Docker browse is tags-first in BOTH modes (so Copy pull / Download stay put).
+// Expert is additive: it reveals the raw bookkeeping dirs and the Delete action.
 const dockerDefault = computed(
-  () => isDocker.value && !expert.value && !isSearchMode.value,
+  () => isDocker.value && !isSearchMode.value,
 )
 function toggleExpert() {
   expert.value = !expert.value
@@ -59,6 +61,7 @@ async function ensureCatalog() {
 function dockerType(item: DisplayItem): string {
   if (item.kind === 'tag') return 'tag'
   if (!item.isDir) return item.content_type || 'file'
+  if (BOOKKEEPING.includes(item.name)) return 'storage'
   return dockerImageSet.value.has(item.path.replace(/\/+$/, '')) ? 'image' : 'namespace'
 }
 
@@ -81,6 +84,27 @@ async function copyPull(item: DisplayItem, e: Event) {
     setTimeout(() => { if (copiedTag.value === item.name) copiedTag.value = '' }, 1500)
   } catch {
     /* clipboard unavailable (insecure context) */
+  }
+}
+
+// Download a tag's manifest JSON (a tag has no blob of its own; the manifest is
+// the single downloadable document). Fetched with auth, then saved client-side.
+async function downloadManifest(item: DisplayItem, e: Event) {
+  e.stopPropagation()
+  const image = prefix.value.replace(/\/+$/, '')
+  try {
+    const { data } = await api.getDockerManifest(props.repoName, image, item.name)
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${item.name}.manifest.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  } catch {
+    /* manifest unavailable (e.g. retention-deleted tag) */
   }
 }
 
@@ -288,22 +312,46 @@ const displayItems = computed((): DisplayItem[] => {
     }))
   }
 
-  // Docker default view: at an image show its tags; otherwise list child
-  // namespaces/images with bookkeeping dirs hidden.
+  // Docker browse: tags-first at an image; namespaces/images otherwise.
+  // Expert is additive — it reveals the raw bookkeeping dirs (_manifests/_blobs)
+  // and lets you drill into them; the friendly tag list (with Copy pull /
+  // Download) stays visible in both modes.
   if (dockerDefault.value) {
-    if (atImage.value) return dockerTagItems.value
-    return dirs.value
-      .filter(d => !BOOKKEEPING.includes(d.name))
-      .map(d => ({
-        name: d.name,
-        path: prefix.value + d.name + '/',
-        isDir: true,
-        size: d.total_bytes,
-        content_type: '',
-        updated_at: d.last_modified_at,
-        artifact_count: d.artifact_count,
-        total_bytes: d.total_bytes,
+    const toDir = (d: DirInfo): DisplayItem => ({
+      name: d.name,
+      path: prefix.value + d.name + '/',
+      isDir: true,
+      size: d.total_bytes,
+      content_type: '',
+      updated_at: d.last_modified_at,
+      artifact_count: d.artifact_count,
+      total_bytes: d.total_bytes,
+    })
+    // Expert drill-in to a bookkeeping dir → show the raw records.
+    const inBookkeeping = BOOKKEEPING.some(b => prefix.value.includes(b + '/'))
+    if (expert.value && inBookkeeping) {
+      const dItems = dirs.value.map(toDir)
+      const fItems: DisplayItem[] = artifacts.value.map(a => ({
+        name: a.path,
+        path: prefix.value + a.path,
+        isDir: false,
+        size: a.size,
+        content_type: a.content_type,
+        updated_at: a.updated_at,
       }))
+      return [...dItems, ...fItems]
+    }
+    if (atImage.value) {
+      if (!expert.value) return dockerTagItems.value
+      // Expert at an image: tags (with actions) + the raw storage dirs.
+      const storage = dirs.value
+        .filter(d => d.name === '_manifests' || d.name === '_blobs')
+        .map(toDir)
+      return [...dockerTagItems.value, ...storage]
+    }
+    return dirs.value
+      .filter(d => expert.value || !BOOKKEEPING.includes(d.name))
+      .map(toDir)
   }
 
   const dirItems: DisplayItem[] = dirs.value.map(d => ({
@@ -782,24 +830,29 @@ watch(
             </td>
             <td>{{ formatDate(item.updated_at) }}</td>
             <td>
-              <!-- Docker default view: a tag offers its `docker pull` command;
-                   managing (raw layers, delete) is done via Expert. -->
-              <template v-if="dockerDefault && item.kind === 'tag'">
+              <!-- Docker tag: Copy pull + Download for everyone (both modes);
+                   Delete only with Expert on AND admin. -->
+              <template v-if="item.kind === 'tag'">
                 <button
                   v-if="hasDefaultDockerGroup"
                   class="act-link"
                   :title="pullCommand(item.name)"
                   @click="copyPull(item, $event)"
                 >{{ copiedTag === item.name ? 'Copied ✓' : 'Copy pull' }}</button>
+                <button class="act-link" title="Download manifest" @click="downloadManifest(item, $event)">Download</button>
+                <button v-if="expert && isAdmin()" class="act-link act-delete" @click="confirmDelete(item.path, $event)" title="Delete tag">Delete</button>
               </template>
-              <template v-else-if="dockerDefault" />
+              <!-- Docker namespace/image folder in the default (non-expert) view: no actions. -->
+              <template v-else-if="dockerDefault && !expert && item.isDir" />
+              <!-- Directory (non-docker, or docker bookkeeping revealed in Expert). -->
               <template v-else-if="item.isDir">
                 <button class="act-link" @click="confirmDirDownload(item, $event)" title="Download directory">Download</button>
-                <button class="act-link act-delete" @click="confirmDirDelete(item, $event)" title="Delete directory">Delete</button>
+                <button v-if="isAdmin()" class="act-link act-delete" @click="confirmDirDelete(item, $event)" title="Delete directory">Delete</button>
               </template>
+              <!-- Raw file. -->
               <template v-else>
                 <a :href="downloadUrl(item.path)" target="_blank" class="act-link" title="Download" @click.stop>Download</a>
-                <button class="act-link act-delete" @click="confirmDelete(item.path, $event)" title="Delete">Delete</button>
+                <button v-if="isAdmin()" class="act-link act-delete" @click="confirmDelete(item.path, $event)" title="Delete">Delete</button>
               </template>
             </td>
           </tr>
