@@ -48,6 +48,12 @@ insight_images = [
   "myriad/s3",
   "myriad/target",
   "myriad/tools",
+  # retired from the pipeline but historical release tags remain — class
+  # recovered from git history (MYR-6437 removed policy_*, MYR-6646 filesvc_logs;
+  # all published -O ${DOCKER_EXTERNAL} = insight)
+  "myriad/policy_agent",
+  "myriad/policy_server",
+  "myriad/filesvc_logs",
   # qkp (3 + arch variants)
   "qkp/quantum_leaf",
   "qkp/quantum_mgmt",
@@ -99,6 +105,10 @@ aux_images = [
   "myriad/builder_elbencho_ubuntu22_x86_64",
   "myriad/builder_ubuntu22_arm64",
   "myriad/builder_ubuntu22_x86_64",
+  # retired from the pipeline (MYR-6437); class recovered from git history
+  # (published -O ${DOCKER_INTERNAL} = aux)
+  "myriad/policy_agent_debug",
+  "myriad/policy_server_debug",
   # qkp (14 + arch variants)
   "qkp/builder_go",
   "qkp/builder_ubuntu22",
