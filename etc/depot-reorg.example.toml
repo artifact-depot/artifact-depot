@@ -60,9 +60,15 @@ format               = "docker"
 source_repos         = [
     "docker-internal", "docker-external",
     "docker-prerelease", "docker-development-local", "docker-release-aux",
+    # docker-upstream is scanned as a source too: drain first-party + retired
+    # from it, but LEAVE (and don't report) its third-party cache images — the
+    # repo itself is kept, only the first-party/retired prefixes are purged.
+    "docker-upstream",
 ]
 first_party_prefixes = ["myriad/", "qkp/", "quantum-orchestrator/"]
-purge_repos          = ["docker-upstream"]   # dead cache (upstream gone): emptied wholesale
+# No wholesale-purge repos: third-party images outside first_party_prefixes /
+# retired_prefixes are none of the reorg's business and are left untouched.
+purge_repos          = []
 # Retired/renamed namespaces — every tag under these is deleted from the source
 # repos (e.g. the project was renamed to quantum-orchestrator/).
 retired_prefixes      = ["orchestrator/", "quantum_orchestrator/"]

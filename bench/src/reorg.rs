@@ -523,6 +523,24 @@ impl MismatchInfo {
             _ => "build time unavailable for one or both — review manually",
         }
     }
+
+    /// A suggested action from the same evidence. `check_repo` is the canonical,
+    /// customer-facing copy and the source is being drained, so unless the
+    /// source is genuinely newer we recommend dropping the redundant source.
+    fn recommendation(&self) -> &'static str {
+        match (self.source_built.as_deref(), self.check_built.as_deref()) {
+            (Some(s), Some(c)) if s < c => {
+                "recommend: DELETE the source copy — the insight copy is newer"
+            }
+            (Some(s), Some(c)) if s > c => {
+                "recommend: KEEP the source and review — it may be a newer build that never reached insight"
+            }
+            (Some(_), Some(_)) => {
+                "recommend: DELETE the source copy — same build, keep the customer-facing insight copy"
+            }
+            _ => "recommend: inspect both manifests before deciding",
+        }
+    }
 }
 
 /// A planned source-tag deletion together with the reason it's being removed,
@@ -1601,6 +1619,7 @@ fn print_residuals(
     p: &ResolvedPlan,
     cache_contents: &BTreeMap<String, Vec<TagRef>>,
     first_party_prefixes: &[String],
+    released: Option<&Regex>,
 ) {
     // Purge repos (drained): first-party was re-homed by the rules; the
     // non-first-party remainder is stale public-cache content — counted only
@@ -1653,6 +1672,21 @@ fn print_residuals(
             println!("\n{repo}: {} first-party tag(s) it serves:", fp.len());
             for (img, ts) in tags_by_image(&fp) {
                 println!("       {img}: {}", ts.join(", "));
+            }
+            // A customer-facing release cache should serve only released x.y.z
+            // versions; suggest pruning any dev/rc/develop/ci tags that leaked in
+            // (removed from the upstream release registry, not this cache).
+            if let Some(re) = released {
+                let stray: Vec<&TagRef> = fp.iter().copied().filter(|t| !re.is_match(&t.tag)).collect();
+                if !stray.is_empty() {
+                    println!(
+                        "  ⚠ suggest removing {} non-released tag(s) (not an x.y.z version) from the release set:",
+                        stray.len()
+                    );
+                    for (img, ts) in tags_by_image(&stray) {
+                        println!("       {img}: {}", ts.join(", "));
+                    }
+                }
             }
         }
     }
@@ -2489,6 +2523,7 @@ fn print_mismatch_evidence(m: &MismatchInfo) {
         short(&m.check_digest)
     );
     println!("            -> {}", m.assessment());
+    println!("            -> {}", m.recommendation());
 }
 
 /// Resolve an image's full build timestamp = its config blob's `created` field
