@@ -89,11 +89,12 @@ pub struct Rule {
     /// Presence-check repo for `delete_if_absent`.
     #[serde(default)]
     pub check: Option<String>,
-    /// `reconcile` only: what to do when the tag is present in the check repo
-    /// with a *different* digest. The script never guesses which copy is correct.
-    /// `leave` (default) parks it for review (report-only); `ask` shows the
-    /// build-time/digest evidence and prompts the operator per tag during `--apply`.
-    /// For `classify`, this governs the insight-image *different-digest* case.
+    /// `reconcile`/`classify`: what to do when the tag is present in the check
+    /// repo with a *different* digest. Default (`delete`): the tag joins the
+    /// `mismatch` --apply group — deleted from source by `--apply mismatch`
+    /// when the check copy is newer or the same build (a NEWER source is always
+    /// kept for review). `leave` opts the rule out: every mismatch is parked
+    /// for review, regardless of evidence.
     #[serde(default)]
     pub on_mismatch: Option<MismatchPolicy>,
     /// `classify` only: destination for an image on the `aux_images` list.
@@ -124,16 +125,18 @@ pub struct ImageClassesFile {
     pub aux_images: Vec<String>,
 }
 
-/// Policy for a reconcile rule when the source and check-repo digests differ.
+/// Policy for a reconcile/classify rule when the source and check-repo digests
+/// differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MismatchPolicy {
-    /// Leave the source copy in place and flag it for review (safe default).
+    /// Default: the tag is eligible for the `mismatch` --apply group. The
+    /// source copy is deleted by `--apply mismatch` when the check copy is
+    /// newer or the same build; a NEWER source is always kept for review.
     #[default]
+    Delete,
+    /// Never delete: park every mismatch for review, regardless of evidence.
     Leave,
-    /// Show the evidence and prompt the operator to delete the source or keep
-    /// it. Interactive — only acts during `--apply`.
-    Ask,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,8 +496,8 @@ pub struct ReconcileItem {
 }
 
 /// A confirmed reconcile mismatch: the tag exists in `check_repo` with a
-/// *different* digest. Carries the evidence used to explain it (and, for the
-/// `ask` policy, to prompt the operator) — never an automatic verdict.
+/// *different* digest. Carries the evidence the plan shows and the `mismatch`
+/// group acts on (delete only when the check copy is newer or the same build).
 #[derive(Debug, Clone)]
 struct MismatchInfo {
     tag: TagRef,
@@ -541,6 +544,20 @@ impl MismatchInfo {
             _ => "recommend: inspect both manifests before deciding",
         }
     }
+
+    /// Whether the `mismatch` group should delete this source copy: only when it
+    /// is older than or the same build as the insight copy. A genuinely NEWER
+    /// source is never deleted (stays for review), and an explicit
+    /// `on_mismatch = "leave"` keeps the tag out of the group entirely.
+    fn recommends_delete(&self) -> bool {
+        if self.on_mismatch == MismatchPolicy::Leave {
+            return false;
+        }
+        matches!(
+            (self.source_built.as_deref(), self.check_built.as_deref()),
+            (Some(s), Some(c)) if s <= c
+        )
+    }
 }
 
 /// A planned source-tag deletion together with the reason it's being removed,
@@ -549,6 +566,16 @@ impl MismatchInfo {
 pub struct DeleteItem {
     pub tag: TagRef,
     pub reason: String,
+}
+
+/// The `--apply` group a source-side deletion belongs to. Superseded copies are
+/// their own group; every other entry in `deletes` is a redundant drop.
+fn delete_group(d: &DeleteItem) -> &'static str {
+    if d.reason.starts_with("superseded") {
+        GROUP_SUPERSEDED
+    } else {
+        GROUP_REDUNDANT
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -836,14 +863,45 @@ async fn preflight_repos(
 
 pub struct ReorgConfig {
     pub rules_path: String,
-    /// Perform the actions. When false (default), only print the plan.
-    pub apply: bool,
+    /// Action groups to execute (see [`ALL_GROUPS`]); `None` => dry run only.
+    /// A list containing `"all"` selects every group.
+    pub apply: Option<Vec<String>>,
     /// Use `staging/copy` for moves and skip all destructive actions.
     pub copy: bool,
     /// Skip TLS verification (also used for the upstream authority client).
     pub insecure: bool,
     /// Print the full per-tag move list. Default summarizes moves by destination.
     pub verbose: bool,
+}
+
+/// The selectable action groups, in report order. Each names one kind of change
+/// the reorg can make; `--apply <names>` runs exactly the ones listed.
+pub const GROUP_MOVE: &str = "move";
+pub const GROUP_REDUNDANT: &str = "redundant";
+pub const GROUP_SUPERSEDED: &str = "superseded";
+pub const GROUP_MISMATCH: &str = "mismatch";
+pub const GROUP_RETIRED: &str = "retired";
+pub const GROUP_NON_RELEASED: &str = "non-released";
+pub const ALL_GROUPS: &[&str] = &[
+    GROUP_MOVE,
+    GROUP_REDUNDANT,
+    GROUP_SUPERSEDED,
+    GROUP_MISMATCH,
+    GROUP_RETIRED,
+    GROUP_NON_RELEASED,
+];
+
+impl ReorgConfig {
+    /// True when this is a dry run (no `--apply`).
+    fn dry_run(&self) -> bool {
+        self.apply.is_none()
+    }
+    /// Whether the named action group was selected for execution.
+    fn wants(&self, group: &str) -> bool {
+        self.apply
+            .as_ref()
+            .is_some_and(|sel| sel.iter().any(|s| s == "all" || s == group))
+    }
 }
 
 /// Resolved, ready-to-execute plan (after presence checks + purge enumeration).
@@ -868,6 +926,18 @@ struct ResolvedPlan {
     /// Moves dropped to avoid clobbering an existing dest copy / duplicating a
     /// sibling source (auto-resolved: keep dest, else newest). Left in source.
     superseded: Vec<SupersededItem>,
+    /// First-party tags in the LOCAL insight cache that the UPSTREAM registry
+    /// does NOT serve (cache pollution) and that are non-released (non x.y.z).
+    /// The `non-released` group deletes these from the local cache — upstream
+    /// lacks them, so they never re-populate. Nothing is deleted upstream.
+    non_released: Vec<TagRef>,
+    /// Released (x.y.z) first-party tags in the local insight cache that the
+    /// UPSTREAM registry doesn't serve — these should be COPIED upstream (the
+    /// upstream is missing a released version), never deleted. Review only.
+    copy_upstream: Vec<TagRef>,
+    /// Why the non-released diff could not be computed (missing UPSTREAM creds /
+    /// unreachable upstream), shown in the plan instead of a count.
+    non_released_note: Option<String>,
     /// Count of tags already in their correct repo (self-move skipped).
     already_placed: usize,
     /// Per-rule-class breakdown of `already_placed`, for the by-rule report.
@@ -911,6 +981,18 @@ impl TriageItem {
 }
 
 pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
+    // Validate the requested --apply groups up front.
+    if let Some(sel) = &cfg.apply {
+        for g in sel {
+            if g != "all" && !ALL_GROUPS.contains(&g.as_str()) {
+                anyhow::bail!(
+                    "unknown --apply group '{g}'; valid groups: {} (or 'all')",
+                    ALL_GROUPS.join(", ")
+                );
+            }
+        }
+    }
+
     let text = std::fs::read_to_string(&cfg.rules_path)
         .with_context(|| format!("read rules file '{}'", cfg.rules_path))?;
     let rules = RulesFile::from_toml(&text)?;
@@ -1102,8 +1184,7 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                     }
                 } else {
                     // A real mismatch: gather the build-time evidence so the plan
-                    // can explain it (and prompt, under the `ask` policy). The
-                    // script never decides which copy is correct.
+                    // can explain it and the `mismatch` group can act on it.
                     let source_built =
                         resolve_built(client, &rec.tag.source_repo, &rec.tag.image, &rec.tag.tag)
                             .await;
@@ -1235,7 +1316,12 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                         s.tag.image.clone(),
                         s.tag.tag.clone(),
                     ),
-                    s.own_built.clone().unwrap_or_else(|| "?".to_string()),
+                    // Store the date only (drop the time), matching how the
+                    // other REMOVED entries print their create date.
+                    s.own_built
+                        .as_deref()
+                        .map(|d| d.split('T').next().unwrap_or(d).to_string())
+                        .unwrap_or_else(|| "?".to_string()),
                 );
                 resolved.deletes.push(DeleteItem {
                     tag: s.tag,
@@ -1271,22 +1357,11 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
     }
 
     // Which tag classes (rule `match` names) route to each move destination —
-    // lets the summary explain *why* the move counts land where they do, and the
-    // regex behind each class for the by-rule detail header.
+    // lets the AUTOMATIC zone explain *why* each destination's move count lands.
     let mut dest_classes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut class_patterns: BTreeMap<String, String> = BTreeMap::new();
     for g in &rules.group {
         for r in &g.rules {
             let class = class_label(&r.match_).to_string();
-            // Resolve the rule's `match` to its regex source (a named pattern, or
-            // the inline regex itself) so the by-rule plan can show it.
-            class_patterns.entry(class.clone()).or_insert_with(|| {
-                rules
-                    .patterns
-                    .get(&r.match_)
-                    .cloned()
-                    .unwrap_or_else(|| r.match_.clone())
-            });
             // `move`/`reconcile` route via `dest`; `classify` routes aux images
             // via `aux_dest` — annotate that destination with this class too.
             if let Some(d) = r.dest.as_ref().or(r.aux_dest.as_ref()) {
@@ -1295,14 +1370,87 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         }
     }
 
-    print_plan(
-        &resolved,
-        &groups,
-        cfg.copy,
-        cfg.verbose,
-        &dest_classes,
-        &class_patterns,
-    );
+    // Enumerate the check/insight repos' current contents (used both by the
+    // dry-run reference and by the `non-released` group), and compute the
+    // non-released (non x.y.z) first-party tags they serve — the `non-released`
+    // group's targets. Done BEFORE print_plan so the overview counts it.
+    let mut check_repos: std::collections::BTreeSet<String> = Default::default();
+    for group in &groups {
+        for r in &group.rules {
+            if let Some(c) = &r.check {
+                check_repos.insert(c.clone());
+            }
+            if let Some(c) = &r.insight_repo {
+                check_repos.insert(c.clone());
+            }
+        }
+    }
+    let mut cache_contents: BTreeMap<String, Vec<TagRef>> = BTreeMap::new();
+    for repo in &check_repos {
+        let tags = list_repo_tags(client, repo).await?;
+        cache_contents.insert(
+            repo.clone(),
+            tags.into_iter()
+                .map(|(image, tag)| TagRef {
+                    source_repo: repo.clone(),
+                    image,
+                    tag,
+                })
+                .collect(),
+        );
+    }
+    let mut prefixes: std::collections::BTreeSet<String> = Default::default();
+    for group in &groups {
+        for p in &group.first_party_prefixes {
+            prefixes.insert(p.clone());
+        }
+    }
+    let prefixes: Vec<String> = prefixes.into_iter().collect();
+    let released_re = compile_match(&rules.patterns, "released").ok();
+    // The `non-released` group is the LOCAL-cache-minus-UPSTREAM diff: tags the
+    // local insight cache serves that the upstream registry does not. Non-x.y.z
+    // ones are pollution to delete from the local cache; x.y.z ones are releases
+    // the upstream is MISSING and should be copied up (review). Needs the
+    // upstream (UPSTREAM_USERNAME / UPSTREAM_PASSWORD) to compute.
+    match (&rules.check_authority, &released_re) {
+        (Some(auth), Some(re)) => match upstream_tag_set(auth, cfg.insecure).await {
+            Ok(upstream_set) => {
+                let is_fp =
+                    |image: &str| prefixes.iter().any(|pre| image.starts_with(pre.as_str()));
+                for (repo, tags) in &cache_contents {
+                    let local: Vec<(String, String)> = tags
+                        .iter()
+                        .filter(|t| is_fp(&t.image))
+                        .map(|t| (t.image.clone(), t.tag.clone()))
+                        .collect();
+                    for (image, ts) in cache_pollution(&local, &upstream_set) {
+                        for tag in ts {
+                            let t = TagRef {
+                                source_repo: repo.clone(),
+                                image: image.clone(),
+                                tag,
+                            };
+                            if re.is_match(&t.tag) {
+                                resolved.copy_upstream.push(t);
+                            } else {
+                                resolved.non_released.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => resolved.non_released_note = Some(e.to_string()),
+        },
+        (None, _) => {
+            resolved.non_released_note =
+                Some("no [check_authority] upstream configured".to_string())
+        }
+        (_, None) => {
+            resolved.non_released_note = Some("no `released` pattern in rules".to_string())
+        }
+    }
+
+    print_plan(&resolved, cfg.copy, &dest_classes);
 
     // Snapshot of the repositories this run involves (sources, move dests, purge
     // repos, and check/cache repos), with current artifact counts + sizes.
@@ -1349,155 +1497,70 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         }
     };
 
-    if !cfg.apply {
-        if let Some(b) = &before_summary {
-            print_repo_summary(b, None);
-        }
-        // Report the post-reorg residual: what stays in each source repo, plus
-        // each check repo (a cache the reorg never writes to). Enumerate the
-        // distinct check repos for their current contents.
-        let mut check_repos: std::collections::BTreeSet<String> = Default::default();
-        for group in &groups {
-            for r in &group.rules {
-                if let Some(c) = &r.check {
-                    check_repos.insert(c.clone());
-                }
-                if let Some(c) = &r.insight_repo {
-                    check_repos.insert(c.clone());
-                }
-            }
-        }
-        let mut cache_contents: BTreeMap<String, Vec<TagRef>> = BTreeMap::new();
-        for repo in &check_repos {
-            let tags = list_repo_tags(client, repo).await?;
-            cache_contents.insert(
-                repo.clone(),
-                tags.into_iter()
-                    .map(|(image, tag)| TagRef {
-                        source_repo: repo.clone(),
-                        image,
-                        tag,
-                    })
-                    .collect(),
-            );
-        }
-        let mut prefixes: std::collections::BTreeSet<String> = Default::default();
-        for group in &groups {
-            for p in &group.first_party_prefixes {
-                prefixes.insert(p.clone());
-            }
-        }
-        let prefixes: Vec<String> = prefixes.into_iter().collect();
-        print_residuals(&resolved, &cache_contents, &prefixes);
-
+    if cfg.dry_run() {
         // Retention safety: warn if a destination's cleanup policy would expire
         // the tags we're about to move there (a re-file silently becoming a delete).
         print_destination_retention(client, &resolved, &atimes).await?;
 
-        // Cache-integrity check: diff a local cache repo against the
-        // authoritative upstream it mirrors, flagging tags present locally but
-        // absent upstream (manually-pushed pollution that the cache would never
-        // legitimately hold).
-        if let Some(authority) = &rules.check_authority {
-            check_cache_authority(client, authority, cfg.insecure).await?;
+        // Verbose appendix (large; the per-tag move list) at the very end, so
+        // the plan up top is never buried under thousands of move lines.
+        if cfg.verbose {
+            print_verbose_moves(&resolved);
         }
 
-        // Repeat the plan summary down here next to the repository/remaining
-        // data, so a reader who scrolled the detail doesn't have to jump back to
-        // the top to recall the counts.
-        print_overview(&resolved, cfg.copy, &dest_classes);
+        // Close with the current repo snapshot and a repeat of the one-screen
+        // summary, so they're the last thing read after the long listings.
+        if let Some(b) = &before_summary {
+            print_repo_summary(b, None);
+        }
+        println!("\n================ Reorg plan — summary ================");
+        print_summary(&resolved, cfg.copy);
 
-        println!("\nDry run — no changes made. Re-run with --apply to execute.");
+        println!("\nDry run — no changes made. Re-run with --apply <groups> to execute.");
         return Ok(());
     }
 
     // ----------------------------------------------------------------------
-    // Phase 1 — gather every operator decision UP FRONT, before any change, so
-    // the long unattended modification phase never stops to ask a question.
-    // ----------------------------------------------------------------------
-    let mut approved_mismatch_deletes: Vec<&MismatchInfo> = Vec::new();
-    if !cfg.copy {
-        let asks: Vec<&MismatchInfo> = resolved
-            .mismatched
-            .iter()
-            .filter(|m| m.on_mismatch == MismatchPolicy::Ask)
-            .collect();
-        if !asks.is_empty() {
-            println!(
-                "\n{} reconcile mismatch(es) need a decision before modifications begin:",
-                asks.len()
-            );
-            for m in asks {
-                print_mismatch_evidence(m);
-                let q = format!(
-                    "  Delete the source copy {}/{}:{}? (it stays if you decline)",
-                    m.tag.source_repo, m.tag.image, m.tag.tag
-                );
-                if prompt_yes_no(&q)? {
-                    approved_mismatch_deletes.push(m);
-                } else {
-                    println!(
-                        "  will keep: {}/{}:{}",
-                        m.tag.source_repo, m.tag.image, m.tag.tag
-                    );
-                }
-            }
-        }
-    }
-
-    // ----------------------------------------------------------------------
-    // Phase 2 — execute. No further prompts from here on.
+    // Execute only the selected action groups (no prompts — the plan named each
+    // group and `--apply` listed the ones to run).
     // ----------------------------------------------------------------------
     let mut ok = 0usize;
     let mut failed = 0usize;
     let verb = if cfg.copy { "copy" } else { "move" };
-    // Flagged tags (purge/retired zones) are reported, never auto-deleted (b).
-    let flagged = resolved.purges.len() + resolved.prefix_deletes.len();
-    let total_deletes = if cfg.copy {
-        0
-    } else {
-        resolved.deletes.len() + approved_mismatch_deletes.len()
-    };
     println!(
-        "\nApplying {} {verb}(s) and {} delete(s) — no further prompts...",
-        resolved.moves.len(),
-        total_deletes
+        "\nApplying groups: {} — no prompts...",
+        cfg.apply.as_ref().map(|s| s.join(", ")).unwrap_or_default()
     );
 
-    for m in &resolved.moves {
-        let r = if cfg.copy {
-            client
-                .staging_copy(&m.source_repo, &m.dest, &m.image, &m.tag)
-                .await
-        } else {
-            client
-                .staging_move(&m.source_repo, &m.dest, &m.image, &m.tag)
-                .await
-        };
-        report(
-            &mut ok,
-            &mut failed,
-            verb,
-            &m.source_repo,
-            &m.image,
-            &m.tag,
-            r,
-        );
-    }
-
-    if cfg.copy {
-        if !resolved.deletes.is_empty() {
-            println!(
-                "\n--copy is non-destructive: skipped {} delete(s).",
-                resolved.deletes.len()
+    // --- move ---
+    if cfg.wants(GROUP_MOVE) {
+        println!("\n[{}] {} tag(s)...", verb, resolved.moves.len());
+        for m in &resolved.moves {
+            let r = if cfg.copy {
+                client
+                    .staging_copy(&m.source_repo, &m.dest, &m.image, &m.tag)
+                    .await
+            } else {
+                client
+                    .staging_move(&m.source_repo, &m.dest, &m.image, &m.tag)
+                    .await
+            };
+            report(
+                &mut ok,
+                &mut failed,
+                verb,
+                &m.source_repo,
+                &m.image,
+                &m.tag,
+                r,
             );
         }
-    } else {
-        // Hard guard: NEVER delete out of a cache/check/insight repo. The
-        // canonical copy of a redundant insight tag lives in the cache; we only
-        // drop the copies that live elsewhere. This is belt-and-suspenders over
-        // the resolve-time guard (a redundant tag whose source IS the check repo
-        // is kept, not dropped) — refuse here too, regardless of how it arose.
+    }
+
+    // --- source-side deletes (redundant / superseded / mismatch / retired) ---
+    // Never under --copy (non-destructive).
+    if !cfg.copy {
+        // Hard guard: NEVER delete out of a cache/check/insight repo.
         let mut protected: BTreeSet<String> = BTreeSet::new();
         for g in &groups {
             for r in &g.rules {
@@ -1512,36 +1575,80 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         if let Some(a) = &rules.check_authority {
             protected.insert(a.cache_repo.clone());
         }
-        // Only verified-duplicate Drops + operator-approved mismatch deletes are
-        // removed. Flagged tags (purge/retired zones) are never auto-deleted.
-        let mismatch_tags = approved_mismatch_deletes.iter().map(|m| &m.tag);
-        for d in resolved.deletes.iter().map(|d| &d.tag).chain(mismatch_tags) {
-            if protected.contains(&d.source_repo) {
-                eprintln!(
-                    "  delete REFUSED (cache/insight repo never deleted): {}/{}:{}",
-                    d.source_repo, d.image, d.tag
-                );
-                continue;
+
+        // Gather the tags to delete from every selected source-delete group.
+        let mut to_delete: Vec<&TagRef> = Vec::new();
+        for d in &resolved.deletes {
+            if cfg.wants(delete_group(d)) {
+                to_delete.push(&d.tag);
             }
-            let r = client
-                .staging_delete(&d.source_repo, &d.image, &d.tag)
-                .await;
-            report(
-                &mut ok,
-                &mut failed,
-                "delete",
-                &d.source_repo,
-                &d.image,
-                &d.tag,
-                r,
-            );
         }
-    }
-    if flagged > 0 {
-        println!(
-            "\n{flagged} tag(s) flagged for review were left untouched (purge/retired zones); \
-             delete them in a separate explicit step when ready."
-        );
+        if cfg.wants(GROUP_MISMATCH) {
+            for m in resolved.mismatched.iter().filter(|m| m.recommends_delete()) {
+                to_delete.push(&m.tag);
+            }
+        }
+        if cfg.wants(GROUP_RETIRED) {
+            for t in &resolved.prefix_deletes {
+                to_delete.push(t);
+            }
+        }
+        if !to_delete.is_empty() {
+            println!("\n[delete] {} tag(s) from source...", to_delete.len());
+            for d in to_delete {
+                if protected.contains(&d.source_repo) {
+                    eprintln!(
+                        "  delete REFUSED (cache/insight repo never deleted): {}/{}:{}",
+                        d.source_repo, d.image, d.tag
+                    );
+                    continue;
+                }
+                let r = client
+                    .staging_delete(&d.source_repo, &d.image, &d.tag)
+                    .await;
+                report(
+                    &mut ok,
+                    &mut failed,
+                    "delete",
+                    &d.source_repo,
+                    &d.image,
+                    &d.tag,
+                    r,
+                );
+            }
+        }
+
+        // --- non-released: delete LOCAL insight-cache pollution. These tags are
+        // absent from the upstream registry (that diff is how they were found),
+        // so deleting the cache copy is permanent and they never re-populate.
+        // Nothing is ever deleted upstream. This intentionally targets the cache
+        // repo, so it does NOT go through the protected-repo guard above.
+        if cfg.wants(GROUP_NON_RELEASED) {
+            if let Some(note) = &resolved.non_released_note {
+                eprintln!("  [non-released] cannot run — {note}");
+            } else if !resolved.non_released.is_empty() {
+                println!(
+                    "\n[non-released] deleting {} tag(s) from the local insight cache (absent upstream)...",
+                    resolved.non_released.len()
+                );
+                for t in &resolved.non_released {
+                    let r = client
+                        .staging_delete(&t.source_repo, &t.image, &t.tag)
+                        .await;
+                    report(
+                        &mut ok,
+                        &mut failed,
+                        "delete",
+                        &t.source_repo,
+                        &t.image,
+                        &t.tag,
+                        r,
+                    );
+                }
+            }
+        }
+    } else {
+        println!("\n--copy is non-destructive: skipping all delete groups.");
     }
 
     println!("\nApplied: {ok} succeeded, {failed} failed.");
@@ -1610,88 +1717,6 @@ fn report(
     }
 }
 
-/// Report the repo-level residuals the per-rule plan doesn't cover: what's left
-/// in the drained purge repos, under retired prefixes, the untouched third-party
-/// remainder in regular source repos, and the cache repos' first-party contents
-/// for reference. Each is grouped by the reason it stays. (First-party tags left
-/// by a rule are shown per-rule in the by-rule plan, not here.)
-fn print_residuals(
-    p: &ResolvedPlan,
-    cache_contents: &BTreeMap<String, Vec<TagRef>>,
-    first_party_prefixes: &[String],
-    released: Option<&Regex>,
-) {
-    // Purge repos (drained): first-party was re-homed by the rules; the
-    // non-first-party remainder is stale public-cache content — counted only
-    // (not your namespaces; not listed, never auto-deleted). The count is just
-    // the "is it empty of value yet" signal before removing the repo wholesale.
-    if !p.purges.is_empty() {
-        println!("\n================ Purge repos (drained) — what's left ================");
-        let mut by_repo: BTreeMap<&str, usize> = BTreeMap::new();
-        for t in &p.purges {
-            *by_repo.entry(t.source_repo.as_str()).or_default() += 1;
-        }
-        for (repo, n) in &by_repo {
-            println!(
-                "  {repo}: first-party re-homed ✓; {n} non-first-party tag(s) remain \
-                 (stale public-cache content, not shown). Once the first-party re-home is \
-                 confirmed, delete the repo (or its contents) wholesale.",
-            );
-        }
-    }
-
-    // Retired prefixes: every tag under a retired namespace, left for review.
-    if !p.prefix_deletes.is_empty() {
-        println!("\n================ Retired prefixes — what's left ================");
-        let mut by_repo: BTreeMap<&str, Vec<&TagRef>> = BTreeMap::new();
-        for t in &p.prefix_deletes {
-            by_repo.entry(t.source_repo.as_str()).or_default().push(t);
-        }
-        for (repo, tags) in &by_repo {
-            println!("\n{repo}: {} tag(s) left:", tags.len());
-            println!(
-                "  [under a retired namespace (retired_prefixes) — NOT deleted, review] — {} tag(s):",
-                tags.len()
-            );
-            for (img, ts) in tags_by_image(tags) {
-                println!("       {img}: {}", ts.join(", "));
-            }
-        }
-    }
-
-    // Cache/check repos — never written to; shown for reference.
-    if !cache_contents.is_empty() {
-        let is_fp = |image: &str| {
-            first_party_prefixes
-                .iter()
-                .any(|pre| image.starts_with(pre.as_str()))
-        };
-        println!("\n================ Cache repos (untouched — reference) ================");
-        for (repo, tags) in cache_contents {
-            let fp: Vec<&TagRef> = tags.iter().filter(|t| is_fp(&t.image)).collect();
-            println!("\n{repo}: {} first-party tag(s) it serves:", fp.len());
-            for (img, ts) in tags_by_image(&fp) {
-                println!("       {img}: {}", ts.join(", "));
-            }
-            // A customer-facing release cache should serve only released x.y.z
-            // versions; suggest pruning any dev/rc/develop/ci tags that leaked in
-            // (removed from the upstream release registry, not this cache).
-            if let Some(re) = released {
-                let stray: Vec<&TagRef> = fp.iter().copied().filter(|t| !re.is_match(&t.tag)).collect();
-                if !stray.is_empty() {
-                    println!(
-                        "  ⚠ suggest removing {} non-released tag(s) (not an x.y.z version) from the release set:",
-                        stray.len()
-                    );
-                    for (img, ts) in tags_by_image(&stray) {
-                        println!("       {img}: {}", ts.join(", "));
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Friendly label for a rule's raw `match` pattern in the summary.
 fn class_label(m: &str) -> &str {
     if m == ".*" {
@@ -1705,149 +1730,393 @@ fn class_label(m: &str) -> &str {
 /// route there), the three distinct removal kinds spelled out, then
 /// review/kept/unmatched. Printed at the top and again at the bottom (beside the
 /// repository/remaining data) so the counts are visible without scrolling.
-fn print_overview(p: &ResolvedPlan, copy: bool, dest_classes: &BTreeMap<String, Vec<String>>) {
-    let verb = if copy { "copy" } else { "move" };
-    println!("================ Reorg plan ({verb}) — summary ================");
+/// Per-group counts of what `--apply <group>` would change.
+fn group_counts(p: &ResolvedPlan) -> [(&'static str, usize, &'static str); 6] {
+    let redundant = p
+        .deletes
+        .iter()
+        .filter(|d| delete_group(d) == GROUP_REDUNDANT)
+        .count();
+    let superseded = p
+        .deletes
+        .iter()
+        .filter(|d| delete_group(d) == GROUP_SUPERSEDED)
+        .count();
+    let mismatch = p
+        .mismatched
+        .iter()
+        .filter(|m| m.recommends_delete())
+        .count();
+    [
+        (
+            GROUP_MOVE,
+            p.moves.len(),
+            "re-home tags to their correct repository",
+        ),
+        (
+            GROUP_REDUNDANT,
+            redundant,
+            "delete source copies identical to the insight copy",
+        ),
+        (
+            GROUP_SUPERSEDED,
+            superseded,
+            "delete older source copies (a newer copy is kept)",
+        ),
+        (
+            GROUP_MISMATCH,
+            mismatch,
+            "delete source copies that differ from insight (insight authoritative)",
+        ),
+        (
+            GROUP_RETIRED,
+            p.prefix_deletes.len(),
+            "delete tags under retired namespaces",
+        ),
+        (
+            GROUP_NON_RELEASED,
+            p.non_released.len(),
+            "delete non-x.y.z tags the upstream doesn't serve from the LOCAL insight cache",
+        ),
+    ]
+}
 
-    // Moves grouped by destination, annotated with the routing tag classes so
-    // the per-destination counts are self-explanatory.
-    let mut by_dest: BTreeMap<&str, usize> = BTreeMap::new();
-    for m in &p.moves {
-        *by_dest.entry(m.dest.as_str()).or_default() += 1;
+/// Count of tags left for the operator to review — NOT touched by any `--apply`
+/// group. (Mismatches whose source is newer, superseded-but-source-newer,
+/// restore candidates, unclassified, unmatched, and already-correct-here.)
+fn for_you_total(p: &ResolvedPlan) -> usize {
+    let mismatch_review = p
+        .mismatched
+        .iter()
+        .filter(|m| !m.recommends_delete())
+        .count();
+    mismatch_review
+        + p.insight_absent.len()
+        + p.superseded.len()
+        + p.copy_upstream.len()
+        + p.needs_classification.len()
+        + p.leaves.len()
+        + p.kept.len()
+}
+
+/// TL;DR up top: the named action groups (each independently selectable via
+/// `--apply`), then what's left for the operator to review.
+fn print_summary(p: &ResolvedPlan, copy: bool) {
+    println!("Nothing is changed until you re-run with --apply. Each line below is one");
+    println!("independent group — pass the ones you want (comma-separated), or 'all':");
+    println!();
+    // Lead every line with the literal command so it's obvious what to run.
+    for (name, n, desc) in group_counts(p) {
+        let cmd = format!("--apply {name}");
+        println!("    {cmd:<22} {n:>6} tag(s)   {desc}");
     }
+    if let Some(note) = &p.non_released_note {
+        println!("    (non-released count unavailable — {note})");
+    }
+    println!();
+    println!("    e.g.   --apply move,redundant        --apply all");
+    if copy {
+        println!("    (--copy makes 'move' a non-destructive copy and skips every delete group)");
+    }
+    let mismatch_review = p
+        .mismatched
+        .iter()
+        .filter(|m| !m.recommends_delete())
+        .count();
     println!(
-        "  Moves     {:>6} tag(s) — re-homed by tag class:",
+        "\nNOT touched by any group (review only): {} — {} mismatch(source newer) · \
+         {} superseded(source newer) · {} copy-upstream · {} restore-candidate · \
+         {} unclassified · {} unmatched",
+        for_you_total(p),
+        mismatch_review,
+        p.superseded.len(),
+        p.copy_upstream.len(),
+        p.insight_absent.len(),
+        p.needs_classification.len(),
+        p.leaves.len(),
+    );
+    println!(
+        "Already in the right place (no change needed): {}",
+        p.already_placed
+    );
+}
+
+/// Print one itemized `repo/image:tag (created date)` line per delete, sorted.
+fn print_delete_listing(p: &ResolvedPlan, items: &[&DeleteItem]) {
+    let mut lines: Vec<String> = items
+        .iter()
+        .map(|d| {
+            format!(
+                "     {}/{}:{} (created {})",
+                d.tag.source_repo,
+                d.tag.image,
+                d.tag.tag,
+                p.created_date(&d.tag)
+            )
+        })
+        .collect();
+    lines.sort();
+    for l in lines {
+        println!("{l}");
+    }
+}
+
+/// One `▸ \`--apply <group>\`` section per action group, each with its full
+/// listing directly underneath — nothing about a group lives anywhere else.
+fn print_group_sections(
+    p: &ResolvedPlan,
+    copy: bool,
+    dest_classes: &BTreeMap<String, Vec<String>>,
+) {
+    let counts = group_counts(p);
+    let desc_of = |g: &str| {
+        counts
+            .iter()
+            .find(|(n, _, _)| *n == g)
+            .map(|(_, _, d)| *d)
+            .unwrap_or("")
+    };
+
+    // ▸ --apply move
+    let verb = if copy { "copied" } else { "moved" };
+    println!(
+        "\n▸ `--apply move` — {} — {} to be {verb}",
+        desc_of(GROUP_MOVE),
         p.moves.len()
     );
-    for (dest, n) in &by_dest {
-        match dest_classes.get(*dest) {
-            Some(cs) if !cs.is_empty() => {
-                println!("        {n:>6}  → {dest:<26} ({})", cs.join(", "))
-            }
-            _ => println!("        {n:>6}  → {dest}"),
-        }
-    }
-
-    // Drop — the only auto-delete: a verified duplicate already in the check repo.
-    if !p.deletes.is_empty() {
-        println!(
-            "  Drop      {:>6} tag(s) — verified duplicate (already in the check repo); deleted on --apply",
-            p.deletes.len()
-        );
-    }
-    if !p.mismatched.is_empty() {
-        println!(
-            "  Review    {:>6} tag(s) — reconcile mismatch (different digest); prompts on --apply",
-            p.mismatched.len()
-        );
-    }
-    // Triage — classify: image on neither insight nor aux list. Never touched.
-    if !p.needs_classification.is_empty() {
-        println!(
-            "  Needs cls {:>6} tag(s) — released image on NEITHER classify list; triage (not moved/deleted)",
-            p.needs_classification.len()
-        );
-    }
-    // Insight images the upstream unexpectedly lacks — flagged, never dropped.
-    if !p.insight_absent.is_empty() {
-        println!(
-            "  Restore?  {:>6} tag(s) — insight image ABSENT upstream; restore-to-insight candidate (review), never dropped",
-            p.insight_absent.len()
-        );
-    }
-
-    // Flagged — purge/retired drain remainder: reported, NEVER auto-deleted.
-    let flagged = p.purges.len() + p.prefix_deletes.len();
-    if flagged > 0 {
-        println!(
-            "  Flagged   {:>6} tag(s) — left for you to review, NOT deleted:",
-            flagged
-        );
-        if !p.prefix_deletes.is_empty() {
-            let mut ns: BTreeSet<String> = BTreeSet::new();
-            for t in &p.prefix_deletes {
-                ns.insert(format!(
-                    "{}/",
-                    t.image.split('/').next().unwrap_or(t.image.as_str())
-                ));
-            }
-            println!(
-                "        retired   {:>6} — under retired_prefixes: {}",
-                p.prefix_deletes.len(),
-                ns.into_iter().collect::<Vec<_>>().join(", ")
-            );
-        }
-        if !p.purges.is_empty() {
-            let mut repos: BTreeSet<&str> = BTreeSet::new();
-            for t in &p.purges {
-                repos.insert(t.source_repo.as_str());
-            }
-            println!(
-                "        remainder {:>6} — third-party left in drained purge repo(s): {}",
-                p.purges.len(),
-                repos.into_iter().collect::<Vec<_>>().join(", ")
-            );
-        }
-    }
-    if !p.kept.is_empty() {
-        println!(
-            "  Kept      {:>6} tag(s) — already in the check repo, left in place",
-            p.kept.len()
-        );
-    }
-    if p.already_placed > 0 {
-        println!(
-            "  Placed    {:>6} tag(s) — already in their correct repo, no move (convergence)",
-            p.already_placed
-        );
-    }
-    // Superseded — moves dropped to avoid clobbering the dest / duplicating a
-    // sibling source. Auto-resolved (keep dest, else newest); left in source.
-    if !p.superseded.is_empty() {
-        let clobber = p
-            .superseded
-            .iter()
-            .filter(|s| s.kept.contains("existing copy"))
-            .count();
-        let dup = p.superseded.len() - clobber;
-        println!(
-            "  Superseded{:>6} tag(s) — move skipped, left in source (not deleted): \
-             {clobber} would-clobber-dest, {dup} duplicate-of-newer-source",
-            p.superseded.len()
-        );
-    }
-    println!(
-        "  Unmatched {:>6} tag(s) — no rule matched{}",
-        p.leaves.len(),
-        if p.leaves.is_empty() { " ✓" } else { "" }
-    );
-
-    // Moves by source repo — shows where the misfiling lives (especially the
-    // destinations-as-sources and the drained purge repos).
     if !p.moves.is_empty() {
+        let mut by_dest: BTreeMap<&str, usize> = BTreeMap::new();
+        for m in &p.moves {
+            *by_dest.entry(m.dest.as_str()).or_default() += 1;
+        }
+        for (dest, n) in &by_dest {
+            let rules = dest_classes
+                .get(*dest)
+                .map(|cs| cs.join(", "))
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("   ({s})"))
+                .unwrap_or_default();
+            println!("     → {dest:<28} {n:>7}{rules}");
+        }
         let mut by_src: BTreeMap<&str, usize> = BTreeMap::new();
         for m in &p.moves {
             *by_src.entry(m.source_repo.as_str()).or_default() += 1;
         }
         let parts: Vec<String> = by_src.iter().map(|(r, n)| format!("{r} {n}")).collect();
-        println!("  Moves by source: {}", parts.join(" · "));
+        println!("     from: {}", parts.join(" · "));
+        println!("     (full per-tag list: --verbose)");
     }
 
-    // One-line preview of what --apply will (and won't) do.
-    let asks = p
+    // ▸ --apply redundant / --apply superseded — split the delete list.
+    let redundant: Vec<&DeleteItem> = p
+        .deletes
+        .iter()
+        .filter(|d| delete_group(d) == GROUP_REDUNDANT)
+        .collect();
+    let superseded: Vec<&DeleteItem> = p
+        .deletes
+        .iter()
+        .filter(|d| delete_group(d) == GROUP_SUPERSEDED)
+        .collect();
+    println!(
+        "\n▸ `--apply redundant` — {} — {} to be deleted",
+        desc_of(GROUP_REDUNDANT),
+        redundant.len()
+    );
+    print_delete_listing(p, &redundant);
+
+    println!(
+        "\n▸ `--apply superseded` — {} — {} to be deleted",
+        desc_of(GROUP_SUPERSEDED),
+        superseded.len()
+    );
+    print_delete_listing(p, &superseded);
+    if !p.superseded.is_empty() {
+        let created = |o: &Option<String>| {
+            o.as_deref()
+                .map(|s| s.get(0..10).unwrap_or(s).to_string())
+                .unwrap_or_else(|| "?".to_string())
+        };
+        println!(
+            "     plus {} kept for REVIEW — the source copy is NEWER than the kept copy:",
+            p.superseded.len()
+        );
+        for s in &p.superseded {
+            println!(
+                "     {}/{}:{} (created {}) — kept {} (created {})",
+                s.tag.source_repo,
+                s.tag.image,
+                s.tag.tag,
+                created(&s.own_built),
+                s.kept,
+                created(&s.winner_built),
+            );
+        }
+    }
+
+    // ▸ --apply mismatch
+    let del = p
         .mismatched
         .iter()
-        .filter(|m| m.on_mismatch == MismatchPolicy::Ask)
+        .filter(|m| m.recommends_delete())
         .count();
-    let flagged = p.purges.len() + p.prefix_deletes.len();
+    let review = p.mismatched.len() - del;
     println!(
-        "  On --apply: {} move(s) · {} drop(s) · {} prompt(s) · {} flagged · {} superseded (untouched)",
-        p.moves.len(),
-        p.deletes.len(),
-        asks,
-        flagged,
-        p.superseded.len(),
+        "\n▸ `--apply mismatch` — {} — {} to be deleted from source; {} kept for review",
+        desc_of(GROUP_MISMATCH),
+        del,
+        review
     );
+    for m in &p.mismatched {
+        let action = if m.recommends_delete() {
+            "DELETE on --apply mismatch"
+        } else {
+            "KEPT for review"
+        };
+        println!(
+            "     {}/{}:{}  [{action}]",
+            m.tag.source_repo, m.tag.image, m.tag.tag
+        );
+        print_mismatch_evidence(m);
+    }
+
+    // ▸ --apply retired
+    println!(
+        "\n▸ `--apply retired` — {} — {} to be deleted from source",
+        desc_of(GROUP_RETIRED),
+        p.prefix_deletes.len()
+    );
+    let mut by_repo: BTreeMap<&str, Vec<&TagRef>> = BTreeMap::new();
+    for t in &p.prefix_deletes {
+        by_repo.entry(t.source_repo.as_str()).or_default().push(t);
+    }
+    for (repo, tags) in &by_repo {
+        println!("     in {repo}:");
+        for (img, ts) in tags_by_image(tags) {
+            println!("        {img}: {}", ts.join(", "));
+        }
+    }
+
+    // ▸ --apply non-released — the local-cache-minus-upstream diff. Deletes are
+    // LOCAL (cache pollution the upstream never serves); x.y.z tags missing
+    // upstream are the opposite problem and are listed for copy-up review.
+    println!(
+        "\n▸ `--apply non-released` — {} — {} to be deleted from the local cache",
+        desc_of(GROUP_NON_RELEASED),
+        p.non_released.len()
+    );
+    if let Some(note) = &p.non_released_note {
+        println!("     unavailable — {note}");
+    } else {
+        let refs: Vec<&TagRef> = p.non_released.iter().collect();
+        for (img, ts) in tags_by_image(&refs) {
+            println!("     {img}: {}", ts.join(", "));
+        }
+        if !p.copy_upstream.is_empty() {
+            println!(
+                "     plus {} released x.y.z tag(s) the UPSTREAM is missing → copy them upstream (review, never deleted):",
+                p.copy_upstream.len()
+            );
+            let refs: Vec<&TagRef> = p.copy_upstream.iter().collect();
+            for (img, ts) in tags_by_image(&refs) {
+                println!("        {img}: {}", ts.join(", "));
+            }
+        }
+    }
+}
+
+/// Review-only leftovers no `--apply` group touches: restore candidates,
+/// unclassified images, unmatched tags. Small by design — everything actionable
+/// lives in a group section above.
+fn print_review_only(p: &ResolvedPlan) {
+    if p.insight_absent.is_empty()
+        && p.purges.is_empty()
+        && p.needs_classification.is_empty()
+        && p.leaves.is_empty()
+        && p.kept.is_empty()
+    {
+        return;
+    }
+    println!("\n▸ Review only — no --apply group touches these:");
+
+    // Restore-to-insight candidates — insight-classified, absent upstream.
+    if !p.insight_absent.is_empty() {
+        println!(
+            "\n  Restore-to-insight candidates ({})  → push to insight, or delete as stale (may have been pruned)",
+            p.insight_absent.len()
+        );
+        let mut by_repo: BTreeMap<&str, Vec<&TagRef>> = BTreeMap::new();
+        for t in &p.insight_absent {
+            by_repo.entry(t.source_repo.as_str()).or_default().push(t);
+        }
+        for (repo, tags) in &by_repo {
+            println!("     in {repo}:");
+            let mut by_img: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for t in tags {
+                by_img.entry(t.image.as_str()).or_default().push(format!(
+                    "{} (created {})",
+                    t.tag,
+                    p.created_date(t)
+                ));
+            }
+            for (img, ts) in &by_img {
+                println!("        {img}: {}", ts.join(", "));
+            }
+        }
+    }
+
+    // Purge-repo remainder — third-party in a dead cache.
+    if !p.purges.is_empty() {
+        let mut by_repo: BTreeMap<&str, usize> = BTreeMap::new();
+        for t in &p.purges {
+            *by_repo.entry(t.source_repo.as_str()).or_default() += 1;
+        }
+        let parts: Vec<String> = by_repo.iter().map(|(r, n)| format!("{r} ({n})")).collect();
+        println!(
+            "\n  Purge-repo remainder ({})  → dead cache; first-party already re-homed, delete the repo wholesale: {}",
+            p.purges.len(),
+            parts.join(", ")
+        );
+    }
+
+    // Needs classification — released image on neither list.
+    if !p.needs_classification.is_empty() {
+        println!(
+            "\n  Needs classification ({})  → add each image to insight_images or aux_images, then re-run",
+            p.needs_classification.len()
+        );
+        let mut by_image: BTreeMap<&str, (Vec<&str>, &TriageItem)> = BTreeMap::new();
+        for t in &p.needs_classification {
+            let e = by_image
+                .entry(t.tag.image.as_str())
+                .or_insert_with(|| (Vec::new(), t));
+            e.0.push(t.tag.tag.as_str());
+        }
+        for (image, (mut tags, sample)) in by_image {
+            tags.sort();
+            println!("     {image} — {} — {}", sample.hint(), tags.join(", "));
+        }
+    }
+
+    // Unmatched — no rule matched (only when there's no catch-all).
+    if !p.leaves.is_empty() {
+        println!(
+            "\n  Unmatched ({})  → no rule matched; add a rule or leave in place",
+            p.leaves.len()
+        );
+        let refs: Vec<&TagRef> = p.leaves.iter().collect();
+        for (img, ts) in tags_by_image(&refs) {
+            println!("     {img}: {}", ts.join(", "));
+        }
+    }
+
+    // Kept — reconcile redundant whose source IS the check repo (never dropped).
+    if !p.kept.is_empty() {
+        println!(
+            "\n  Kept ({})  → already present in the check repo, left in place (informational)",
+            p.kept.len()
+        );
+    }
 }
 
 /// Warn when a move's destination has a cleanup policy that would expire the
@@ -1927,20 +2196,14 @@ async fn print_destination_retention(
     Ok(())
 }
 
-fn print_plan(
-    p: &ResolvedPlan,
-    groups: &[CompiledGroup],
-    copy: bool,
-    verbose: bool,
-    dest_classes: &BTreeMap<String, Vec<String>>,
-    class_patterns: &BTreeMap<String, String>,
-) {
-    // One-screen summary up top (the caller repeats it at the bottom, beside the
-    // repository/remaining data, so you needn't scroll back up).
-    print_overview(p, copy, dest_classes);
-    // Then the per-rule detail: for each rule, what MOVES, what's REMOVED, and
-    // what's NOT MOVING (with the reason).
-    print_by_rule(p, groups, copy, verbose, class_patterns);
+fn print_plan(p: &ResolvedPlan, copy: bool, dest_classes: &BTreeMap<String, Vec<String>>) {
+    // Summary up top, then one ▸ section per --apply group (each with its full
+    // listing directly underneath), then the review-only leftovers. The summary
+    // repeats at the very end of the dry run, after the reference sections.
+    println!("================ Reorg plan ================");
+    print_summary(p, copy);
+    print_group_sections(p, copy, dest_classes);
+    print_review_only(p);
 }
 
 /// Group a set of tag refs by image, sorted tags per image.
@@ -1955,257 +2218,29 @@ fn tags_by_image(tags: &[&TagRef]) -> BTreeMap<String, Vec<String>> {
     m
 }
 
-/// Rule-centric plan detail. Walks each group's rules in evaluation order and,
-/// for each, prints what it MOVES, what it REMOVEs (deletes), and what it leaves
-/// NOT MOVING — every "not moving" outcome under its own reason. Outcomes are
-/// attributed to a rule by re-running the matcher (`image,tag → rule class`), so
-/// the flat plan buckets need no per-rule bookkeeping. Moves and the (large)
-/// already-in-place set are counts unless `--verbose`; the small not-moving
-/// reasons always list.
-fn print_by_rule(
-    p: &ResolvedPlan,
-    groups: &[CompiledGroup],
-    copy: bool,
-    verbose: bool,
-    class_patterns: &BTreeMap<String, String>,
-) {
-    let did = if copy { "copied" } else { "moved" };
-    let created = |o: &Option<String>| {
-        o.as_deref()
-            .map(|s| s.get(0..10).unwrap_or(s).to_string())
-            .unwrap_or_else(|| "?".to_string())
-    };
-
-    println!("\n================ Plan by rule ================");
-    println!("Per rule: what MOVES, what's REMOVED (deleted), and what's NOT MOVING (by reason).");
-
-    for g in groups {
-        // The matched-rule class of a first-party tag within this group.
-        let class_of = |image: &str, tag: &str| -> Option<String> {
-            g.is_first_party(image)
-                .then(|| move_class(g, image, tag).to_string())
-        };
-        for r in &g.rules {
-            let class = r.class.as_str();
-            let same = |c: Option<String>| c.as_deref() == Some(class);
-
-            let moves: Vec<&PlannedMove> = p.moves.iter().filter(|m| m.class == class).collect();
-            let removed: Vec<&DeleteItem> = p
-                .deletes
-                .iter()
-                .filter(|d| same(class_of(&d.tag.image, &d.tag.tag)))
-                .collect();
-            let superseded: Vec<&SupersededItem> = p
-                .superseded
-                .iter()
-                .filter(|s| same(class_of(&s.tag.image, &s.tag.tag)))
-                .collect();
-            let insight_absent: Vec<&TagRef> = p
-                .insight_absent
-                .iter()
-                .filter(|t| same(class_of(&t.image, &t.tag)))
-                .collect();
-            let needs: Vec<&TriageItem> = p
-                .needs_classification
-                .iter()
-                .filter(|t| same(class_of(&t.tag.image, &t.tag.tag)))
-                .collect();
-            let mism: Vec<&MismatchInfo> = p
-                .mismatched
-                .iter()
-                .filter(|m| same(class_of(&m.tag.image, &m.tag.tag)))
-                .collect();
-            let kept: Vec<&TagRef> = p
-                .kept
-                .iter()
-                .filter(|t| same(class_of(&t.image, &t.tag)))
-                .collect();
-            let placed = p.already_placed_by_class.get(class).copied().unwrap_or(0);
-
-            if moves.is_empty()
-                && removed.is_empty()
-                && superseded.is_empty()
-                && insight_absent.is_empty()
-                && needs.is_empty()
-                && mism.is_empty()
-                && kept.is_empty()
-                && placed == 0
-            {
-                continue;
-            }
-
-            let pat = class_patterns
-                .get(class)
-                .map(|p| format!(" /{p}/"))
-                .unwrap_or_default();
-            // Name the repo(s) this rule targets in the header, so it's clear
-            // where a rule sends things even when nothing actually moves (e.g. a
-            // develop rule whose tags are all already in place / superseded).
-            let target = match r.action {
-                Action::Move | Action::Reconcile => r
-                    .dest
-                    .as_deref()
-                    .map(|d| format!(" → {d}"))
-                    .unwrap_or_default(),
-                Action::Classify => format!(
-                    " → {} (aux) · verify vs {} (insight)",
-                    r.aux_dest.as_deref().unwrap_or("?"),
-                    r.insight_repo.as_deref().unwrap_or("?"),
-                ),
-                Action::DeleteIfAbsent => r
-                    .check
-                    .as_deref()
-                    .map(|c| format!(" → delete from source if absent from {c}"))
-                    .unwrap_or_default(),
-                Action::Delete => " → delete from source".to_string(),
-                Action::Leave => " → leave in place".to_string(),
-            };
-            println!("\nrule '{class}'{pat}{target}");
-
-            // MOVE — count by default; list under --verbose.
-            if !moves.is_empty() {
-                let dest = moves[0].dest.as_str();
-                if verbose {
-                    println!("   MOVE → {dest}: {} tag(s):", moves.len());
-                    for m in &moves {
-                        println!("        {}/{}:{}", m.source_repo, m.image, m.tag);
-                    }
-                } else {
-                    println!(
-                        "   MOVE → {dest}: {} tag(s)  (--verbose to list)",
-                        moves.len()
-                    );
-                }
-            }
-
-            // REMOVE — deletes from source, grouped by the recorded reason, each
-            // tag annotated with its create date.
-            if !removed.is_empty() {
-                let skip = if copy { " (skipped: --copy)" } else { "" };
-                println!(
-                    "   REMOVE — delete from source{skip}: {} tag(s):",
-                    removed.len()
-                );
-                let mut by_reason: BTreeMap<&str, Vec<&DeleteItem>> = BTreeMap::new();
-                for d in &removed {
-                    by_reason.entry(d.reason.as_str()).or_default().push(d);
-                }
-                for (reason, items) in &by_reason {
-                    println!("     · {reason} — {} tag(s):", items.len());
-                    for d in items {
-                        println!(
-                            "          {}/{}:{} (created {})",
-                            d.tag.source_repo,
-                            d.tag.image,
-                            d.tag.tag,
-                            p.created_date(&d.tag)
-                        );
-                    }
-                }
-            }
-
-            // NOT MOVING — every reason as its own line.
-            if placed > 0
-                || !superseded.is_empty()
-                || !insight_absent.is_empty()
-                || !needs.is_empty()
-                || !mism.is_empty()
-                || !kept.is_empty()
-            {
-                println!("   NOT MOVING:");
-                if placed > 0 {
-                    println!("     · already in place (self-move skipped) — {placed} tag(s)");
-                }
-                if !superseded.is_empty() {
-                    println!(
-                        "     · superseded — would clobber the dest / duplicate a newer source — {} tag(s):",
-                        superseded.len()
-                    );
-                    for s in &superseded {
-                        println!(
-                            "          {}/{}:{} (created {}) — NOT {did} to {}; kept {} (created {})",
-                            s.tag.source_repo,
-                            s.tag.image,
-                            s.tag.tag,
-                            created(&s.own_built),
-                            s.dest,
-                            s.kept,
-                            created(&s.winner_built),
-                        );
-                    }
-                }
-                if !insight_absent.is_empty() {
-                    println!(
-                        "     · insight image absent upstream — restore-to-insight candidate (review; may have been intentionally pruned), never dropped — {} tag(s):",
-                        insight_absent.len()
-                    );
-                    for t in &insight_absent {
-                        println!(
-                            "          {}/{}:{} (created {})",
-                            t.source_repo,
-                            t.image,
-                            t.tag,
-                            p.created_date(t)
-                        );
-                    }
-                }
-                if !needs.is_empty() {
-                    println!(
-                        "     · needs classification — on neither insight nor aux list — {} tag(s):",
-                        needs.len()
-                    );
-                    let mut by_image: BTreeMap<&str, (Vec<&str>, &TriageItem)> = BTreeMap::new();
-                    for t in &needs {
-                        let e = by_image
-                            .entry(t.tag.image.as_str())
-                            .or_insert_with(|| (Vec::new(), t));
-                        e.0.push(t.tag.tag.as_str());
-                    }
-                    for (image, (mut tags, sample)) in by_image {
-                        tags.sort();
-                        println!(
-                            "          {image} — {} — {}",
-                            sample.hint(),
-                            tags.join(", ")
-                        );
-                    }
-                }
-                if !mism.is_empty() {
-                    let asks = mism
-                        .iter()
-                        .filter(|m| m.on_mismatch == MismatchPolicy::Ask)
-                        .count();
-                    println!(
-                        "     · reconcile mismatch — different digest, review ({asks} prompt on --apply) — {} tag(s):",
-                        mism.len()
-                    );
-                    for m in &mism {
-                        println!(
-                            "          {}/{}:{}",
-                            m.tag.source_repo, m.tag.image, m.tag.tag
-                        );
-                        print_mismatch_evidence(m);
-                    }
-                }
-                if !kept.is_empty() {
-                    println!(
-                        "     · kept — already present in the check repo — {} tag(s)",
-                        kept.len()
-                    );
-                }
-            }
-        }
+/// Verbose appendix: the full per-tag list of the automatic MOVES, grouped by
+/// destination. Emitted only with --verbose — it's large (thousands of tags),
+/// and being automatic and non-destructive it needs no review, so it sorts to
+/// the very bottom. Removals are NOT here: deletes are itemized unconditionally
+/// in the ① AUTOMATIC zone (see print_automatic), so they're always visible.
+fn print_verbose_moves(p: &ResolvedPlan) {
+    if p.moves.is_empty() {
+        return;
     }
-
-    // Tags that matched NO rule (only when there is no catch-all rule).
-    if !p.leaves.is_empty() {
-        println!(
-            "\nrule '(none)' — unmatched, no rule applied — {} tag(s):",
-            p.leaves.len()
-        );
-        let refs: Vec<&TagRef> = p.leaves.iter().collect();
-        for (img, tags) in tags_by_image(&refs) {
-            println!("        {img}: {}", tags.join(", "));
+    println!("\n================ Detail (--verbose) — every automatic move ================");
+    let mut by_dest: BTreeMap<&str, Vec<&PlannedMove>> = BTreeMap::new();
+    for m in &p.moves {
+        by_dest.entry(m.dest.as_str()).or_default().push(m);
+    }
+    for (dest, ms) in &by_dest {
+        println!("\n→ {dest}  ({} tag(s)):", ms.len());
+        let mut lines: Vec<String> = ms
+            .iter()
+            .map(|m| format!("     {}/{}:{}", m.source_repo, m.image, m.tag))
+            .collect();
+        lines.sort();
+        for l in lines {
+            println!("{l}");
         }
     }
 }
@@ -2382,110 +2417,36 @@ fn print_repo_summary(before: &RepoSummary, after: Option<&RepoSummary>) {
     }
 }
 
-/// Validate a local cache repo against the authoritative upstream registry it
-/// mirrors, flagging tags present locally but absent upstream — i.e. content
-/// that was manually pushed into the cache and would never be served by the
-/// upstream. Report-only, and non-fatal: a missing credential or unreachable
-/// upstream prints a note and skips rather than failing the run.
-async fn check_cache_authority(
-    client: &DepotClient,
+/// Enumerate the UPSTREAM registry's `image:tag` set (union of the configured
+/// upstream repos). Requires `UPSTREAM_USERNAME` / `UPSTREAM_PASSWORD` — the
+/// local-cache-vs-upstream diff is meaningless without the upstream, so a
+/// missing credential is an error the caller reports, not a silent skip.
+async fn upstream_tag_set(
     authority: &CheckAuthority,
     insecure: bool,
-) -> Result<()> {
-    println!(
-        "\n================ Cache integrity — '{}' vs upstream {} ================",
-        authority.cache_repo, authority.upstream_url
-    );
+) -> Result<std::collections::HashSet<String>> {
     let (Some(user), Some(pass)) = (
         std::env::var("UPSTREAM_USERNAME").ok(),
         std::env::var("UPSTREAM_PASSWORD").ok(),
     ) else {
-        println!("  skipped: set UPSTREAM_USERNAME / UPSTREAM_PASSWORD to enable this check.");
-        return Ok(());
+        anyhow::bail!(
+            "set UPSTREAM_USERNAME / UPSTREAM_PASSWORD to diff the insight cache against {}",
+            authority.upstream_url
+        );
     };
-    let upstream = match DepotClient::new(&authority.upstream_url, &user, &pass, insecure) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("  skipped: cannot build upstream client: {e}");
-            return Ok(());
-        }
-    };
-
-    // Upstream source of truth (union of upstream_repos). Unreachable → skip.
-    let mut upstream_set: std::collections::HashSet<String> = Default::default();
+    let upstream = DepotClient::new(&authority.upstream_url, &user, &pass, insecure)
+        .with_context(|| format!("build upstream client for {}", authority.upstream_url))?;
+    let mut set: std::collections::HashSet<String> = Default::default();
     for repo in &authority.upstream_repos {
-        match list_repo_tags(&upstream, repo).await {
-            Ok(tags) => upstream_set.extend(tags.into_iter().map(|(i, t)| format!("{i}:{t}"))),
-            Err(e) => {
-                println!("  skipped: upstream repo '{repo}' unreachable ({e}).");
-                return Ok(());
-            }
-        }
+        let tags = list_repo_tags(&upstream, repo).await.with_context(|| {
+            format!(
+                "upstream repo '{repo}' unreachable via {}",
+                authority.upstream_url
+            )
+        })?;
+        set.extend(tags.into_iter().map(|(i, t)| format!("{i}:{t}")));
     }
-
-    let local = list_repo_tags(client, &authority.cache_repo)
-        .await
-        .with_context(|| format!("enumerate cache repo '{}'", authority.cache_repo))?;
-    println!(
-        "  cache: {} tag(s); upstream: {} tag(s)",
-        local.len(),
-        upstream_set.len()
-    );
-
-    let by_img = cache_pollution(&local, &upstream_set);
-    if by_img.is_empty() {
-        println!(
-            "  clean ✓ — every tag in '{}' exists upstream.",
-            authority.cache_repo
-        );
-        return Ok(());
-    }
-    let n: usize = by_img.values().map(|v| v.len()).sum();
-    // Candidates for deletion (NEVER auto-deleted). Split by release format: a
-    // non-x.y.z tag in a release registry is high-confidence pollution; an x.y.z
-    // tag that's merely absent upstream warrants a closer look before removal.
-    let xyz = Regex::new(r"^\d+\.\d+\.\d+$").expect("static regex");
-    let mut non_release: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut release_fmt: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (img, ts) in &by_img {
-        for t in ts {
-            if xyz.is_match(t) {
-                release_fmt
-                    .entry(img.as_str())
-                    .or_default()
-                    .push(t.as_str());
-            } else {
-                non_release
-                    .entry(img.as_str())
-                    .or_default()
-                    .push(t.as_str());
-            }
-        }
-    }
-    let nr: usize = non_release.values().map(|v| v.len()).sum();
-    let rf: usize = release_fmt.values().map(|v| v.len()).sum();
-    println!(
-        "  {n} tag(s) in '{}' NOT upstream (NOT auto-changed, review):",
-        authority.cache_repo
-    );
-    if nr > 0 {
-        println!(
-            "    non-release ({nr}) — not x.y.z; high-confidence pollution to DELETE from cache:"
-        );
-        for (img, ts) in &non_release {
-            println!("       {img}: {}", ts.join(", "));
-        }
-    }
-    if rf > 0 {
-        println!(
-            "    release-format ({rf}) — x.y.z in cache but absent upstream; RESTORE-to-insight candidate \
-             OR delete from cache — review:"
-        );
-        for (img, ts) in &release_fmt {
-            println!("       {img}: {}", ts.join(", "));
-        }
-    }
-    Ok(())
+    Ok(set)
 }
 
 /// Local `(image, tag)` entries whose `image:tag` key is absent from the
@@ -2507,8 +2468,7 @@ fn cache_pollution(
 }
 
 /// Print the two-sided evidence for a reconcile mismatch (build time + digest)
-/// plus a non-authoritative assessment. Used by the dry-run plan and the
-/// interactive `ask` prompt.
+/// plus a non-authoritative assessment and recommendation, shown in the plan.
 fn print_mismatch_evidence(m: &MismatchInfo) {
     println!(
         "            source ({}): created {}  [{}]",
@@ -2584,19 +2544,6 @@ fn short(digest: &str) -> String {
     }
 }
 
-/// Prompt the operator for a yes/no decision (defaults to no on empty/EOF).
-fn prompt_yes_no(question: &str) -> Result<bool> {
-    use std::io::Write;
-    print!("{question} [y/N]: ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(matches!(
-        line.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2665,6 +2612,32 @@ mod tests {
     }
 
     #[test]
+    fn released_regex_flags_non_xyz_tags() {
+        // The `non-released` group uses the compiled `released` pattern to spot
+        // non x.y.z tags an insight/release cache shouldn't serve.
+        let rules = RulesFile::from_toml(SAMPLE).unwrap();
+        let re = compile_match(&rules.patterns, "released").expect("released compiles");
+        assert!(re.is_match("1.5.0"), "plain x.y.z is released");
+        assert!(
+            re.is_match("1.5.0-linux_amd64"),
+            "platform-suffixed is released"
+        );
+        assert!(
+            !re.is_match("1.4.0-dev.117"),
+            "dev prerelease is NOT released"
+        );
+        assert!(
+            !re.is_match("1.6.0-dev.242"),
+            "dev prerelease is NOT released"
+        );
+        assert!(!re.is_match("develop"), "develop is NOT released");
+        assert!(
+            !re.is_match("1.0.0-alain-20260520T151747Z"),
+            "one-off tag is NOT released"
+        );
+    }
+
+    #[test]
     fn arch_suffixed_tags_route_like_their_base() {
         let g = sample_group();
         // A platform component tag routes exactly like its base tag, so a
@@ -2687,7 +2660,7 @@ mod tests {
             Decision::Reconcile {
                 check: "docker-insight",
                 absent: AbsentDest::MoveTo("docker-release-aux"),
-                on_mismatch: MismatchPolicy::Leave,
+                on_mismatch: MismatchPolicy::Delete,
             }
         );
         // The bare index tag still routes as before.
@@ -2732,7 +2705,7 @@ mod tests {
             Decision::Reconcile {
                 check: "docker-insight",
                 absent: AbsentDest::MoveTo("docker-release-aux"),
-                on_mismatch: MismatchPolicy::Leave,
+                on_mismatch: MismatchPolicy::Delete,
             }
         );
         assert_eq!(
@@ -2740,7 +2713,7 @@ mod tests {
             Decision::Reconcile {
                 check: "docker-insight",
                 absent: AbsentDest::MoveTo("docker-release-aux"),
-                on_mismatch: MismatchPolicy::Leave,
+                on_mismatch: MismatchPolicy::Delete,
             }
         );
         // unmatched (e.g. the real 1.4.2-canal13 tag, or latest) → catch-all
@@ -2951,16 +2924,16 @@ mod tests {
     }
 
     #[test]
-    fn on_mismatch_defaults_to_leave_and_parses_ask() {
-        // SAMPLE's reconcile rule omits on_mismatch → Leave.
+    fn on_mismatch_defaults_to_delete_and_parses_leave() {
+        // SAMPLE's reconcile rule omits on_mismatch → Delete (mismatch group).
         let g = sample_group();
         match decide(&g, "myriad/api_server", "1.2.3") {
             Decision::Reconcile { on_mismatch, .. } => {
-                assert_eq!(on_mismatch, MismatchPolicy::Leave)
+                assert_eq!(on_mismatch, MismatchPolicy::Delete)
             }
             d => panic!("expected reconcile, got {d:?}"),
         }
-        // Explicit on_mismatch = "ask" parses and flows through to the decision.
+        // Explicit on_mismatch = "leave" parses and flows through to the decision.
         let toml = r#"
             [patterns]
             released = '\d+\.\d+\.\d+'
@@ -2973,7 +2946,7 @@ mod tests {
               action = "reconcile"
               check = "c"
               dest = "d"
-              on_mismatch = "ask"
+              on_mismatch = "leave"
         "#;
         let rules = RulesFile::from_toml(toml).unwrap();
         let g = compile_groups(&rules, Path::new("."))
@@ -2981,7 +2954,9 @@ mod tests {
             .pop()
             .unwrap();
         match decide(&g, "app/x", "1.2.3") {
-            Decision::Reconcile { on_mismatch, .. } => assert_eq!(on_mismatch, MismatchPolicy::Ask),
+            Decision::Reconcile { on_mismatch, .. } => {
+                assert_eq!(on_mismatch, MismatchPolicy::Leave)
+            }
             d => panic!("expected reconcile, got {d:?}"),
         }
     }
@@ -2999,7 +2974,7 @@ mod tests {
             check_digest: "sha256:bbbbbbbbbbbb".into(),
             source_built: s.map(String::from),
             check_built: c.map(String::from),
-            on_mismatch: MismatchPolicy::Ask,
+            on_mismatch: MismatchPolicy::Delete,
         };
         assert!(mk(Some("2024-06-26"), Some("2024-08-12"))
             .assessment()
@@ -3032,7 +3007,6 @@ mod tests {
           insight_repo = "docker-insight"
           insight_images = ["myriad/api_internal", "myriad/master"]
           aux_images     = ["myriad/api_internal_debug", "myriad/test"]
-          on_mismatch  = "ask"
     "#;
 
     fn classify_group() -> CompiledGroup {
@@ -3062,7 +3036,7 @@ mod tests {
             Decision::Reconcile {
                 check: "docker-insight",
                 absent: AbsentDest::Flag,
-                on_mismatch: MismatchPolicy::Ask,
+                on_mismatch: MismatchPolicy::Delete,
             }
         );
         // image on NEITHER list → Triage.

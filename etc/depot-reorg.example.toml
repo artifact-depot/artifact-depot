@@ -91,7 +91,11 @@ retired_prefixes      = ["orchestrator/", "quantum_orchestrator/"]
   #                    redundant, so it's verified against `insight_repo` and:
   #                      same digest      → drop the source copy (never out of the
   #                                         cache itself — only copies elsewhere)
-  #                      different digest → review (on_mismatch); never auto-decided
+  #                      different digest → the `mismatch` --apply group: deleted by
+  #                                         `--apply mismatch` when the insight copy is
+  #                                         newer/same build; a NEWER source is always
+  #                                         kept for review. Set on_mismatch = "leave"
+  #                                         to park every mismatch for review instead.
   #                      absent upstream  → flag, never dropped (may be the only copy)
   #   neither list   → "needs classification": reported with evidence, never
   #                    moved/deleted. The lists are a snapshot of today's pipeline;
@@ -104,7 +108,6 @@ retired_prefixes      = ["orchestrator/", "quantum_orchestrator/"]
   aux_dest     = "docker-release-aux"
   insight_repo = "docker-insight"
   classes_file = "depot-reorg.image-classes.toml"
-  on_mismatch  = "ask"
 
   # rolling develop tag → prerelease repo
   [[group.rule]]

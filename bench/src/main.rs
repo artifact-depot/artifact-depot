@@ -170,9 +170,13 @@ enum Command {
         #[arg(long)]
         rules: String,
 
-        /// Perform the moves (default is a dry run that only prints the plan)
-        #[arg(long, default_value_t = false)]
-        apply: bool,
+        /// Action groups to execute, comma-separated: any of `move`,
+        /// `redundant`, `superseded`, `mismatch`, `retired`, `non-released`, or
+        /// `all`. Omit for a dry run that prints the plan and each group's name.
+        /// e.g. `--apply move,redundant` runs the moves and drops the redundant
+        /// duplicates, leaving everything else untouched.
+        #[arg(long)]
+        apply: Option<String>,
 
         /// Use staging copy (leave the source intact) instead of move
         #[arg(long, default_value_t = false)]
@@ -327,6 +331,13 @@ async fn main() -> anyhow::Result<()> {
                 .init();
 
             let c = client::DepotClient::new(&url, &username, &password, insecure)?;
+            // Parse the comma-separated group list; None => dry run.
+            let apply = apply.map(|s| {
+                s.split(',')
+                    .map(|g| g.trim().to_string())
+                    .filter(|g| !g.is_empty())
+                    .collect::<Vec<_>>()
+            });
             reorg::run(
                 &c,
                 reorg::ReorgConfig {
