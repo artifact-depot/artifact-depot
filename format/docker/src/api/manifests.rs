@@ -18,7 +18,7 @@ use crate::store::{self as docker, DockerStore, MANIFEST_TYPES};
 
 use super::helpers::{
     check_docker_permission, docker_error, hosted_store, location_prefix, resolve_blob_store,
-    store_tag_path, validate_docker_repo,
+    store_tag_path, validate_docker_repo, wants_atime,
 };
 
 // =============================================================================
@@ -91,7 +91,10 @@ pub async fn do_get_manifest(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let store = hosted_store(state, repo_name, image, blobs.as_ref(), &config.store);
+            let mut store = hosted_store(state, repo_name, image, blobs.as_ref(), &config.store);
+            if !wants_atime(req_headers) {
+                store = store.without_atime();
+            }
             // When the client fetches by digest, it already identified the
             // exact content — skip Accept-header content-type negotiation.
             // Docker daemon does HEAD-by-tag → GET-by-digest, and the GET
@@ -102,8 +105,20 @@ pub async fn do_get_manifest(
                 manifest_response_with_accept(store.get_manifest(reference).await, req_headers)
             }
         }
-        RepoType::Cache => cache_get_manifest(state, &config, image, reference).await,
-        RepoType::Proxy => proxy_get_manifest(state, &config, image, reference, 0).await,
+        RepoType::Cache => {
+            cache_get_manifest(state, &config, image, reference, wants_atime(req_headers)).await
+        }
+        RepoType::Proxy => {
+            proxy_get_manifest(
+                state,
+                &config,
+                image,
+                reference,
+                wants_atime(req_headers),
+                0,
+            )
+            .await
+        }
     }
 }
 
@@ -140,7 +155,10 @@ pub async fn do_head_manifest(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let store = hosted_store(state, repo_name, image, blobs.as_ref(), &config.store);
+            // A HEAD probe is a pure existence/metadata check — it must never
+            // refresh last_accessed_at (Docker daemons HEAD before every pull).
+            let store = hosted_store(state, repo_name, image, blobs.as_ref(), &config.store)
+                .without_atime();
             head_manifest_response(&store, reference).await
         }
         RepoType::Cache => {
@@ -221,6 +239,7 @@ async fn cache_get_manifest(
     config: &RepoConfig,
     image: Option<&str>,
     reference: &str,
+    track_access: bool,
 ) -> Response {
     let RepoKind::Cache {
         ref upstream_url,
@@ -239,7 +258,10 @@ async fn cache_get_manifest(
         Ok(b) => b,
         Err(r) => return r,
     };
-    let store = hosted_store(state, &config.name, image, blobs.as_ref(), &config.store);
+    let mut store = hosted_store(state, &config.name, image, blobs.as_ref(), &config.store);
+    if !track_access {
+        store = store.without_atime();
+    }
 
     // Check local cache first.
     let cached = store.get_manifest(reference).await.ok().flatten();
@@ -331,7 +353,9 @@ async fn cache_head_manifest(
         Ok(b) => b,
         Err(r) => return r,
     };
-    let store = hosted_store(state, &config.name, image, blobs.as_ref(), &config.store);
+    // HEAD probe — never refresh last_accessed_at on the cached copy.
+    let store =
+        hosted_store(state, &config.name, image, blobs.as_ref(), &config.store).without_atime();
 
     // Check local first.
     if let Ok(Some((data, ct, digest))) = store.get_manifest(reference).await {
@@ -373,6 +397,7 @@ async fn proxy_get_manifest(
     config: &RepoConfig,
     image: Option<&str>,
     reference: &str,
+    track_access: bool,
     depth: u8,
 ) -> Response {
     if depth > MAX_PROXY_DEPTH {
@@ -407,19 +432,23 @@ async fn proxy_get_manifest(
                     Ok(b) => b,
                     Err(r) => return r,
                 };
-                let store = hosted_store(
+                let mut store = hosted_store(
                     state,
                     member_name,
                     image,
                     blobs.as_ref(),
                     &member_config.store,
                 );
+                if !track_access {
+                    store = store.without_atime();
+                }
                 if let Ok(Some((data, ct, digest))) = store.get_manifest(reference).await {
                     return manifest_data_response(data, &ct, &digest);
                 }
             }
             RepoType::Cache => {
-                let resp = cache_get_manifest(state, &member_config, image, reference).await;
+                let resp =
+                    cache_get_manifest(state, &member_config, image, reference, track_access).await;
                 if resp.status() != StatusCode::NOT_FOUND {
                     return resp;
                 }
@@ -430,6 +459,7 @@ async fn proxy_get_manifest(
                     &member_config,
                     image,
                     reference,
+                    track_access,
                     depth + 1,
                 ))
                 .await;
@@ -485,13 +515,15 @@ async fn proxy_head_manifest(
                     Ok(b) => b,
                     Err(r) => return r,
                 };
+                // HEAD probe — never refresh last_accessed_at.
                 let store = hosted_store(
                     state,
                     member_name,
                     image,
                     blobs.as_ref(),
                     &member_config.store,
-                );
+                )
+                .without_atime();
                 if let Ok(Some((data, ct, digest))) = store.get_manifest(reference).await {
                     let headers = docker_manifest_headers(&ct, data.len(), &digest);
                     return (StatusCode::OK, headers).into_response();

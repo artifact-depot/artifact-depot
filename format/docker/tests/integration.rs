@@ -628,6 +628,7 @@ async fn test_dangling_tag_does_not_refresh_tag_atime() {
         blobs: blobs.as_ref(),
         updater: &sender,
         store: "default",
+        track_access: true,
     };
 
     let result = docker_store.get_manifest("v1.0").await.unwrap();
@@ -662,6 +663,7 @@ async fn test_healthy_tag_refreshes_tag_atime() {
         blobs: blobs.as_ref(),
         updater: &sender,
         store: "default",
+        track_access: true,
     };
 
     let result = docker_store.get_manifest("v1.0").await.unwrap();
@@ -676,6 +678,206 @@ async fn test_healthy_tag_refreshes_tag_atime() {
     assert_eq!(
         tag_touches, 1,
         "healthy tag lookup should queue exactly one tag atime touch"
+    );
+}
+
+/// A store built with [`DockerStore::without_atime`] must not queue any atime
+/// touch on a healthy tag→manifest read — this is the mechanism read-only
+/// tooling (the reorg CLI) and HEAD probes rely on to stay non-mutating.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_no_atime_store_suppresses_manifest_touch() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("noatime-mfst").await;
+
+    let config_digest = app.push_docker_blob("noatime-mfst", b"{}").await;
+    let layer_digest = app.push_docker_blob("noatime-mfst", b"layer").await;
+    let manifest = TestApp::make_manifest(&config_digest, &[&layer_digest]);
+    app.push_docker_manifest("noatime-mfst", "v1.0", &manifest)
+        .await;
+
+    let (sender, mut receiver) = depot_core::update::UpdateSender::new(64);
+    let blobs = app.state.repo.blob_store("default").await.unwrap();
+    let store = depot_format_docker::store::DockerStore {
+        repo: "noatime-mfst",
+        image: None,
+        kv: app.state.repo.kv.as_ref(),
+        blobs: blobs.as_ref(),
+        updater: &sender,
+        store: "default",
+        track_access: true,
+    }
+    .without_atime();
+
+    let result = store.get_manifest("v1.0").await.unwrap();
+    assert!(result.is_some(), "expected healthy tag to resolve");
+
+    let touched = receiver.atime_rx.try_recv();
+    assert!(
+        touched.is_err(),
+        "no-atime store must not queue any touch, got {:?}",
+        touched.ok().map(|e| e.path)
+    );
+}
+
+/// The same suppression applies to blob reads: a no-atime store serving a blob
+/// must not refresh the `_blobs/` record's access time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_no_atime_store_suppresses_blob_touch() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("noatime-blob").await;
+    let digest = app.push_docker_blob("noatime-blob", b"layer-bytes").await;
+
+    let blobs = app.state.repo.blob_store("default").await.unwrap();
+
+    // Control: a tracking store DOES queue a blob touch.
+    let (tracking_sender, mut tracking_rx) = depot_core::update::UpdateSender::new(64);
+    let tracking = depot_format_docker::store::DockerStore {
+        repo: "noatime-blob",
+        image: None,
+        kv: app.state.repo.kv.as_ref(),
+        blobs: blobs.as_ref(),
+        updater: &tracking_sender,
+        store: "default",
+        track_access: true,
+    };
+    assert!(tracking.get_blob(&digest).await.unwrap().is_some());
+    assert!(
+        tracking_rx.atime_rx.try_recv().is_ok(),
+        "tracking store should queue a blob touch"
+    );
+
+    // A no-atime store queues nothing.
+    let (sender, mut receiver) = depot_core::update::UpdateSender::new(64);
+    let store = depot_format_docker::store::DockerStore {
+        repo: "noatime-blob",
+        image: None,
+        kv: app.state.repo.kv.as_ref(),
+        blobs: blobs.as_ref(),
+        updater: &sender,
+        store: "default",
+        track_access: true,
+    }
+    .without_atime();
+    assert!(store.get_blob(&digest).await.unwrap().is_some());
+    let touched = receiver.atime_rx.try_recv();
+    assert!(
+        touched.is_err(),
+        "no-atime blob read must not queue a touch, got {:?}",
+        touched.ok().map(|e| e.path)
+    );
+}
+
+/// Build a [`FormatState`] mirroring the app's, but wired to a fresh
+/// [`UpdateSender`] whose receiver the test keeps — so we can observe exactly
+/// which atime touches a docker handler queues.
+fn observing_format_state(
+    app: &TestApp,
+    sender: depot_core::update::UpdateSender,
+) -> depot_core::format_state::FormatState {
+    let base = app.state.format_state();
+    depot_core::format_state::FormatState {
+        updater: sender,
+        ..base
+    }
+}
+
+/// A HEAD manifest request is a pure existence check (Docker daemons HEAD
+/// before every pull) and must never refresh `last_accessed_at`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_head_manifest_does_not_touch_atime() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("head-noatime").await;
+    let config_digest = app.push_docker_blob("head-noatime", b"{}").await;
+    let layer_digest = app.push_docker_blob("head-noatime", b"layer").await;
+    let manifest = TestApp::make_manifest(&config_digest, &[&layer_digest]);
+    app.push_docker_manifest("head-noatime", "v1.0", &manifest)
+        .await;
+
+    let (sender, mut receiver) = depot_core::update::UpdateSender::new(64);
+    let fs = observing_format_state(&app, sender);
+    let headers = axum::http::HeaderMap::new();
+
+    let resp = depot_format_docker::api::manifests::do_head_manifest(
+        &fs,
+        "admin",
+        "head-noatime",
+        None,
+        "v1.0",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let touched = receiver.atime_rx.try_recv();
+    assert!(
+        touched.is_err(),
+        "HEAD manifest must not queue a touch, got {:?}",
+        touched.ok().map(|e| e.path)
+    );
+}
+
+/// A GET manifest carrying `X-Depot-No-Atime` (sent by read-only tooling) must
+/// not refresh `last_accessed_at`, while a plain GET still does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_manifest_honors_no_atime_header() {
+    let app = TestApp::new().await;
+    app.create_docker_repo("get-noatime").await;
+    let config_digest = app.push_docker_blob("get-noatime", b"{}").await;
+    let layer_digest = app.push_docker_blob("get-noatime", b"layer").await;
+    let manifest = TestApp::make_manifest(&config_digest, &[&layer_digest]);
+    app.push_docker_manifest("get-noatime", "v1.0", &manifest)
+        .await;
+
+    // With the opt-out header: no touches.
+    let (sender, mut receiver) = depot_core::update::UpdateSender::new(64);
+    let fs = observing_format_state(&app, sender);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-depot-no-atime",
+        axum::http::HeaderValue::from_static("1"),
+    );
+    let resp = depot_format_docker::api::manifests::do_get_manifest(
+        &fs,
+        "admin",
+        "get-noatime",
+        None,
+        "v1.0",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let touched = receiver.atime_rx.try_recv();
+    assert!(
+        touched.is_err(),
+        "GET with X-Depot-No-Atime must not queue a touch, got {:?}",
+        touched.ok().map(|e| e.path)
+    );
+
+    // Without the header: the tag and its manifest are both touched.
+    let (sender2, mut receiver2) = depot_core::update::UpdateSender::new(64);
+    let fs2 = observing_format_state(&app, sender2);
+    let plain = axum::http::HeaderMap::new();
+    let resp2 = depot_format_docker::api::manifests::do_get_manifest(
+        &fs2,
+        "admin",
+        "get-noatime",
+        None,
+        "v1.0",
+        &plain,
+        None,
+    )
+    .await;
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let mut paths = std::collections::BTreeSet::new();
+    while let Ok(event) = receiver2.atime_rx.try_recv() {
+        paths.insert(event.path);
+    }
+    assert!(
+        paths.contains("_tags/v1.0"),
+        "plain GET should touch the tag, got {:?}",
+        paths
     );
 }
 
