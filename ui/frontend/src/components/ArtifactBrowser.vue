@@ -122,10 +122,15 @@ const manifestPlatforms = ref<{ platform: string; digest: string; size: number }
 const manifestConfig = ref<{ digest: string; size: number } | null>(null)
 const manifestLayers = ref<{ digest: string; size: number }[]>([])
 const manifestTotal = ref(0)
+// Tag timestamps carried from the browse row (no extra fetch — already loaded).
+const manifestUpdated = ref('')
+const manifestAccessed = ref('')
 
 async function openTagDetail(item: DisplayItem) {
   const image = prefix.value.replace(/\/+$/, '')
   manifestTag.value = item.name
+  manifestUpdated.value = item.updated_at || ''
+  manifestAccessed.value = item.last_accessed_at || ''
   manifestError.value = ''
   manifestDigest.value = ''
   manifestMediaType.value = ''
@@ -283,6 +288,8 @@ interface DisplayItem {
   size: number
   content_type: string
   updated_at: string
+  last_accessed_at?: string
+  created_at?: string
   artifact_count?: number
   total_bytes?: number
   kind?: 'tag'
@@ -309,6 +316,8 @@ const displayItems = computed((): DisplayItem[] => {
       size: a.size,
       content_type: a.content_type,
       updated_at: a.updated_at,
+      last_accessed_at: a.last_accessed_at,
+      created_at: a.created_at,
     }))
   }
 
@@ -324,6 +333,7 @@ const displayItems = computed((): DisplayItem[] => {
       size: d.total_bytes,
       content_type: '',
       updated_at: d.last_modified_at,
+      last_accessed_at: d.last_accessed_at,
       artifact_count: d.artifact_count,
       total_bytes: d.total_bytes,
     })
@@ -338,6 +348,8 @@ const displayItems = computed((): DisplayItem[] => {
         size: a.size,
         content_type: a.content_type,
         updated_at: a.updated_at,
+        last_accessed_at: a.last_accessed_at,
+        created_at: a.created_at,
       }))
       return [...dItems, ...fItems]
     }
@@ -361,6 +373,7 @@ const displayItems = computed((): DisplayItem[] => {
     size: d.total_bytes,
     content_type: '',
     updated_at: d.last_modified_at,
+    last_accessed_at: d.last_accessed_at,
     artifact_count: d.artifact_count,
     total_bytes: d.total_bytes,
   }))
@@ -372,6 +385,8 @@ const displayItems = computed((): DisplayItem[] => {
     size: a.size,
     content_type: a.content_type,
     updated_at: a.updated_at,
+    last_accessed_at: a.last_accessed_at,
+    created_at: a.created_at,
   }))
 
   return [...dirItems, ...fileItems]
@@ -497,6 +512,8 @@ async function load() {
         size: a.size,
         content_type: 'docker tag',
         updated_at: a.updated_at,
+        last_accessed_at: a.last_accessed_at,
+        created_at: a.created_at,
         kind: 'tag' as const,
       }))
     }
@@ -782,7 +799,8 @@ watch(
           <col style="width: auto;" />
           <col style="width: 10rem;" />
           <col :style="{ width: isDocker ? '9rem' : '16rem' }" />
-          <col style="width: 14rem;" />
+          <col style="width: 13rem;" />
+          <col style="width: 13rem;" />
           <col style="width: 13rem;" />
         </colgroup>
         <thead>
@@ -790,7 +808,8 @@ watch(
             <th>Name</th>
             <th>Size</th>
             <th>{{ isDocker ? 'Type' : 'Content Type' }}</th>
-            <th>Updated</th>
+            <th>Created/Modified</th>
+            <th>Last Accessed</th>
             <th></th>
           </tr>
         </thead>
@@ -829,6 +848,7 @@ watch(
               <template v-else>{{ item.isDir ? 'Folder' : item.content_type }}</template>
             </td>
             <td>{{ formatDate(item.updated_at) }}</td>
+            <td>{{ item.last_accessed_at ? formatDate(item.last_accessed_at) : '—' }}</td>
             <td>
               <!-- Docker tag: Copy pull + Download for everyone (both modes);
                    Delete only with Expert on AND admin. -->
@@ -937,6 +957,10 @@ watch(
           <dd v-if="!manifestIsList">{{ formatSize(manifestTotal) }}</dd>
           <dt v-if="manifestMediaType">Media type</dt>
           <dd v-if="manifestMediaType" class="mono">{{ manifestMediaType }}</dd>
+          <dt>Created/Modified</dt>
+          <dd>{{ manifestUpdated ? formatDate(manifestUpdated) : '—' }}</dd>
+          <dt>Last Accessed</dt>
+          <dd>{{ manifestAccessed ? formatDate(manifestAccessed) : '—' }}</dd>
         </dl>
 
         <!-- Multi-arch: per-platform child manifests -->
