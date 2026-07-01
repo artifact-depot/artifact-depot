@@ -1197,7 +1197,34 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         let moves = std::mem::take(&mut resolved.moves);
         let (kept, superseded) = resolve_move_collisions(moves, &present, &ts);
         resolved.moves = kept;
-        resolved.superseded = superseded;
+        // A superseded copy — an older/duplicate copy whose winning copy is kept
+        // elsewhere — is deleted on --apply. The one exception: if we can PROVE
+        // the source copy is NEWER than the copy that was kept, we refuse to drop
+        // it automatically (that would discard a newer build) and leave it flagged
+        // for review instead. Record each deletable copy's build date so the
+        // REMOVED listing can still show the age evidence.
+        for s in superseded {
+            let source_is_newer = matches!(
+                (&s.own_built, &s.winner_built),
+                (Some(o), Some(w)) if o > w
+            );
+            if source_is_newer {
+                resolved.superseded.push(s);
+            } else {
+                resolved.created.insert(
+                    (
+                        s.tag.source_repo.clone(),
+                        s.tag.image.clone(),
+                        s.tag.tag.clone(),
+                    ),
+                    s.own_built.clone().unwrap_or_else(|| "?".to_string()),
+                );
+                resolved.deletes.push(DeleteItem {
+                    tag: s.tag,
+                    reason: "superseded (a newer copy is kept elsewhere)".to_string(),
+                });
+            }
+        }
     }
 
     // Last-accessed (usage) data from the configured usage repo, used ONLY by the
