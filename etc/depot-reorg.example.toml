@@ -1,0 +1,138 @@
+# Example rules for `depot-bench reorg`.
+#
+# Everything is data-driven from this file — no repo names, image prefixes, or
+# tag conventions are compiled into depot. Run a dry run first:
+#
+#   depot-bench reorg --url https://depot-dev.lab.mdh.quantum.com \
+#       --username admin --password ... --rules etc/depot-reorg.example.toml
+#
+# then add --apply to execute (or --copy for a non-destructive pass that uses
+# staging/copy for moves and skips all deletes/purges).
+
+# --------------------------------------------------------------------------
+# Reusable named patterns. Reference any by name from a rule's `match`, or
+# inline a regex there. Patterns are auto-anchored (^(?:…)$), so write them
+# without ^ / $. Shared across every group below (and future helm/raw groups).
+# --------------------------------------------------------------------------
+# Optional: read last-accessed (usage) data from this repo to annotate the
+# dry-run plan — typically the docker group/proxy, so each tag's *live* atime is
+# reported (the stale source member resolves last in the group). Report only; it
+# never changes what gets moved/deleted. Annotations: [pulled DATE] if the proxy
+# served the tag, or [absent from <repo>] (a "stale, safe to drop" hint).
+usage_repo = "docker"
+
+# --------------------------------------------------------------------------
+# Optional cache-integrity check. A local cache repo (e.g. docker-insight) is
+# supposed to mirror an authoritative upstream registry; anything in the cache
+# that the upstream doesn't have was manually pushed (pollution). The dry-run
+# diffs the cache against the union of the upstream repos and flags the extras.
+# Upstream credentials come from the UPSTREAM_USERNAME / UPSTREAM_PASSWORD env
+# vars. Report-only, and skipped (with a note) if creds are unset or the
+# upstream is unreachable.
+[check_authority]
+cache_repo     = "docker-insight"
+upstream_url   = "https://insight.quantum.com:8081"
+upstream_repos = ["docker-external", "docker-release"]
+
+# A buildx pipeline tags each platform separately (e.g. `1.4.0-dev.80-linux_amd64`,
+# `…-linux_arm64_v8`) AND stitches them into a bare manifest-list/index tag
+# (`1.4.0-dev.80`). The optional trailing `(-<os>_<arch>)?` makes a platform
+# component tag route exactly like its base tag, so a multi-arch family stays
+# together (e.g. the components follow their index into docker-prerelease) instead
+# of falling to the catch-all.
+[patterns]
+released   = '\d+\.\d+\.\d+(-(linux|windows|darwin)_[a-z0-9_]+)?'
+prerelease = '\d+\.\d+\.\d+-(dev|rc)\.\d+(-(linux|windows|darwin)_[a-z0-9_]+)?'
+develop    = 'develop(-(linux|windows|darwin)_[a-z0-9_]+)?'
+ci         = 'ci-.+-\d+'
+developer  = '[a-z][a-z0-9]*-\d+'
+
+# --------------------------------------------------------------------------
+# One group per artifact format. Only `docker` is supported by the server-side
+# movers today; helm/raw groups will reuse the same [patterns] once those land.
+# --------------------------------------------------------------------------
+[[group]]
+format               = "docker"
+# Repos to scan and re-home. List the destinations here too (prerelease /
+# development-local / release-aux): an artifact already misfiled in a dest gets
+# re-classified to where it belongs, and a tag already in its correct repo is
+# skipped (self-move guard), so a second run converges to ~0 moves.
+source_repos         = [
+    "docker-internal", "docker-external",
+    "docker-prerelease", "docker-development-local", "docker-release-aux",
+    # docker-upstream is scanned as a source too: drain first-party + retired
+    # from it, but LEAVE (and don't report) its third-party cache images — the
+    # repo itself is kept, only the first-party/retired prefixes are purged.
+    "docker-upstream",
+]
+first_party_prefixes = ["myriad/", "qkp/", "quantum-orchestrator/"]
+# No wholesale-purge repos: third-party images outside first_party_prefixes /
+# retired_prefixes are none of the reorg's business and are left untouched.
+purge_repos          = []
+# Retired/renamed namespaces — every tag under these is deleted from the source
+# repos (e.g. the project was renamed to quantum-orchestrator/).
+retired_prefixes      = ["orchestrator/", "quantum_orchestrator/"]
+
+  # Ordered; first matching rule wins.
+
+  # x.y.z-dev.n / -rc.n  → prerelease repo
+  [[group.rule]]
+  match  = "prerelease"
+  action = "move"
+  dest   = "docker-prerelease"
+
+  # x.y.z released → classify by the EXPLICIT per-image pipeline rule. Each
+  # first-party image is published to exactly one of two release destinations by
+  # its project's `.gitlab-ci.yml` publish_release job — no overlap, and NOT
+  # inferable from cache presence:
+  #   aux_images     → docker-release-aux (move there; that is its home)
+  #   insight_images → shipped to the customer-facing upstream insight registry
+  #                    (mirrored by the docker-insight cache); the source copy is
+  #                    redundant, so it's verified against `insight_repo` and:
+  #                      same digest      → drop the source copy (never out of the
+  #                                         cache itself — only copies elsewhere)
+  #                      different digest → the `mismatch` --apply group: deleted by
+  #                                         `--apply mismatch` when the insight copy is
+  #                                         newer/same build; a NEWER source is always
+  #                                         kept for review. Set on_mismatch = "leave"
+  #                                         to park every mismatch for review instead.
+  #                      absent upstream  → flag, never dropped (may be the only copy)
+  #   neither list   → "needs classification": reported with evidence, never
+  #                    moved/deleted. The lists are a snapshot of today's pipeline;
+  #                    historical tags built under older rules may need triage and
+  #                    adding to the right list. The lists live in the include file
+  #                    below (regenerate from the CI files when the pipeline changes).
+  [[group.rule]]
+  match        = "released"
+  action       = "classify"
+  aux_dest     = "docker-release-aux"
+  insight_repo = "docker-insight"
+  classes_file = "depot-reorg.image-classes.toml"
+
+  # rolling develop tag → prerelease repo
+  [[group.rule]]
+  match  = "develop"
+  action = "move"
+  dest   = "docker-prerelease"
+
+  # ci-*-<n>  → development-local
+  [[group.rule]]
+  match  = "ci"
+  action = "move"
+  dest   = "docker-development-local"
+
+  # <name>-<n> (e.g. slord-79) → development-local
+  [[group.rule]]
+  match  = "developer"
+  action = "move"
+  dest   = "docker-development-local"
+
+  # Catch-all: anything no rule matched (dash-versions, platform-suffixed builder
+  # tags, branch tags, …) → development-local (the hosted repo that backs the
+  # `docker-development` group; a move must target a hosted repo, not the group).
+  # Unused ones age out via that repo's cleanup_max_unaccessed_days; anything
+  # still pulled keeps its atime fresh.
+  [[group.rule]]
+  match  = '.*'
+  action = "move"
+  dest   = "docker-development-local"

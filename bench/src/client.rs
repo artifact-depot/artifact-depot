@@ -38,10 +38,33 @@ pub struct CreateRepoRequest {
 #[derive(Debug, Deserialize)]
 pub struct RepoResponse {
     pub name: String,
-    #[allow(dead_code)]
     pub repo_type: String,
-    #[allow(dead_code)]
     pub format: String,
+    /// Ordered member list for group/proxy repos (first-match-wins resolution).
+    #[serde(default)]
+    pub members: Option<Vec<String>>,
+    /// Total artifact records (tags + manifests + blobs) currently in the repo.
+    #[serde(default)]
+    pub artifact_count: u64,
+    /// Logical size of those records in bytes (shared blobs counted per-repo).
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// Retention: expire artifacts older than this many days (by creation).
+    #[serde(default)]
+    pub cleanup_max_age_days: Option<u32>,
+    /// Retention: expire artifacts not accessed within this many days.
+    #[serde(default)]
+    pub cleanup_max_unaccessed_days: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StoreResponse {
+    pub name: String,
+    #[serde(default)]
+    pub blob_count: u64,
+    /// Physical bytes stored (deduplicated; shared blobs counted once).
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +72,9 @@ pub struct ArtifactResponse {
     pub path: String,
     #[allow(dead_code)]
     pub size: u64,
+    /// Authoritative last-accessed time (RFC3339), present on the browse API.
+    #[serde(default)]
+    pub last_accessed_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +227,22 @@ impl DepotClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("list repos failed ({}): {}", status, body);
+        }
+        Ok(resp.json().await?)
+    }
+
+    pub async fn list_stores(&self) -> Result<Vec<StoreResponse>> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/stores", self.base_url))
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("list stores failed ({}): {}", status, body);
         }
         Ok(resp.json().await?)
     }
@@ -644,6 +686,40 @@ impl DepotClient {
         Ok(browse.artifacts)
     }
 
+    /// List `(tag, last_accessed_at)` for an image's tags via the browse API.
+    /// `repo` is typically the docker *group/proxy* so the access time reflects
+    /// the live copy (the stale member resolves last). Returns the relative tag
+    /// name (the browse API strips the prefix) and its RFC3339 atime if present.
+    pub async fn image_tag_atimes(
+        &self,
+        repo: &str,
+        image: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let token = self.bearer_token().await?;
+        let prefix = format!("{image}/_tags/");
+        let resp = self
+            .http
+            .get(format!(
+                "{}/api/v1/repositories/{}/artifacts",
+                self.base_url, repo
+            ))
+            .bearer_auth(&token)
+            .query(&[("prefix", prefix.as_str()), ("limit", "100000")])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("browse {repo}/{prefix} failed ({status}): {body}");
+        }
+        let browse: BrowseResponse = resp.json().await?;
+        Ok(browse
+            .artifacts
+            .into_iter()
+            .map(|a| (a.path, a.last_accessed_at))
+            .collect())
+    }
+
     pub async fn search_artifacts(&self, repo: &str, query: &str) -> Result<Vec<ArtifactResponse>> {
         let token = self.bearer_token().await?;
         let resp = self
@@ -886,6 +962,62 @@ impl DepotClient {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// GET a manifest using the path-based form so multi-segment image names
+    /// route to the docker handler rather than the SPA. Returns (body, content-type).
+    pub async fn docker_get_manifest_path(
+        &self,
+        repo: &str,
+        image: &str,
+        reference: &str,
+    ) -> Result<(Vec<u8>, String)> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/repository/{}/v2/{}/manifests/{}",
+                self.base_url, repo, image, reference
+            ))
+            .header("Authorization", format!("Basic {}", self.basic_auth))
+            .header("Accept", MANIFEST_ACCEPT_ALL)
+            .send()
+            .await?;
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("docker get manifest failed ({status}): {body}");
+        }
+        Ok((resp.bytes().await?.to_vec(), content_type))
+    }
+
+    /// GET a blob using the path-based form (multi-segment image safe).
+    pub async fn docker_get_blob_path(
+        &self,
+        repo: &str,
+        image: &str,
+        digest: &str,
+    ) -> Result<Vec<u8>> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/repository/{}/v2/{}/blobs/{}",
+                self.base_url, repo, image, digest
+            ))
+            .header("Authorization", format!("Basic {}", self.basic_auth))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("docker get blob failed ({status}): {body}");
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     pub async fn docker_head_blob(
         &self,
         repo: &str,
@@ -937,8 +1069,11 @@ impl DepotClient {
     ) -> Result<(u16, String, String)> {
         let resp = self
             .http
+            // Path-based form so multi-segment image names (e.g.
+            // `breakpad/builder_redhat7`) route to the docker handler rather
+            // than the SPA frontend.
             .head(format!(
-                "{}/v2/{}/{}/manifests/{}",
+                "{}/repository/{}/v2/{}/manifests/{}",
                 self.base_url, repo, image, reference
             ))
             .header("Authorization", format!("Basic {}", self.basic_auth))
@@ -964,7 +1099,12 @@ impl DepotClient {
     pub async fn docker_list_tags(&self, repo: &str, image: &str) -> Result<Vec<String>> {
         let resp = self
             .http
-            .get(format!("{}/v2/{}/{}/tags/list", self.base_url, repo, image))
+            // Path-based form so multi-segment image names route to the docker
+            // handler rather than the SPA frontend.
+            .get(format!(
+                "{}/repository/{}/v2/{}/tags/list",
+                self.base_url, repo, image
+            ))
             .header("Authorization", format!("Basic {}", self.basic_auth))
             .send()
             .await?;
@@ -1088,6 +1228,99 @@ impl DepotClient {
             .send()
             .await?;
         Ok(resp.status().as_u16())
+    }
+
+    // --- Nexus staging ops ---
+
+    /// `POST /service/rest/v1/staging/move/{dest}` — move a Docker `image:tag`
+    /// from `source` into `dest` (same blob store, metadata-only).
+    pub async fn staging_move(
+        &self,
+        source: &str,
+        dest: &str,
+        image: &str,
+        tag: &str,
+    ) -> Result<()> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .post(format!(
+                "{}/service/rest/v1/staging/move/{}",
+                self.base_url, dest
+            ))
+            .bearer_auth(&token)
+            .query(&[
+                ("repository", source),
+                ("docker.imageName", image),
+                ("docker.imageTag", tag),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "staging move {source}/{image}:{tag} -> {dest} failed ({status}): {body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `POST /service/rest/v1/staging/copy/{dest}` — copy a Docker `image:tag`
+    /// from `source` into `dest` (works across blob stores; leaves the source).
+    pub async fn staging_copy(
+        &self,
+        source: &str,
+        dest: &str,
+        image: &str,
+        tag: &str,
+    ) -> Result<()> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .post(format!(
+                "{}/service/rest/v1/staging/copy/{}",
+                self.base_url, dest
+            ))
+            .bearer_auth(&token)
+            .query(&[
+                ("repository", source),
+                ("docker.imageName", image),
+                ("docker.imageTag", tag),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "staging copy {source}/{image}:{tag} -> {dest} failed ({status}): {body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `POST /service/rest/v1/staging/delete` — delete a Docker `image:tag`
+    /// from `source`.
+    pub async fn staging_delete(&self, source: &str, image: &str, tag: &str) -> Result<()> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .post(format!("{}/service/rest/v1/staging/delete", self.base_url))
+            .bearer_auth(&token)
+            .query(&[
+                ("repository", source),
+                ("docker.imageName", image),
+                ("docker.imageTag", tag),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("staging delete {source}/{image}:{tag} failed ({status}): {body}");
+        }
+        Ok(())
     }
 
     pub async fn docker_push_manifest_raw(

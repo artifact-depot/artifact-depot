@@ -7,7 +7,7 @@
 
 use clap::{Parser, Subcommand};
 
-use depot_bench::{client, demo, runner};
+use depot_bench::{audit, client, demo, reorg, runner};
 
 #[derive(Parser)]
 #[command(
@@ -147,6 +147,69 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         pipeline: usize,
     },
+
+    /// Re-file Docker images into the right repositories by tag, per a rules file
+    Reorg {
+        /// Base URL of the depot instance
+        #[arg(long, default_value = "http://localhost:8080")]
+        url: String,
+
+        /// Username for authentication
+        #[arg(long, default_value = "admin")]
+        username: String,
+
+        /// Password for authentication
+        #[arg(long, default_value = "admin")]
+        password: String,
+
+        /// Skip TLS certificate verification
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
+
+        /// Path to the TOML rules file
+        #[arg(long)]
+        rules: String,
+
+        /// Action groups to execute, comma-separated: any of `move`,
+        /// `redundant`, `superseded`, `mismatch`, `retired`, `non-released`, or
+        /// `all`. Omit for a dry run that prints the plan and each group's name.
+        /// e.g. `--apply move,redundant` runs the moves and drops the redundant
+        /// duplicates, leaving everything else untouched.
+        #[arg(long)]
+        apply: Option<String>,
+
+        /// Use staging copy (leave the source intact) instead of move
+        #[arg(long, default_value_t = false)]
+        copy: bool,
+
+        /// Print the full per-tag move list (default shows only the summary +
+        /// removals; moves are summarized by destination)
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+
+    /// Audit a group repo for tags cloaked by an earlier member (shadowing)
+    AuditShadow {
+        /// Base URL of the depot instance
+        #[arg(long, default_value = "http://localhost:8080")]
+        url: String,
+
+        /// Username for authentication
+        #[arg(long, default_value = "admin")]
+        username: String,
+
+        /// Password for authentication
+        #[arg(long, default_value = "admin")]
+        password: String,
+
+        /// Skip TLS certificate verification
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
+
+        /// Name of the group/proxy repo to audit
+        #[arg(long)]
+        group: String,
+    },
 }
 
 #[tokio::main]
@@ -248,6 +311,62 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await?;
+        }
+
+        Command::Reorg {
+            url,
+            username,
+            password,
+            insecure,
+            rules,
+            apply,
+            copy,
+            verbose,
+        } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "depot=info".into()),
+                )
+                .init();
+
+            let c = client::DepotClient::new(&url, &username, &password, insecure)?;
+            // Parse the comma-separated group list; None => dry run.
+            let apply = apply.map(|s| {
+                s.split(',')
+                    .map(|g| g.trim().to_string())
+                    .filter(|g| !g.is_empty())
+                    .collect::<Vec<_>>()
+            });
+            reorg::run(
+                &c,
+                reorg::ReorgConfig {
+                    rules_path: rules,
+                    apply,
+                    copy,
+                    insecure,
+                    verbose,
+                },
+            )
+            .await?;
+        }
+
+        Command::AuditShadow {
+            url,
+            username,
+            password,
+            insecure,
+            group,
+        } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "depot=info".into()),
+                )
+                .init();
+
+            let c = client::DepotClient::new(&url, &username, &password, insecure)?;
+            audit::run(&c, audit::AuditConfig { group }).await?;
         }
     }
 
