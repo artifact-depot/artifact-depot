@@ -26,8 +26,8 @@ pub use artifact::{
     list_artifacts, put_artifact, put_artifact_if_absent, search_artifacts, touch_artifact,
 };
 pub use blob::{
-    count_blobs_for_store, delete_blob, fold_all_blobs, get_blob, list_blobs_for_store, put_blob,
-    put_dedup_record,
+    claim_or_reuse_blob, count_blobs_for_store, delete_blob, fold_all_blobs, get_blob,
+    list_blobs_for_store, put_blob, put_dedup_record,
 };
 pub use directory::{get_dir, get_repo_stats, list_children};
 pub use meta::{delete_meta, get_gc_last_started_at, get_meta, put_meta, set_gc_last_started_at};

@@ -1339,6 +1339,97 @@ async fn cache_get_miss_fetches_upstream() {
     assert!(cached.is_some());
 }
 
+/// Count regular files under a directory tree (blob files on disk).
+fn count_files_recursive(dir: &std::path::Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_files_recursive(&path);
+            } else if path.is_file() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_refetch_identical_content_reuses_blob() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (kv, blobs, dir) = test_kv().await;
+    let blobs_dir = dir.path().join("blobs");
+    let http = reqwest::Client::new();
+    let mock_server = MockServer::start().await;
+
+    // Upstream serves the same bytes on every fetch (e.g. an unchanged
+    // helm index.yaml re-fetched after each TTL expiry).
+    Mock::given(method("GET"))
+        .and(path("/index.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"unchanged-upstream-content".to_vec())
+                .insert_header("content-type", "application/x-yaml"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let cache = CacheRepo {
+        name: "cache1".to_string(),
+        upstream_url: mock_server.uri(),
+        cache_ttl_secs: 60,
+        kv: Arc::clone(&kv),
+        blobs: Arc::clone(&blobs),
+        store: "default".to_string(),
+        http: http.clone(),
+        upstream_auth: None,
+        inflight: InflightMap::new(),
+        updater: UpdateSender::noop(),
+        format: "raw".into(),
+    };
+
+    // First fetch: cache miss, fills the cache.
+    let result = cache.get("index.yaml").await.unwrap().unwrap();
+    assert_eq!(read_all(result.data).await, b"unchanged-upstream-content");
+    let first = service::get_artifact(kv.as_ref(), "cache1", "index.yaml")
+        .await
+        .unwrap()
+        .unwrap();
+    let first_blob_id = first.blob_id.clone().unwrap();
+    assert_eq!(count_files_recursive(&blobs_dir), 1);
+
+    // Expire the cached record so the next get re-fetches upstream.
+    let mut rec = first.clone();
+    rec.updated_at = DateTime::from_timestamp(1000, 0).unwrap(); // very old
+    service::put_artifact(kv.as_ref(), "cache1", "index.yaml", &rec)
+        .await
+        .unwrap();
+
+    // Second fetch: upstream content is byte-identical, so the commit must
+    // dedup against the existing blob — reuse its blob_id and delete the
+    // freshly written duplicate.
+    let result = cache.get("index.yaml").await.unwrap().unwrap();
+    assert_eq!(read_all(result.data).await, b"unchanged-upstream-content");
+
+    let second = service::get_artifact(kv.as_ref(), "cache1", "index.yaml")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second.blob_id.as_deref(),
+        Some(first_blob_id.as_str()),
+        "re-fetch of identical content must reuse the existing blob_id"
+    );
+    assert_eq!(
+        count_files_recursive(&blobs_dir),
+        1,
+        "re-fetch of identical content must not leave a duplicate blob file on disk"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_get_passes_upstream_content_length() {
     use wiremock::matchers::{method, path};

@@ -284,6 +284,10 @@ impl<'a> DockerStore<'a> {
             path: String::new(),
             internal: false,
         };
+        // The mounted blob_id references a pre-existing, shared blob file — we
+        // did not write a new one, so on a lost dedup race there is no
+        // duplicate to delete (and deleting would destroy live data). Ignoring
+        // the result is safe: the record only re-registers existing content.
         service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, self.repo, &blob_path, &record).await?;
         let (count_delta, bytes_delta) = match &old_record {
@@ -476,7 +480,10 @@ impl<'a> DockerStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+        // Re-pushing an identical manifest (e.g. the same image under a second
+        // tag) dedups against the existing manifest blob.
+        let blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
 
         let manifest_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,

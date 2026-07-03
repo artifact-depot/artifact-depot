@@ -32,6 +32,12 @@ pub async fn get_blob(
 /// Returns `None` if a new record was created (we won the race),
 /// or `Some(existing_blob_id)` if a record already existed (dedup — caller
 /// should delete the duplicate blob file and use the existing blob_id).
+///
+/// Most callers that have just written a fresh blob should use
+/// [`claim_or_reuse_blob`] instead, which handles the dedup hit (duplicate
+/// deletion + blob_id substitution) so it cannot be forgotten. Call this
+/// directly only when registering a pre-existing blob (e.g. cross-repo
+/// mount), where there is no duplicate to delete.
 #[tracing::instrument(level = "debug", name = "put_dedup_record", skip(kv, record), fields(store, hash = %record.hash))]
 pub async fn put_dedup_record(
     kv: &dyn KvStore,
@@ -61,6 +67,38 @@ pub async fn put_dedup_record(
                 Ok(None)
             }
         }
+    }
+}
+
+/// Claim the `hash→blob_id` dedup mapping for a freshly written blob, or
+/// reuse an existing blob with the same content hash.
+///
+/// On a dedup hit the just-written duplicate blob file (`record.blob_id`) is
+/// deleted from the blob store and the existing blob_id is returned; the
+/// caller MUST reference the returned blob_id in its artifact records, never
+/// `record.blob_id` directly. Delete failures are logged and ignored — the
+/// orphaned duplicate is unreferenced, so blob GC will collect it.
+#[must_use = "artifact records must reference the returned blob_id, not the one passed in"]
+pub async fn claim_or_reuse_blob(
+    kv: &dyn KvStore,
+    blobs: &dyn crate::store::blob::BlobStore,
+    store: &str,
+    record: &BlobRecord,
+) -> error::Result<String> {
+    match put_dedup_record(kv, store, record).await? {
+        Some(existing_blob_id) if existing_blob_id != record.blob_id => {
+            // Content already stored under another blob_id — drop our duplicate.
+            if let Err(e) = blobs.delete(&record.blob_id).await {
+                tracing::warn!(
+                    store,
+                    blob_id = %record.blob_id,
+                    error = %e,
+                    "failed to delete duplicate blob after dedup hit; GC will collect it"
+                );
+            }
+            Ok(existing_blob_id)
+        }
+        _ => Ok(record.blob_id.clone()),
     }
 }
 

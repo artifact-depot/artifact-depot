@@ -364,6 +364,13 @@ async fn cache_upstream_packument(
                 created_at: now,
                 store: config.store.clone(),
             };
+            let store = config.store.clone();
+            // Best-effort cache fill: on claim failure keep the freshly written
+            // blob_id (matching the previously swallowed put_dedup_record error).
+            let tags_blob_id =
+                service::claim_or_reuse_blob(state.kv.as_ref(), blobs.as_ref(), &store, &blob_rec)
+                    .await
+                    .unwrap_or(tags_blob_id);
             let tags_record = depot_core::store::kv::ArtifactRecord {
                 schema_version: CURRENT_RECORD_VERSION,
                 id: String::new(),
@@ -381,8 +388,6 @@ async fn cache_upstream_packument(
             };
             let dt_path = npm::dist_tags_path(package);
             let cn = config.name.clone();
-            let store = config.store.clone();
-            let _ = service::put_dedup_record(state.kv.as_ref(), &store, &blob_rec).await;
             let _ = service::put_artifact(state.kv.as_ref(), &cn, &dt_path, &tags_record).await;
         }
     }
@@ -403,6 +408,17 @@ async fn cache_upstream_packument(
                     created_at: now,
                     store: config.store.clone(),
                 };
+                let store = config.store.clone();
+                // Best-effort cache fill: on claim failure keep the freshly written
+                // blob_id (matching the previously swallowed put_dedup_record error).
+                let ver_blob_id = service::claim_or_reuse_blob(
+                    state.kv.as_ref(),
+                    blobs.as_ref(),
+                    &store,
+                    &blob_rec,
+                )
+                .await
+                .unwrap_or(ver_blob_id);
                 let ver_record = depot_core::store::kv::ArtifactRecord {
                     schema_version: CURRENT_RECORD_VERSION,
                     id: String::new(),
@@ -420,8 +436,6 @@ async fn cache_upstream_packument(
                 };
                 let ver_path = npm::version_path(package, version);
                 let cn = config.name.clone();
-                let store = config.store.clone();
-                let _ = service::put_dedup_record(state.kv.as_ref(), &store, &blob_rec).await;
                 let _ = service::put_artifact(state.kv.as_ref(), &cn, &ver_path, &ver_record).await;
             }
         }

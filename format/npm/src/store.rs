@@ -78,6 +78,18 @@ impl<'a> NpmStore<'a> {
         self.blobs.put(&blob_id, data).await?;
 
         let path = tarball_path(name, version, filename);
+        let store = self.store.to_string();
+
+        // Atomic KV updates
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob_id.clone(),
+            hash: blake3_hash.clone(),
+            size: data.len() as u64,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -104,16 +116,6 @@ impl<'a> NpmStore<'a> {
             etag: Some(blake3_hash.clone()),
         };
 
-        // Atomic KV updates
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob_id.clone(),
-            hash: blake3_hash.clone(),
-            size: data.len() as u64,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-
         // Store version metadata as a blob-backed artifact
         let ver_blob_id = uuid::Uuid::new_v4().to_string();
         let ver_bytes = version_metadata_json.as_bytes();
@@ -127,6 +129,8 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
+        let ver_blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &ver_blob_rec).await?;
         let version_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -162,6 +166,8 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
+        let tags_blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &tags_blob_rec).await?;
         let tags_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -178,15 +184,11 @@ impl<'a> NpmStore<'a> {
             etag: Some(tags_hash.clone()),
         };
 
-        let store = self.store.to_string();
         let repo = self.repo.to_string();
         let record_clone = record.clone();
         let ver_path = version_path(name, version);
         let dt_path = dist_tags_path(name);
 
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
-        service::put_dedup_record(self.kv, &store, &ver_blob_rec).await?;
-        service::put_dedup_record(self.kv, &store, &tags_blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -236,6 +238,17 @@ impl<'a> NpmStore<'a> {
         self.blobs.put(&blob_id, data).await?;
 
         let path = tarball_path(name, version, filename);
+        let store = self.store.to_string();
+
+        let blob_rec = BlobRecord {
+            schema_version: CURRENT_RECORD_VERSION,
+            blob_id: blob_id.clone(),
+            hash: blake3_hash.clone(),
+            size: data.len() as u64,
+            created_at: now,
+            store: self.store.to_string(),
+        };
+        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -262,15 +275,6 @@ impl<'a> NpmStore<'a> {
             etag: Some(blake3_hash.clone()),
         };
 
-        let blob_rec = BlobRecord {
-            schema_version: CURRENT_RECORD_VERSION,
-            blob_id: blob_id.clone(),
-            hash: blake3_hash.clone(),
-            size: data.len() as u64,
-            created_at: now,
-            store: self.store.to_string(),
-        };
-
         // Store version metadata as a blob-backed artifact
         let ver_blob_id = uuid::Uuid::new_v4().to_string();
         let ver_bytes = version_metadata_json.as_bytes();
@@ -284,6 +288,8 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
+        let ver_blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &ver_blob_rec).await?;
         let version_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -300,13 +306,10 @@ impl<'a> NpmStore<'a> {
             etag: Some(ver_hash.clone()),
         };
 
-        let store = self.store.to_string();
         let repo = self.repo.to_string();
         let record_clone = record.clone();
         let ver_path = version_path(name, version);
 
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
-        service::put_dedup_record(self.kv, &store, &ver_blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record_clone).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -395,6 +398,9 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
+        let store = self.store.to_string();
+        let tags_blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -410,9 +416,7 @@ impl<'a> NpmStore<'a> {
             content_hash: Some(tags_hash.clone()),
             etag: Some(tags_hash.clone()),
         };
-        let store = self.store.to_string();
         let repo = self.repo.to_string();
-        service::put_dedup_record(self.kv, &store, &blob_rec).await?;
         let old_record = service::put_artifact(self.kv, &repo, &path, &record).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -730,7 +734,8 @@ impl<'a> NpmStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+        let blob_id =
+            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
 
         let norm = normalize_name(package);
         let path = format!("_npm/packument/{norm}");
