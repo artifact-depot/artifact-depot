@@ -1420,3 +1420,131 @@ async fn clean_repo_artifacts_with_cancel() {
     .await;
     assert!(result.is_err(), "cancelled clean should return error");
 }
+
+/// Full-flow regression for the depot-dev observation that a staging-MOVED old
+/// tag survived the destination's max-age cleanup: push an aged image into a
+/// source repo (namespaced, like real first-party images), staging-move it to a
+/// destination with a 1-day age policy, then run the expiry sweep. The moved
+/// tag record must keep its original created_at and therefore expire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_moved_old_tag_expires_by_destination_age_policy() {
+    let (kv, blobs, _registry, _dir) = setup_test_env().await;
+
+    let mk_repo = |name: &str, max_age: Option<u64>| RepoConfig {
+        schema_version: CURRENT_RECORD_VERSION,
+        name: name.to_string(),
+        kind: RepoKind::Hosted,
+        format_config: FormatConfig::Docker {
+            listen: None,
+            cleanup_untagged_manifests: None,
+        },
+        store: "default".to_string(),
+        created_at: chrono::Utc::now(),
+        cleanup_max_unaccessed_days: None,
+        cleanup_max_age_days: max_age,
+        deleting: false,
+    };
+    let src = mk_repo("dkr-move-src", None);
+    let dest = mk_repo("dkr-move-dest", Some(1));
+    service::put_repo(kv.as_ref(), &src).await.unwrap();
+    service::put_repo(kv.as_ref(), &dest).await.unwrap();
+
+    // A minimal, parseable v2 manifest stored as a blob (copy_tag walks it).
+    let manifest_json = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {"digest": "sha256:cfg", "size": 2, "mediaType": "application/vnd.docker.container.image.v1+json"},
+        "layers": [{"digest": "sha256:lay", "size": 2, "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip"}]
+    })
+    .to_string();
+    blobs.put("mblob", manifest_json.as_bytes()).await.unwrap();
+
+    let old = chrono::Utc::now() - chrono::Duration::days(47);
+    let image = "myriad/api_alert_manager";
+    let stub = ArtifactRecord {
+        schema_version: CURRENT_RECORD_VERSION,
+        id: String::new(),
+        size: manifest_json.len() as u64,
+        content_type: "application/vnd.docker.distribution.manifest.v2+json".to_string(),
+        created_at: old,
+        updated_at: old,
+        last_accessed_at: old,
+        path: String::new(),
+        kind: ArtifactKind::DockerManifest {
+            docker_digest: "sha256:root".to_string(),
+        },
+        internal: false,
+        blob_id: Some("mblob".to_string()),
+        content_hash: None,
+        etag: None,
+    };
+    let tag_rec = ArtifactRecord {
+        kind: ArtifactKind::DockerTag {
+            digest: "sha256:root".to_string(),
+            tag: "1.0.0-sb-test".to_string(),
+        },
+        blob_id: None,
+        ..stub.clone()
+    };
+    let tag_path = format!("{image}/_tags/1.0.0-sb-test");
+    let manifest_path = format!("{image}/_manifests/sha256:root");
+    service::put_artifact(kv.as_ref(), "dkr-move-src", &tag_path, &tag_rec)
+        .await
+        .unwrap();
+    service::put_artifact(kv.as_ref(), "dkr-move-src", &manifest_path, &stub)
+        .await
+        .unwrap();
+    for blob_ref in ["_blobs/sha256:cfg", "_blobs/sha256:lay"] {
+        service::put_artifact(kv.as_ref(), "dkr-move-src", blob_ref, &stub)
+            .await
+            .unwrap();
+    }
+
+    // Staging-move the tag (same store, delete source) — the real reorg path.
+    let updater = UpdateSender::noop();
+    let target = depot_format_docker::CopyTarget {
+        kv: kv.as_ref(),
+        updater: &updater,
+        source_repo: "dkr-move-src",
+        source_store: "default",
+        source_blobs: blobs.as_ref(),
+        dest_repo: "dkr-move-dest",
+        dest_store: "default",
+        dest_blobs: blobs.as_ref(),
+    };
+    depot_format_docker::promote::copy_tag(&target, Some(image), "1.0.0-sb-test", true, true)
+        .await
+        .unwrap();
+
+    // The moved record must keep its original created_at...
+    let moved = service::get_artifact(kv.as_ref(), "dkr-move-dest", &tag_path)
+        .await
+        .unwrap()
+        .expect("moved tag exists in dest");
+    assert_eq!(moved.created_at, old, "move must preserve created_at");
+
+    // ...and therefore expire under the destination's 1-day age policy.
+    let (_, _, expired) =
+        super::repo_cleanup::expire_repo_artifacts(kv.clone(), &dest, None, &UpdateSender::noop())
+            .await
+            .unwrap();
+    assert!(expired >= 1, "aged moved tag should expire, got {expired}");
+    assert!(
+        service::get_artifact(kv.as_ref(), "dkr-move-dest", &tag_path)
+            .await
+            .unwrap()
+            .is_none(),
+        "moved tag should be expired by the destination age policy"
+    );
+
+    // The paired delete must also remove the browse-tree file entry — a
+    // surviving row is a ghost (dangling tag in the UI, no record behind it).
+    let (_, te_pk, te_sk) = depot_core::store::keys::tree_entry_key("dkr-move-dest", &tag_path);
+    assert!(
+        kv.get(depot_core::store::keys::TABLE_DIR_ENTRIES, te_pk, te_sk)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired tag must not leave a ghost browse-tree entry"
+    );
+}
