@@ -14,8 +14,8 @@
 
 use std::borrow::Cow;
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
+use aes_gcm::aead::{Aead, Generate, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 
 use depot_core::error::{self, DepotError};
 use depot_core::store::kv::{KvStore, ScanResult};
@@ -38,12 +38,12 @@ impl<T> EncryptedKvStore<T> {
         let key_bytes = derive_key(secret.as_bytes());
         Self {
             inner,
-            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes)),
+            cipher: Aes256Gcm::new(&Key::<Aes256Gcm>::from(key_bytes)),
         }
     }
 
     fn encrypt(&self, plaintext: &[u8]) -> error::Result<Vec<u8>> {
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Nonce::generate();
         let ciphertext = self
             .cipher
             .encrypt(&nonce, plaintext)
@@ -62,9 +62,10 @@ impl<T> EncryptedKvStore<T> {
             ));
         }
         let (nonce_bytes, ciphertext) = blob.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes)
+            .map_err(|_| DepotError::Internal("KV value nonce malformed".into()))?;
         self.cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| DepotError::Internal("KV decryption failed (wrong server_secret?)".into()))
     }
 }
