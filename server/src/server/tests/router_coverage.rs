@@ -209,7 +209,7 @@ async fn test_router_with_default_docker_repo() {
     // V2 check — authenticated should get 200.
     let gs: &[u8; 32] = jwt_secret.as_slice().try_into().unwrap();
     let key = auth::derive_signing_key(gs, &[]);
-    let token = auth::create_token("admin", &key, 86400).unwrap();
+    let token = auth::create_token("admin", &key, 86400, vec!["admin".to_string()]).unwrap();
     let req = Request::builder()
         .method(Method::GET)
         .uri("/v2/")

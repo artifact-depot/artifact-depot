@@ -5,13 +5,14 @@
 <script setup lang="ts">
 import { ref, computed, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, type Artifact, type DirInfo, type TaskInfo } from '../api'
+import { api, isAdmin, type Artifact, type DirInfo, type TaskInfo } from '../api'
+import { useSettingsStore } from '../stores/settingsStore'
 import BaseModal from './BaseModal.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import ResponsiveTable from './ResponsiveTable.vue'
 import { formatSize, formatDate } from '../composables/useFormatters'
 
-const props = defineProps<{ repoName: string }>()
+const props = defineProps<{ repoName: string; format?: string }>()
 
 const route = useRoute()
 const router = useRouter()
@@ -20,6 +21,262 @@ const dirs = ref<DirInfo[]>([])
 const artifacts = ref<Artifact[]>([])
 const loading = ref(false)
 const prefix = computed(() => (route.query.path as string) || '')
+
+// Docker repos browse tags-first: bookkeeping dirs (_manifests/_blobs) are
+// hidden in the default view, and at an image level the _tags/ contents are
+// shown as tag rows. Expert view reveals the raw storage tree instead.
+const isDocker = computed(() => props.format === 'docker')
+// Expert view (raw storage + delete) is admin-only; gate the toggle on the
+// roles embedded in the JWT. Non-admins only ever see the default browse.
+const canExpert = computed(() => isDocker.value && isAdmin())
+const expert = ref(false)
+const BOOKKEEPING = ['_manifests', '_blobs', '_tags']
+// Set when the current prefix is a Docker image (its listing contains _tags/);
+// holds the tag rows fetched from _tags/.
+const atImage = ref(false)
+const dockerTagItems = ref<DisplayItem[]>([])
+// Docker browse is tags-first in BOTH modes (so Copy pull / Download stay put).
+// Expert is additive: it reveals the raw bookkeeping dirs and the Delete action.
+const dockerDefault = computed(
+  () => isDocker.value && !isSearchMode.value,
+)
+function toggleExpert() {
+  expert.value = !expert.value
+  load()
+}
+
+// Repo image catalog (one cached call per repo) — lets us label a folder as a
+// namespace vs an image cheaply, without probing every row.
+const dockerImageSet = ref<Set<string>>(new Set())
+let catalogFetchedFor = ''
+async function ensureCatalog() {
+  if (!isDocker.value || catalogFetchedFor === props.repoName) return
+  try {
+    dockerImageSet.value = new Set(await api.getDockerCatalog(props.repoName))
+    catalogFetchedFor = props.repoName
+  } catch {
+    /* leave empty — folders just fall back to "namespace" */
+  }
+}
+function dockerType(item: DisplayItem): string {
+  if (item.kind === 'tag') return 'tag'
+  if (!item.isDir) return item.content_type || 'file'
+  if (BOOKKEEPING.includes(item.name)) return 'storage'
+  return dockerImageSet.value.has(item.path.replace(/\/+$/, '')) ? 'image' : 'namespace'
+}
+
+// `docker pull` is available through the default docker group (host-root
+// routing), so a tag's pull command is just <host>/<image>:<tag> — no per-repo
+// port. Only offer it when a default group is configured (else it wouldn't
+// resolve).
+const settingsStore = useSettingsStore()
+const hasDefaultDockerGroup = computed(() => !!settingsStore.settings?.default_docker_repo)
+const copiedTag = ref('')
+function pullCommand(tag: string): string {
+  const image = prefix.value.replace(/\/+$/, '')
+  return `docker pull ${window.location.host}/${image}:${tag}`
+}
+async function copyPull(item: DisplayItem, e: Event) {
+  e.stopPropagation()
+  try {
+    await navigator.clipboard.writeText(pullCommand(item.name))
+    copiedTag.value = item.name
+    setTimeout(() => { if (copiedTag.value === item.name) copiedTag.value = '' }, 1500)
+  } catch {
+    /* clipboard unavailable (insecure context) */
+  }
+}
+
+// Download a tag's manifest JSON (a tag has no blob of its own; the manifest is
+// the single downloadable document). Fetched with auth, then saved client-side.
+async function downloadManifest(item: DisplayItem, e: Event) {
+  e.stopPropagation()
+  const image = prefix.value.replace(/\/+$/, '')
+  try {
+    const { data } = await api.getDockerManifest(props.repoName, image, item.name)
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${item.name}.manifest.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  } catch {
+    /* manifest unavailable (e.g. retention-deleted tag) */
+  }
+}
+
+// Delete visibility: admin-only everywhere; Docker tags additionally require
+// Expert; Docker namespace/image folders in the default view have no delete.
+function canDelete(item: DisplayItem): boolean {
+  if (!isAdmin()) return false
+  if (item.kind === 'tag') return expert.value
+  if (item.isDir) return !isDocker.value || expert.value
+  return true
+}
+function deleteItem(item: DisplayItem, e: Event) {
+  if (item.isDir) confirmDirDelete(item, e)
+  else confirmDelete(item.path, e)
+}
+
+// --- Docker tag detail (manifest) ---
+// Fetched on drill-in via the /v2 endpoint (one request); layer/platform sizes
+// come straight from the manifest JSON, so there are no extra blob reads.
+const showManifestModal = ref(false)
+const manifestLoading = ref(false)
+const manifestError = ref('')
+const manifestTag = ref('')
+const manifestDigest = ref('')
+const manifestMediaType = ref('')
+const manifestIsList = ref(false)
+const manifestPlatforms = ref<{ platform: string; digest: string; size: number }[]>([])
+const manifestConfig = ref<{ digest: string; size: number } | null>(null)
+const manifestLayers = ref<{ digest: string; size: number }[]>([])
+const manifestTotal = ref(0)
+// Tag timestamps carried from the browse row (no extra fetch — already loaded).
+const manifestUpdated = ref('')
+const manifestAccessed = ref('')
+
+async function openTagDetail(item: DisplayItem) {
+  const image = prefix.value.replace(/\/+$/, '')
+  manifestTag.value = item.name
+  manifestUpdated.value = item.updated_at || ''
+  manifestAccessed.value = item.last_accessed_at || ''
+  manifestError.value = ''
+  manifestDigest.value = ''
+  manifestMediaType.value = ''
+  manifestIsList.value = false
+  manifestPlatforms.value = []
+  manifestConfig.value = null
+  manifestLayers.value = []
+  manifestTotal.value = 0
+  showManifestModal.value = true
+  manifestLoading.value = true
+  try {
+    const { data, digest } = await api.getDockerManifest(props.repoName, image, item.name)
+    manifestDigest.value = digest
+    manifestMediaType.value = data.mediaType || ''
+    if (Array.isArray(data.manifests)) {
+      manifestIsList.value = true
+      manifestPlatforms.value = data.manifests.map((m: any) => ({
+        platform: m.platform
+          ? `${m.platform.os}/${m.platform.architecture}${m.platform.variant ? '/' + m.platform.variant : ''}`
+          : '(unknown)',
+        digest: m.digest,
+        size: m.size || 0,
+      }))
+    } else {
+      manifestConfig.value = data.config ? { digest: data.config.digest, size: data.config.size || 0 } : null
+      manifestLayers.value = (data.layers || []).map((l: any) => ({ digest: l.digest, size: l.size || 0 }))
+      manifestTotal.value = (manifestConfig.value?.size || 0) +
+        manifestLayers.value.reduce((s, l) => s + l.size, 0)
+    }
+  } catch (e: any) {
+    manifestError.value = e.message || 'Failed to load manifest'
+  } finally {
+    manifestLoading.value = false
+  }
+}
+
+// --- Lazy tag-size fill for the browse list ---
+// A tag is a zero-byte pointer; its real image size lives in the manifest
+// (config + layers). Resolving it is one cheap manifest read, but doing that
+// for every tag up front fans out to hundreds of requests on images with many
+// tags. So each tag row resolves its size only when it scrolls into view, with
+// a small concurrency cap — the browse list never blocks.
+type TagSize = number | 'err'
+const tagSizes = ref<Record<string, TagSize>>({})
+const tagSizePending = new Set<string>()
+const tagSizeQueue: string[] = []
+let tagSizeInFlight = 0
+const TAG_SIZE_MAX_CONCURRENT = 6
+
+function resetTagSizes() {
+  tagSizes.value = {}
+  tagSizePending.clear()
+  tagSizeQueue.length = 0
+  tagSizeInFlight = 0
+}
+
+function tagSizeLabel(tag: string): string | null {
+  const v = tagSizes.value[tag]
+  return typeof v === 'number' ? formatSize(v) : null
+}
+
+function enqueueTagSize(tag: string) {
+  if (tag in tagSizes.value || tagSizePending.has(tag) || tagSizeQueue.includes(tag)) return
+  tagSizeQueue.push(tag)
+  pumpTagSizeQueue()
+}
+
+function pumpTagSizeQueue() {
+  while (tagSizeInFlight < TAG_SIZE_MAX_CONCURRENT && tagSizeQueue.length) {
+    const tag = tagSizeQueue.shift() as string
+    tagSizeInFlight++
+    tagSizePending.add(tag)
+    computeTagSize(tag).finally(() => {
+      tagSizeInFlight--
+      tagSizePending.delete(tag)
+      pumpTagSizeQueue()
+    })
+  }
+}
+
+function sumManifestBytes(m: any): number {
+  return (m?.config?.size || 0) + (m?.layers || []).reduce((s: number, l: any) => s + (l.size || 0), 0)
+}
+
+async function computeTagSize(tag: string) {
+  const image = prefix.value.replace(/\/+$/, '')
+  try {
+    const { data } = await api.getDockerManifest(props.repoName, image, tag)
+    let total = 0
+    if (Array.isArray(data.manifests)) {
+      // Multi-arch: sum config+layers across each per-arch child manifest.
+      const children = await Promise.all(
+        data.manifests.map((m: any) =>
+          api.getDockerManifest(props.repoName, image, m.digest).then(r => r.data).catch(() => null)),
+      )
+      total = children.reduce((s: number, c: any) => s + sumManifestBytes(c), 0)
+    } else {
+      total = sumManifestBytes(data)
+    }
+    tagSizes.value = { ...tagSizes.value, [tag]: total }
+  } catch {
+    tagSizes.value = { ...tagSizes.value, [tag]: 'err' }
+  }
+}
+
+// One shared observer; tag rows register via v-tagsize and resolve their size
+// the first time they enter the viewport.
+const tagSizeObserver =
+  typeof IntersectionObserver !== 'undefined'
+    ? new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            if (e.isIntersecting) {
+              const tag = (e.target as HTMLElement).dataset.tagsize
+              if (tag) enqueueTagSize(tag)
+            }
+          }
+        },
+        { rootMargin: '150px' },
+      )
+    : null
+onUnmounted(() => tagSizeObserver?.disconnect())
+
+const vTagsize = {
+  mounted(el: HTMLElement, binding: { value: string }) {
+    el.dataset.tagsize = binding.value
+    tagSizeObserver?.observe(el)
+  },
+  unmounted(el: HTMLElement) {
+    tagSizeObserver?.unobserve(el)
+  },
+}
+
 const search = ref('')
 const isSearchMode = ref(false)
 const selectedArtifact = ref<Artifact | null>(null)
@@ -44,8 +301,11 @@ interface DisplayItem {
   size: number
   content_type: string
   updated_at: string
+  last_accessed_at?: string
+  created_at?: string
   artifact_count?: number
   total_bytes?: number
+  kind?: 'tag'
 }
 
 const breadcrumbs = computed(() => {
@@ -69,7 +329,54 @@ const displayItems = computed((): DisplayItem[] => {
       size: a.size,
       content_type: a.content_type,
       updated_at: a.updated_at,
+      last_accessed_at: a.last_accessed_at,
+      created_at: a.created_at,
     }))
+  }
+
+  // Docker browse: tags-first at an image; namespaces/images otherwise.
+  // Expert is additive — it reveals the raw bookkeeping dirs (_manifests/_blobs)
+  // and lets you drill into them; the friendly tag list (with Copy pull /
+  // Download) stays visible in both modes.
+  if (dockerDefault.value) {
+    const toDir = (d: DirInfo): DisplayItem => ({
+      name: d.name,
+      path: prefix.value + d.name + '/',
+      isDir: true,
+      size: d.total_bytes,
+      content_type: '',
+      updated_at: d.last_modified_at,
+      last_accessed_at: d.last_accessed_at,
+      artifact_count: d.artifact_count,
+      total_bytes: d.total_bytes,
+    })
+    // Expert drill-in to a bookkeeping dir → show the raw records.
+    const inBookkeeping = BOOKKEEPING.some(b => prefix.value.includes(b + '/'))
+    if (expert.value && inBookkeeping) {
+      const dItems = dirs.value.map(toDir)
+      const fItems: DisplayItem[] = artifacts.value.map(a => ({
+        name: a.path,
+        path: prefix.value + a.path,
+        isDir: false,
+        size: a.size,
+        content_type: a.content_type,
+        updated_at: a.updated_at,
+        last_accessed_at: a.last_accessed_at,
+        created_at: a.created_at,
+      }))
+      return [...dItems, ...fItems]
+    }
+    if (atImage.value) {
+      if (!expert.value) return dockerTagItems.value
+      // Expert at an image: tags (with actions) + the raw storage dirs.
+      const storage = dirs.value
+        .filter(d => d.name === '_manifests' || d.name === '_blobs')
+        .map(toDir)
+      return [...dockerTagItems.value, ...storage]
+    }
+    return dirs.value
+      .filter(d => expert.value || !BOOKKEEPING.includes(d.name))
+      .map(toDir)
   }
 
   const dirItems: DisplayItem[] = dirs.value.map(d => ({
@@ -79,6 +386,7 @@ const displayItems = computed((): DisplayItem[] => {
     size: d.total_bytes,
     content_type: '',
     updated_at: d.last_modified_at,
+    last_accessed_at: d.last_accessed_at,
     artifact_count: d.artifact_count,
     total_bytes: d.total_bytes,
   }))
@@ -90,16 +398,36 @@ const displayItems = computed((): DisplayItem[] => {
     size: a.size,
     content_type: a.content_type,
     updated_at: a.updated_at,
+    last_accessed_at: a.last_accessed_at,
+    created_at: a.created_at,
   }))
 
   return [...dirItems, ...fileItems]
 })
+
+// Whether any visible row renders an action (Copy pull / Download / Delete).
+// When nothing in view has one (e.g. a page of Docker namespaces/images with no
+// delete rights), the actions column is dropped so it doesn't waste width.
+const showActionsColumn = computed(() =>
+  displayItems.value.some(item => {
+    const copyPull = item.kind === 'tag' && hasDefaultDockerGroup.value
+    // Docker image folders aren't downloadable (you pull images, not tar the
+    // raw storage) — only tags are. Non-docker folders download normally.
+    const download =
+      item.kind === 'tag' || (item.isDir && !isDocker.value) || !item.isDir
+    return copyPull || download || canDelete(item)
+  }),
+)
 
 function downloadUrl(path: string): string {
   return api.downloadUrl(props.repoName, path)
 }
 
 function onRowClick(item: DisplayItem) {
+  if (item.kind === 'tag') {
+    openTagDetail(item)
+    return
+  }
   if (item.isDir) {
     navigateTo(item.path)
   } else {
@@ -178,6 +506,7 @@ function clearSearch() {
 async function load() {
   loading.value = true
   try {
+    await ensureCatalog()
     if (isSearchMode.value && search.value) {
       const resp = await api.listArtifacts(props.repoName, { q: search.value })
       dirs.value = resp.dirs
@@ -193,10 +522,42 @@ async function load() {
       artifacts.value = resp.artifacts
       totalArtifacts.value = resp.total ?? resp.artifacts.length
     }
+
+    // Docker default view: if this level is an image (has a _tags/ dir), pull
+    // its tags so they can be shown in place of the bookkeeping dirs.
+    atImage.value = false
+    dockerTagItems.value = []
+    resetTagSizes()
+    if (dockerDefault.value && dirs.value.some(d => d.name === '_tags')) {
+      atImage.value = true
+      const tagsPrefix = prefix.value + '_tags/'
+      // Page through the tags with the standard pagination controls: an image
+      // (or a group aggregating several repos) can serve thousands of tags, so
+      // a flat capped fetch would silently truncate the list.
+      const t = await api.listArtifacts(props.repoName, {
+        prefix: tagsPrefix,
+        limit: pageLimit.value,
+        offset: pageOffset.value,
+      })
+      totalArtifacts.value = t.total ?? t.artifacts.length
+      dockerTagItems.value = t.artifacts.map(a => ({
+        name: a.path,
+        path: tagsPrefix + a.path,
+        isDir: false,
+        size: a.size,
+        content_type: 'docker tag',
+        updated_at: a.updated_at,
+        last_accessed_at: a.last_accessed_at,
+        created_at: a.created_at,
+        kind: 'tag' as const,
+      }))
+    }
   } catch {
     dirs.value = []
     artifacts.value = []
     totalArtifacts.value = 0
+    atImage.value = false
+    dockerTagItems.value = []
   } finally {
     loading.value = false
   }
@@ -428,7 +789,16 @@ watch(
       <h3>Artifacts</h3>
       <div class="header-actions">
         <input ref="fileInput" type="file" hidden @change="onFileSelected" />
-        <button class="btn btn-upload" :disabled="uploading" @click="triggerUpload">
+        <button
+          v-if="canExpert"
+          class="btn btn-expert"
+          :class="{ 'btn-expert-on': expert }"
+          :title="expert ? 'Showing raw storage (manifests, blobs)' : 'Show raw storage: manifests, blobs, and delete'"
+          @click="toggleExpert"
+        >
+          Expert: {{ expert ? 'on' : 'off' }}
+        </button>
+        <button v-if="!isDocker" class="btn btn-upload" :disabled="uploading" @click="triggerUpload">
           {{ uploading ? 'Uploading...' : 'Upload' }}
         </button>
         <div class="search-box">
@@ -461,19 +831,29 @@ watch(
     <ResponsiveTable v-else-if="displayItems.length > 0">
       <table>
         <colgroup>
-          <col style="width: auto;" />
-          <col style="width: 10rem;" />
-          <col style="width: 12rem;" />
-          <col style="width: 14rem;" />
-          <col style="width: 5rem;" />
+          <!-- Name is a FIXED width (fits a long Supermicro download name;
+               longer ellipsizes) so every folder lays out identically. Size,
+               Type and the actions column shrink to their content (width:1% +
+               nowrap), and the two un-sized date columns float — absorbing the
+               leftover width and filling the row (right-aligned, see CSS). The
+               actions column holds all actions as a flex row: hidden ones
+               collapse to nothing, shown ones expand, so it's narrow when Expert
+               is off and widens only for the actions Expert reveals. -->
+          <col style="width: 36rem;" />
+          <col style="width: 1%;" />
+          <col style="width: 1%;" />
+          <col />
+          <col />
+          <col v-if="showActionsColumn" style="width: 1%;" />
         </colgroup>
         <thead>
           <tr>
             <th>Name</th>
             <th>Size</th>
-            <th>Content Type</th>
-            <th>Updated</th>
-            <th></th>
+            <th>{{ isDocker ? 'Type' : 'Content Type' }}</th>
+            <th>Created/Modified</th>
+            <th>Last Accessed</th>
+            <th v-if="showActionsColumn"></th>
           </tr>
         </thead>
         <tbody>
@@ -493,22 +873,42 @@ watch(
             </td>
             <td>
               <template v-if="item.isDir">
-                {{ formatSize(item.total_bytes || 0) }}
-                <span class="dir-count">({{ item.artifact_count }} items)</span>
+                <span v-if="isDocker" class="size-dash" title="Docker layers are content-addressed and shared across images at the repo level, so they aren't counted per image — open an image to see its size">&mdash;</span>
+                <template v-else>
+                  {{ formatSize(item.total_bytes || 0) }}
+                  <span class="dir-count">({{ item.artifact_count }} items)</span>
+                </template>
+              </template>
+              <template v-else-if="item.kind === 'tag'">
+                <span v-if="tagSizeLabel(item.name)">{{ tagSizeLabel(item.name) }}</span>
+                <span v-else v-tagsize="item.name" class="size-dash"
+                      :title="tagSizes[item.name] === 'err' ? 'Could not read this tag\'s manifest' : 'Resolving image size…'">&mdash;</span>
               </template>
               <template v-else>{{ formatSize(item.size) }}</template>
             </td>
-            <td>{{ item.isDir ? 'Folder' : item.content_type }}</td>
-            <td>{{ formatDate(item.updated_at) }}</td>
             <td>
-              <template v-if="item.isDir">
-                <button class="action-btn" @click="confirmDirDownload(item, $event)" title="Download directory">&#11015;</button>
-                <button class="action-btn action-delete" @click="confirmDirDelete(item, $event)" title="Delete directory">&#10005;</button>
-              </template>
-              <template v-else>
-                <a :href="downloadUrl(item.path)" target="_blank" class="action-btn" title="Download">&#11015;</a>
-                <button class="action-btn action-delete" @click="confirmDelete(item.path, $event)" title="Delete">&#10005;</button>
-              </template>
+              <span v-if="isDocker" class="type-label">{{ dockerType(item) }}</span>
+              <template v-else>{{ item.isDir ? 'Folder' : item.content_type }}</template>
+            </td>
+            <td>{{ formatDate(item.updated_at) }}</td>
+            <td>{{ item.last_accessed_at ? formatDate(item.last_accessed_at) : '—' }}</td>
+            <td v-if="showActionsColumn">
+              <!-- Flex row: only the buttons that apply are rendered, and each
+                   takes just its own width — an absent Copy pull / Download /
+                   Delete leaves no reserved gap (so a Delete-only row sits tight
+                   against the date, not pushed right by phantom slots). -->
+              <div class="row-actions">
+                <button
+                  v-if="isDocker && item.kind === 'tag' && hasDefaultDockerGroup"
+                  class="act-link"
+                  :title="pullCommand(item.name)"
+                  @click="copyPull(item, $event)"
+                >{{ copiedTag === item.name ? 'Copied ✓' : 'Copy pull' }}</button>
+                <button v-if="item.kind === 'tag'" class="act-link" title="Download manifest" @click="downloadManifest(item, $event)">Download</button>
+                <button v-else-if="item.isDir && !isDocker" class="act-link" title="Download directory" @click="confirmDirDownload(item, $event)">Download</button>
+                <a v-else-if="!item.isDir" :href="downloadUrl(item.path)" target="_blank" class="act-link" title="Download" @click.stop>Download</a>
+                <button v-if="canDelete(item)" class="act-link act-delete" :title="item.isDir ? 'Delete directory' : 'Delete'" @click="deleteItem(item, $event)">Delete</button>
+              </div>
             </td>
           </tr>
         </tbody>
@@ -574,6 +974,60 @@ watch(
       <template #footer>
         <a :href="downloadUrl(detailFullPath())" target="_blank" class="btn btn-download">Download</a>
         <button class="btn btn-danger" @click="deleteFromDetail">Delete</button>
+      </template>
+    </BaseModal>
+
+    <!-- Docker tag detail (manifest) -->
+    <BaseModal v-if="showManifestModal" max-width="640px" :show-close="true" @close="showManifestModal = false">
+      <h3 class="mono">{{ manifestTag }}</h3>
+      <p v-if="manifestLoading"><span class="loading-spinner"></span> Loading manifest...</p>
+      <p v-else-if="manifestError" class="error-text">{{ manifestError }}</p>
+      <template v-else>
+        <dl class="detail-list">
+          <dt>Digest</dt>
+          <dd class="mono">{{ manifestDigest || 'N/A' }}</dd>
+          <dt>Type</dt>
+          <dd>{{ manifestIsList ? 'Manifest list (multi-arch)' : 'Image manifest' }}</dd>
+          <dt v-if="!manifestIsList">Total size</dt>
+          <dd v-if="!manifestIsList">{{ formatSize(manifestTotal) }}</dd>
+          <dt v-if="manifestMediaType">Media type</dt>
+          <dd v-if="manifestMediaType" class="mono">{{ manifestMediaType }}</dd>
+          <dt>Created/Modified</dt>
+          <dd>{{ manifestUpdated ? formatDate(manifestUpdated) : '—' }}</dd>
+          <dt>Last Accessed</dt>
+          <dd>{{ manifestAccessed ? formatDate(manifestAccessed) : '—' }}</dd>
+        </dl>
+
+        <!-- Multi-arch: per-platform child manifests -->
+        <template v-if="manifestIsList">
+          <h4 class="manifest-section">Platforms ({{ manifestPlatforms.length }})</h4>
+          <table class="manifest-table">
+            <tbody>
+              <tr v-for="p in manifestPlatforms" :key="p.digest">
+                <td class="plat">{{ p.platform }}</td>
+                <td class="mono digest-cell">{{ p.digest }}</td>
+                <td class="size-cell">{{ formatSize(p.size) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </template>
+
+        <!-- Single image: config + layers -->
+        <template v-else>
+          <h4 class="manifest-section">Config + {{ manifestLayers.length }} layer(s)</h4>
+          <table class="manifest-table">
+            <tbody>
+              <tr v-if="manifestConfig">
+                <td class="mono digest-cell">{{ manifestConfig.digest }}</td>
+                <td class="size-cell">config</td>
+              </tr>
+              <tr v-for="(l, i) in manifestLayers" :key="i">
+                <td class="mono digest-cell">{{ l.digest }}</td>
+                <td class="size-cell">{{ formatSize(l.size) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </template>
       </template>
     </BaseModal>
 
@@ -706,6 +1160,15 @@ watch(
   opacity: 0.5;
   cursor: not-allowed;
 }
+.btn-expert {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-secondary);
+}
+.btn-expert-on {
+  background: var(--color-primary);
+  color: var(--color-primary-text);
+  border-color: var(--color-primary);
+}
 .upload-error {
   color: var(--color-danger);
   font-size: 0.85rem;
@@ -756,9 +1219,45 @@ watch(
   color: var(--color-text-disabled);
   margin: 0 0.25rem;
 }
-/* Override global table: this component needs fixed layout and tighter padding */
+/* Auto layout so each column sizes to its content (see the colgroup): Name,
+   Size, Type and the actions column shrink to fit, and the two date columns
+   absorb the leftover width. When Expert turns on, the actions column is just
+   the (content-sized) Delete link added on the right — the rest is unchanged. */
 table {
-  table-layout: fixed;
+  table-layout: auto;
+  width: 100%;
+}
+.type-label {
+  text-transform: capitalize;
+  color: var(--color-text-secondary);
+}
+.act-link {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.15rem 0.4rem;
+  margin-right: 0.25rem;
+  color: var(--color-blue);
+  text-decoration: none;
+}
+.act-link:hover {
+  text-decoration: underline;
+}
+.act-delete {
+  color: var(--color-danger);
+}
+/* Pack the actions with flex so only rendered buttons take space — an absent
+   Copy pull / Download / Delete collapses instead of leaving a reserved gap.
+   (Trades cross-row column alignment for no phantom whitespace.) */
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.row-actions .act-link {
+  margin: 0;
 }
 th, td {
   padding: 0.5rem 0.75rem;
@@ -769,6 +1268,18 @@ th, td {
 th {
   font-size: 0.85rem;
 }
+/* Name is a fixed 36rem (see colgroup); this keeps a longer name clipped to
+   that width with an ellipsis rather than stretching the column. */
+td:first-child, th:first-child {
+  max-width: 36rem;
+}
+/* Right-align the two date columns (Created/Modified, Last Accessed) so, as
+   they absorb the leftover width, each value stays against the next column
+   rather than leaving a gap before it. */
+th:nth-child(4), td:nth-child(4),
+th:nth-child(5), td:nth-child(5) {
+  text-align: right;
+}
 .item-icon {
   margin-right: 0.4rem;
 }
@@ -776,6 +1287,10 @@ th {
   color: var(--color-text-faint);
   font-size: 0.8rem;
   margin-left: 0.3rem;
+}
+.size-dash {
+  color: var(--color-text-faint);
+  cursor: help;
 }
 .action-btn {
   background: none;
@@ -791,6 +1306,17 @@ th {
 }
 .action-delete:hover {
   color: var(--color-danger);
+}
+.pull-btn {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.pull-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
 }
 .btn-download {
   background: var(--color-primary);
@@ -825,6 +1351,36 @@ th {
 .detail-list .mono {
   font-family: monospace;
   font-size: 0.85rem;
+}
+.manifest-section {
+  margin: 1rem 0 0.4rem;
+  font-size: 0.85rem;
+  color: var(--color-text-secondary);
+}
+.manifest-table {
+  width: 100%;
+  table-layout: auto;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+.manifest-table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+.manifest-table .plat {
+  font-weight: 600;
+}
+.manifest-table .digest-cell {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 0;
+}
+.manifest-table .size-cell {
+  text-align: right;
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
 }
 .pagination-bar {
   display: flex;

@@ -64,6 +64,7 @@ pub async fn login(
         &jwt.current,
         &user.token_secret,
         expiry_secs,
+        user.roles.clone(),
     )
     .map_err(|e| DepotError::Storage(Box::new(e), Retryability::Permanent))?;
 
@@ -175,6 +176,7 @@ pub async fn change_password(
                         &jwt.current,
                         &new_token_secret,
                         expiry_secs,
+                        record.roles.clone(),
                     ) {
                         Ok(token) => Json(LoginResponse {
                             token,

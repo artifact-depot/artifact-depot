@@ -123,6 +123,7 @@ impl PermissionChecker for AuthPermissionChecker {
             &jwt.current,
             &user.token_secret,
             expiry_secs,
+            user.roles.clone(),
         )
         .map_err(|e| DepotError::Storage(Box::new(e), Retryability::Transient))
     }

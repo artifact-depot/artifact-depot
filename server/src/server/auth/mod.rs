@@ -50,6 +50,12 @@ pub struct Claims {
     pub sub: String,
     pub exp: usize,
     pub iat: usize,
+    /// The user's role names, embedded so the UI can gate admin-only affordances
+    /// without a separate lookup. `#[serde(default)]` keeps tokens issued before
+    /// this field was added valid (they decode with no roles). Authorization is
+    /// always re-checked server-side; this is a convenience for the client only.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 /// Global JWT signing state. `current` is the active signing key; `previous`
@@ -78,12 +84,13 @@ pub fn create_user_token(
     global_secret: &[u8],
     user_token_secret: &[u8],
     expiry_secs: u64,
+    roles: Vec<String>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let gs: &[u8; 32] = global_secret
         .try_into()
         .map_err(|_| jsonwebtoken::errors::ErrorKind::InvalidKeyFormat)?;
     let key = derive_signing_key(gs, user_token_secret);
-    create_token(username, &key, expiry_secs)
+    create_token(username, &key, expiry_secs, roles)
 }
 
 /// Decode the claims payload of a JWT **without** verifying its signature.
@@ -161,6 +168,7 @@ pub fn create_token(
     username: &str,
     secret: &[u8],
     expiry_secs: u64,
+    roles: Vec<String>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -170,6 +178,7 @@ pub fn create_token(
         sub: username.to_string(),
         iat: now,
         exp: now + expiry_secs as usize,
+        roles,
     };
     jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
@@ -442,15 +451,16 @@ mod tests {
     #[test]
     fn test_create_validate_token_roundtrip() {
         let secret = b"test-secret-key";
-        let token = create_token("bob", secret, 86400).unwrap();
+        let token = create_token("bob", secret, 86400, vec!["admin".to_string()]).unwrap();
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.sub, "bob");
         assert!(claims.exp > claims.iat);
+        assert_eq!(claims.roles, vec!["admin".to_string()]);
     }
 
     #[test]
     fn test_validate_token_wrong_secret() {
-        let token = create_token("bob", b"secret1", 86400).unwrap();
+        let token = create_token("bob", b"secret1", 86400, vec![]).unwrap();
         assert!(validate_token(&token, b"secret2").is_err());
     }
 
@@ -488,7 +498,7 @@ mod tests {
     fn test_create_user_token_roundtrip() {
         let global = [42u8; 32];
         let user_secret = b"per-user";
-        let token = create_user_token("alice", &global, user_secret, 86400).unwrap();
+        let token = create_user_token("alice", &global, user_secret, 86400, vec![]).unwrap();
         let key = derive_signing_key(&global, user_secret);
         let claims = validate_token(&token, &key).unwrap();
         assert_eq!(claims.sub, "alice");
@@ -497,7 +507,7 @@ mod tests {
     #[test]
     fn test_create_user_token_rejected_after_user_secret_change() {
         let global = [42u8; 32];
-        let token = create_user_token("alice", &global, b"old-secret", 86400).unwrap();
+        let token = create_user_token("alice", &global, b"old-secret", 86400, vec![]).unwrap();
         let new_key = derive_signing_key(&global, b"new-secret");
         assert!(validate_token(&token, &new_key).is_err());
     }
@@ -508,7 +518,7 @@ mod tests {
         let new_global = [2u8; 32];
         let user_secret = b"user";
         // Token signed with old global.
-        let token = create_user_token("bob", &old_global, user_secret, 86400).unwrap();
+        let token = create_user_token("bob", &old_global, user_secret, 86400, vec![]).unwrap();
         // Validate with old global key (simulating "previous" fallback).
         let prev_key = derive_signing_key(&old_global, user_secret);
         assert!(validate_token(&token, &prev_key).is_ok());
@@ -519,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_decode_claims_unverified() {
-        let token = create_token("carol", b"any-secret-here!", 86400).unwrap();
+        let token = create_token("carol", b"any-secret-here!", 86400, vec![]).unwrap();
         let claims = decode_claims_unverified(&token).unwrap();
         assert_eq!(claims.sub, "carol");
     }

@@ -297,7 +297,7 @@ async function save() {
 </template>
 
 <style scoped>
-section { max-width: 720px; }
+section { max-width: 720px; margin: 0 auto; }
 
 .subtitle {
   color: var(--color-text-muted);

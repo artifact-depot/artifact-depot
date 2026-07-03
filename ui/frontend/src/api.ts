@@ -403,6 +403,26 @@ export function clearToken() {
   tokenRef.value = null
 }
 
+/** Role names embedded in the current JWT (added to the token at login so the
+ *  UI can gate admin-only affordances without a lookup). Reads `tokenRef`, so
+ *  it stays reactive inside computeds. Authorization is always re-checked
+ *  server-side; this only controls what the UI offers. */
+export function currentRoles(): string[] {
+  const t = tokenRef.value
+  if (!t) return []
+  try {
+    const payload = t.split('.')[1]
+    const json = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')))
+    return Array.isArray(json.roles) ? json.roles : []
+  } catch {
+    return []
+  }
+}
+
+export function isAdmin(): boolean {
+  return currentRoles().includes('admin')
+}
+
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { 'X-Requested-With': 'XMLHttpRequest' }
   const token = getToken()
@@ -516,6 +536,46 @@ export const api = {
       { headers: authHeaders() },
     )
     return handleResponse(resp)
+  },
+
+  /** Fetch a Docker manifest by tag or digest, for the tag detail panel.
+   *  Uses the repo-scoped /v2 endpoint with the SPA's Bearer token (accepted
+   *  like any docker client). `image` is a path (keep its slashes). Returns the
+   *  parsed manifest plus the resolved manifest digest from the response. */
+  async getDockerManifest(
+    repo: string,
+    image: string,
+    reference: string,
+  ): Promise<{ data: any; digest: string }> {
+    const resp = await fetch(
+      `/repository/${encodeURIComponent(repo)}/v2/${image}/manifests/${encodeURIComponent(reference)}`,
+      {
+        headers: {
+          ...authHeaders(),
+          Accept: [
+            'application/vnd.docker.distribution.manifest.v2+json',
+            'application/vnd.docker.distribution.manifest.list.v2+json',
+            'application/vnd.oci.image.manifest.v1+json',
+            'application/vnd.oci.image.index.v1+json',
+          ].join(', '),
+        },
+      },
+    )
+    if (!resp.ok) throw new Error(`manifest fetch failed (${resp.status})`)
+    const digest = resp.headers.get('Docker-Content-Digest') || ''
+    const data = await resp.json()
+    return { data, digest }
+  },
+
+  /** All Docker image names in a repo (one cheap call), so the browser can
+   *  label a folder as a namespace vs an image without probing each row. */
+  async getDockerCatalog(repo: string): Promise<string[]> {
+    const resp = await fetch(`/repository/${encodeURIComponent(repo)}/v2/_catalog`, {
+      headers: authHeaders(),
+    })
+    if (!resp.ok) return []
+    const data = await resp.json()
+    return Array.isArray(data?.repositories) ? data.repositories : []
   },
 
   async deleteArtifact(repo: string, path: string): Promise<void> {

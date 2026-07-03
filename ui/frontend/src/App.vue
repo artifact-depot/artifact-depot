@@ -231,6 +231,8 @@ nav a.router-link-active {
 }
 main {
   padding: 2rem;
+  max-width: 1800px;
+  margin: 0 auto;
 }
 .menu-toggle {
   display: none;
