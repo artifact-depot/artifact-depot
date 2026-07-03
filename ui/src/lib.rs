@@ -18,7 +18,10 @@ use rust_embed::RustEmbed;
 struct Assets;
 
 /// Serve embedded static assets, falling back to index.html for SPA routing.
-async fn static_handler(uri: axum::http::Uri) -> Response {
+///
+/// Public so a server can branch its own fallback (e.g. return a docker JSON
+/// 404 under `/v2`) and delegate everything else here.
+pub async fn static_handler(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
     // Try to serve the exact file first.

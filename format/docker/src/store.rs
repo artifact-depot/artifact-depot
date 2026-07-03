@@ -57,14 +57,14 @@ pub const MANIFEST_ACCEPT: &str = "application/vnd.docker.distribution.manifest.
 
 // --- Path helpers ---
 
-fn manifest_path_for(image: Option<&str>, digest: &str) -> String {
+pub(crate) fn manifest_path_for(image: Option<&str>, digest: &str) -> String {
     match image {
         Some(img) => format!("{img}/_manifests/{digest}"),
         None => format!("_manifests/{digest}"),
     }
 }
 
-fn tag_path_for(image: Option<&str>, tag: &str) -> String {
+pub(crate) fn tag_path_for(image: Option<&str>, tag: &str) -> String {
     match image {
         Some(img) => format!("{img}/_tags/{tag}"),
         None => format!("_tags/{tag}"),
@@ -78,7 +78,7 @@ fn tag_prefix_for(image: Option<&str>) -> String {
     }
 }
 
-fn blob_ref_path_for(digest: &str) -> String {
+pub(crate) fn blob_ref_path_for(digest: &str) -> String {
     format!("_blobs/{digest}")
 }
 
@@ -207,7 +207,10 @@ impl<'a> DockerStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let existing = service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+        // Credit the store only when a genuinely new blob is created (the single
+        // place store stats grow — see put_dedup_record_counted).
+        let existing =
+            service::put_dedup_record_counted(self.kv, self.store, &blob_rec, self.updater).await?;
 
         let effective_blob_id = existing.as_ref().unwrap_or(&blob_id).clone();
         let record = ArtifactRecord {
@@ -228,15 +231,15 @@ impl<'a> DockerStore<'a> {
             internal: false,
         };
         let old_record = service::put_artifact(self.kv, self.repo, &blob_path, &record).await?;
+        // Per-repo (logical) directory stats: the repo gains/updates this
+        // blob-ref record regardless of physical dedup. Store stats are handled
+        // above by put_dedup_record_counted, not here.
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
             None => (1i64, record.size as i64),
         };
         self.updater
             .dir_changed(self.repo, &blob_path, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
 
         // Dedup: if blob already existed, delete the duplicate we just wrote.
@@ -285,10 +288,11 @@ impl<'a> DockerStore<'a> {
             internal: false,
         };
         // The mounted blob_id references a pre-existing, shared blob file — we
-        // did not write a new one, so on a lost dedup race there is no
-        // duplicate to delete (and deleting would destroy live data). Ignoring
-        // the result is safe: the record only re-registers existing content.
-        service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+        // did not write a new one, so there is no duplicate to delete (and
+        // deleting would destroy live data); use the plain counted record. It
+        // credits the store only if this actually creates a new blob record (a
+        // genuine cross-repo mount references existing content → no credit).
+        service::put_dedup_record_counted(self.kv, self.store, &blob_rec, self.updater).await?;
         let old_record = service::put_artifact(self.kv, self.repo, &blob_path, &record).await?;
         let (count_delta, bytes_delta) = match &old_record {
             Some(old) => (0i64, record.size as i64 - old.size as i64),
@@ -296,9 +300,6 @@ impl<'a> DockerStore<'a> {
         };
         self.updater
             .dir_changed(self.repo, &blob_path, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
 
         Ok(docker_digest.to_string())
@@ -324,7 +325,8 @@ impl<'a> DockerStore<'a> {
             store: self.store.to_string(),
         };
         let blob_id_owned = blob_id.to_string();
-        let existing = service::put_dedup_record(self.kv, self.store, &blob_rec).await?;
+        let existing =
+            service::put_dedup_record_counted(self.kv, self.store, &blob_rec, self.updater).await?;
 
         let effective_blob_id = existing.as_ref().unwrap_or(&blob_id_owned).clone();
         let record = ArtifactRecord {
@@ -351,9 +353,6 @@ impl<'a> DockerStore<'a> {
         };
         self.updater
             .dir_changed(self.repo, &blob_path, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
 
         // Dedup: if blob already existed, delete the duplicate we just wrote.
@@ -481,9 +480,16 @@ impl<'a> DockerStore<'a> {
             store: self.store.to_string(),
         };
         // Re-pushing an identical manifest (e.g. the same image under a second
-        // tag) dedups against the existing manifest blob.
-        let blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
+        // tag) dedups against the existing manifest blob. The manifest is itself
+        // a blob — credit the store iff it's new content, and drop the duplicate.
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            self.store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let manifest_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -533,8 +539,8 @@ impl<'a> DockerStore<'a> {
                 Some(old) => (0i64, tag_record.size as i64 - old.size as i64),
                 None => (1i64, tag_record.size as i64),
             };
+            // Tags are not blobs — per-repo dir stats only, never store stats.
             self.updater.dir_changed(self.repo, &tag_path, tc, tb).await;
-            self.updater.store_changed(self.store, tc, tb).await;
         }
 
         let old_manifest =
@@ -543,11 +549,10 @@ impl<'a> DockerStore<'a> {
             Some(old) => (0i64, manifest_record.size as i64 - old.size as i64),
             None => (1i64, manifest_record.size as i64),
         };
+        // Manifest *artifact-record* → per-repo dir stats only; the manifest's
+        // store credit was already recorded by put_dedup_record_counted above.
         self.updater
             .dir_changed(self.repo, &manifest_path, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
 
         Ok(digest)

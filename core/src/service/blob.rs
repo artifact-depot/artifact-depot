@@ -107,6 +107,81 @@ pub async fn delete_blob(kv: &dyn KvStore, store: &str, hash: &str) -> error::Re
     kv.delete(table, pk, sk).await
 }
 
+/// [`delete_blob`] plus the symmetric store debit: when a blob record is
+/// actually removed, credit `store_changed(-1, -size)`. The counterpart to
+/// [`put_dedup_record_counted`] for single-record deletions outside the GC
+/// bulk-sweep (which keeps its own authoritative recompute). Reads the record
+/// first to learn its size; debits nothing if it was already gone.
+pub async fn delete_blob_counted(
+    kv: &dyn KvStore,
+    store: &str,
+    hash: &str,
+    updater: &crate::update::UpdateSender,
+) -> error::Result<bool> {
+    let size = get_blob(kv, store, hash).await?.map(|r| r.size);
+    let deleted = delete_blob(kv, store, hash).await?;
+    if deleted {
+        if let Some(sz) = size {
+            updater.store_changed(store, -1, -(sz as i64)).await;
+        }
+    }
+    Ok(deleted)
+}
+
+/// [`put_dedup_record`] plus the **single** place a store's physical byte/blob
+/// counter grows: when (and only when) a genuinely new `BlobRecord` is created,
+/// credit `store_changed(+1, +size)`. On a dedup hit nothing is added, so
+/// nothing is credited. Callers must use this for blob ingest and never adjust
+/// store stats themselves — that's what keeps the counter correct by
+/// construction (no reliance on the GC recompute). Blob *removal* is GC's job
+/// (it deletes unreferenced `BlobRecord`s and rewrites authoritative per-store
+/// stats), so there is no symmetric debit here.
+pub async fn put_dedup_record_counted(
+    kv: &dyn KvStore,
+    store: &str,
+    record: &BlobRecord,
+    updater: &crate::update::UpdateSender,
+) -> error::Result<Option<String>> {
+    let existing = put_dedup_record(kv, store, record).await?;
+    if existing.is_none() {
+        updater.store_changed(store, 1, record.size as i64).await;
+    }
+    Ok(existing)
+}
+
+/// [`claim_or_reuse_blob`] with the store-stats credit of
+/// [`put_dedup_record_counted`] folded in: claims the `hash→blob_id` mapping
+/// (crediting the store `+size` only when a genuinely new blob is created), and
+/// on a dedup hit deletes the just-written duplicate blob file and returns the
+/// existing canonical blob_id. This is the one helper a freshly-written blob's
+/// ingest path should use — it both keeps the physical store counter correct
+/// and prevents the duplicate-blob leak. As with [`claim_or_reuse_blob`], the
+/// caller MUST reference the returned blob_id, never `record.blob_id`.
+#[must_use = "artifact records must reference the returned blob_id, not the one passed in"]
+pub async fn claim_or_reuse_blob_counted(
+    kv: &dyn KvStore,
+    blobs: &dyn crate::store::blob::BlobStore,
+    store: &str,
+    record: &BlobRecord,
+    updater: &crate::update::UpdateSender,
+) -> error::Result<String> {
+    match put_dedup_record_counted(kv, store, record, updater).await? {
+        Some(existing_blob_id) if existing_blob_id != record.blob_id => {
+            // Content already stored under another blob_id — drop our duplicate.
+            if let Err(e) = blobs.delete(&record.blob_id).await {
+                tracing::warn!(
+                    store,
+                    blob_id = %record.blob_id,
+                    error = %e,
+                    "failed to delete duplicate blob after dedup hit; GC will collect it"
+                );
+            }
+            Ok(existing_blob_id)
+        }
+        _ => Ok(record.blob_id.clone()),
+    }
+}
+
 /// Fold over all blob records across all stores without collecting into a Vec.
 ///
 /// Each store×shard partition builds local state via `fold`, then per-partition

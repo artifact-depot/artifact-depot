@@ -308,6 +308,68 @@ async fn test_cleanup_max_unaccessed_deletes_stale() {
         .is_some());
 }
 
+/// Regression: `cleanup_max_unaccessed_days` must honor a *real download*.
+///
+/// A download updates the authoritative access time on the browse-tree file
+/// entry (via the debounced atime worker / `touch_artifact`), NOT the artifact
+/// record — whose `last_accessed_at` is frozen at write time. The cleanup sweep
+/// must therefore consult the tree entry; if it reads the record's stale field
+/// it will wrongly expire a recently-downloaded artifact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cleanup_max_unaccessed_respects_recent_download() {
+    let (kv, stores, _blobs, _dir) = make_stores().await;
+
+    let config = RepoConfig {
+        schema_version: CURRENT_RECORD_VERSION,
+        name: "recent-dl".to_string(),
+        kind: RepoKind::Hosted,
+        format_config: FormatConfig::Raw {
+            content_disposition: None,
+        },
+        store: "default".to_string(),
+        created_at: now_utc(),
+        cleanup_max_unaccessed_days: Some(1),
+        cleanup_max_age_days: None,
+        deleting: false,
+    };
+    svc_put_repo(kv.as_ref(), &config).await;
+
+    // Uploaded 10 days ago: the record's last_accessed_at is the (frozen) write
+    // time, and put_artifact stamps the tree entry with the same value.
+    let rec = make_record(
+        now_utc() - chrono::Duration::days(10),
+        now_utc() - chrono::Duration::days(10),
+    );
+    svc_put_artifact(kv.as_ref(), "recent-dl", "downloaded.txt", &rec).await;
+
+    // Simulate a download today: this updates ONLY the tree file entry's
+    // last_accessed_at (the authoritative access time), as a real GET does.
+    service::touch_artifact(kv.as_ref(), "recent-dl", "downloaded.txt", now_utc())
+        .await
+        .unwrap();
+
+    let mut state = GcState::new();
+    gc_pass(
+        kv.clone(),
+        &stores,
+        &mut state,
+        None,
+        usize::MAX,
+        None,
+        false,
+        &UpdateSender::noop(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        svc_get_artifact(kv.as_ref(), "recent-dl", "downloaded.txt")
+            .await
+            .is_some(),
+        "artifact downloaded today must survive max_unaccessed=1d cleanup"
+    );
+}
+
 // ===========================================================================
 // GC expiration -- multiple repos with different policies
 // ===========================================================================

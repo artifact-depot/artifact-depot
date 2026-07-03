@@ -333,6 +333,10 @@ pub fn with_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestB
 pub struct IngestionResult {
     pub record: ArtifactRecord,
     pub old_record: Option<ArtifactRecord>,
+    /// True when a genuinely new physical blob was stored (no dedup hit). The
+    /// caller must credit store stats `+record.size` iff this is true — store
+    /// growth is recorded only on real blob creation.
+    pub new_blob: bool,
 }
 
 #[tracing::instrument(
@@ -408,7 +412,11 @@ pub async fn commit_ingestion(
     counter!("ingest_bytes_total", "format" => format_owned, "repo_type" => repo_type_owned)
         .increment(size);
 
-    Ok(IngestionResult { record, old_record })
+    Ok(IngestionResult {
+        record,
+        old_record,
+        new_blob: !is_dedup,
+    })
 }
 
 /// Ingest an artifact: hash it, store the blob, write the artifact and blob records.

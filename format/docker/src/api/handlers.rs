@@ -23,6 +23,19 @@ use super::types::{
 };
 use super::uploads::{do_complete_upload, do_patch_upload, do_start_upload};
 
+/// Catch-all for `/v2/...` requests that match no registry route — returns a
+/// docker error envelope (404) so registry clients (and tools speaking the
+/// registry API) get JSON, instead of the SPA HTML the global fallback would
+/// otherwise serve. This includes multi-segment image names addressed via the
+/// `/v2/{repo}/{image}/...` shortcut, which only spans two name segments.
+pub async fn v2_not_found() -> Response {
+    super::helpers::docker_error(
+        "NAME_UNKNOWN",
+        "registry endpoint or repository not found",
+        StatusCode::NOT_FOUND,
+    )
+}
+
 /// `GET /v2/` — Docker V2 API version check.
 ///
 /// Returns 401 with Bearer challenge for anonymous users, 200 for authenticated users.

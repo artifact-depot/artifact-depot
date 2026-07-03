@@ -104,7 +104,14 @@ impl<'a> GolangStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
-        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -138,9 +145,6 @@ impl<'a> GolangStore<'a> {
         self.updater
             .dir_changed(self.repo, &path, count_delta, bytes_delta)
             .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
-            .await;
 
         Ok(record)
     }
@@ -173,7 +177,14 @@ impl<'a> GolangStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
-        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -206,9 +217,6 @@ impl<'a> GolangStore<'a> {
         };
         self.updater
             .dir_changed(self.repo, &path, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
 
         Ok(record)

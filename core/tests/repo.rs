@@ -191,6 +191,68 @@ async fn hosted_delete_existing() {
     assert!(repo.get("file.txt").await.unwrap().is_none());
 }
 
+// Regression: deleting an artifact must also prune its browse-tree entry
+// (`TABLE_DIR_ENTRIES`). The UI listing reads that table, so a delete that
+// drops only the `ArtifactRecord` leaves a "ghost" row whose backing record is
+// gone (404 on open). Covers both the single delete (`delete_artifact`) and the
+// bulk paired delete (`delete_artifacts_paired_batch`, used by retention/GC).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_prunes_browse_tree_entry_no_ghost() {
+    let (kv, blobs, _dir) = test_kv().await;
+    let repo = HostedRepo {
+        name: "hosted1".into(),
+        kv: Arc::clone(&kv),
+        blobs: Arc::clone(&blobs),
+        updater: UpdateSender::noop(),
+        store: "default".into(),
+        format: "raw".into(),
+    };
+    repo.put("d/a.txt", "text/plain", b"a").await.unwrap();
+    repo.put("d/b.txt", "text/plain", b"b").await.unwrap();
+
+    // Both files appear in the browse listing.
+    let (_, files) = service::list_children(kv.as_ref(), "hosted1", "d/")
+        .await
+        .unwrap();
+    let names: Vec<String> = files.into_iter().map(|(n, _)| n).collect();
+    assert!(
+        names.iter().any(|n| n == "a.txt") && names.iter().any(|n| n == "b.txt"),
+        "both files should be listed, got {names:?}"
+    );
+
+    // Single delete prunes the tree entry — no ghost.
+    assert!(repo.delete("d/a.txt").await.unwrap());
+    let (_, files) = service::list_children(kv.as_ref(), "hosted1", "d/")
+        .await
+        .unwrap();
+    let names: Vec<String> = files.into_iter().map(|(n, _)| n).collect();
+    assert!(
+        !names.iter().any(|n| n == "a.txt"),
+        "single-deleted file must not ghost in the listing, got {names:?}"
+    );
+    assert!(service::get_artifact(kv.as_ref(), "hosted1", "d/a.txt")
+        .await
+        .unwrap()
+        .is_none());
+
+    // Bulk paired delete (the retention / GC path) prunes the tree entry too.
+    service::delete_artifacts_paired_batch(kv.as_ref(), "hosted1", &["d/b.txt"])
+        .await
+        .unwrap();
+    let (_, files) = service::list_children(kv.as_ref(), "hosted1", "d/")
+        .await
+        .unwrap();
+    let names: Vec<String> = files.into_iter().map(|(n, _)| n).collect();
+    assert!(
+        !names.iter().any(|n| n == "b.txt"),
+        "bulk-deleted file must not ghost in the listing, got {names:?}"
+    );
+    assert!(service::get_artifact(kv.as_ref(), "hosted1", "d/b.txt")
+        .await
+        .unwrap()
+        .is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hosted_delete_nonexistent() {
     let (kv, blobs, _dir) = test_kv().await;

@@ -197,7 +197,8 @@ pub async fn delete_artifacts_paired_batch(
         .iter()
         .map(|(pk, sk)| (pk.as_str(), sk.as_str()))
         .collect();
-    kv.delete_batch(keys::TABLE_ARTIFACTS, &artifact_keys_ref)
+    let record_hits = kv
+        .delete_batch(keys::TABLE_ARTIFACTS, &artifact_keys_ref)
         .await?;
 
     let tree_keys: Vec<(String, String)> = paths
@@ -211,16 +212,45 @@ pub async fn delete_artifacts_paired_batch(
         .iter()
         .map(|(pk, sk)| (pk.as_str(), sk.as_str()))
         .collect();
-    if let Err(e) = kv
+    match kv
         .delete_batch(keys::TABLE_DIR_ENTRIES, &tree_keys_ref)
         .await
     {
-        tracing::warn!(
-            repo,
-            error = %e,
-            count = paths.len(),
-            "paired tree-entry delete failed; full_scan will reconcile"
-        );
+        Ok(tree_hits) => {
+            // Ghost detector: a record that was deleted whose browse-tree entry
+            // was NOT found leaves a dangling UI row (a "ghost"). This should
+            // never happen — count and log the first few so a future ghost can
+            // be traced to its origin instead of reverse-engineered.
+            let ghosts: Vec<&str> = paths
+                .iter()
+                .zip(record_hits.iter().zip(tree_hits.iter()))
+                .filter(|(_, (&rec, &tree))| rec && !tree)
+                .map(|(p, _)| *p)
+                .take(5)
+                .collect();
+            let ghost_count = paths
+                .iter()
+                .zip(record_hits.iter().zip(tree_hits.iter()))
+                .filter(|(_, (&rec, &tree))| rec && !tree)
+                .count();
+            if ghost_count > 0 {
+                metrics::counter!("paired_delete_tree_misses_total").increment(ghost_count as u64);
+                tracing::warn!(
+                    repo,
+                    ghost_count,
+                    sample = ?ghosts,
+                    "paired delete removed records whose tree entries were already absent"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                error = %e,
+                count = paths.len(),
+                "paired tree-entry delete failed; full_scan will reconcile"
+            );
+        }
     }
     Ok(())
 }

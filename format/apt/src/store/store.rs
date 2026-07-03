@@ -81,7 +81,14 @@ impl<'a> AptStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
-        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -124,9 +131,6 @@ impl<'a> AptStore<'a> {
         };
         self.updater
             .dir_changed(self.repo, &path_owned, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
 
         // Set stale flag (if not already set)
@@ -171,7 +175,14 @@ impl<'a> AptStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
-        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -214,9 +225,6 @@ impl<'a> AptStore<'a> {
         self.updater
             .dir_changed(self.repo, &path, count_delta, bytes_delta)
             .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
-            .await;
 
         self.set_stale_flag(distribution).await?;
         Ok(record)
@@ -250,7 +258,14 @@ impl<'a> AptStore<'a> {
         };
         let store = self.store.to_string();
         let repo = self.repo.to_string();
-        let blob_id = service::claim_or_reuse_blob(self.kv, self.blobs, &store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            &store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -293,9 +308,6 @@ impl<'a> AptStore<'a> {
         };
         self.updater
             .dir_changed(self.repo, &path_owned, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
 
         // Set stale flag (if not already set)
@@ -666,8 +678,14 @@ impl<'a> AptStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            self.store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -692,9 +710,6 @@ impl<'a> AptStore<'a> {
         if written {
             self.updater
                 .dir_changed(self.repo, &bhp, 1, record.size as i64)
-                .await;
-            self.updater
-                .store_changed(self.store, 1, record.size as i64)
                 .await;
         }
 
@@ -722,8 +737,14 @@ impl<'a> AptStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &blob_rec).await?;
+        let blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            self.store,
+            &blob_rec,
+            self.updater,
+        )
+        .await?;
 
         let record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
@@ -750,9 +771,6 @@ impl<'a> AptStore<'a> {
         };
         self.updater
             .dir_changed(self.repo, &path, count_delta, bytes_delta)
-            .await;
-        self.updater
-            .store_changed(self.store, count_delta, bytes_delta)
             .await;
         Ok(())
     }
@@ -789,9 +807,6 @@ impl<'a> AptStore<'a> {
         if written {
             self.updater
                 .dir_changed(self.repo, &bhp, 1, record.size as i64)
-                .await;
-            self.updater
-                .store_changed(self.store, 1, record.size as i64)
                 .await;
         }
         Ok(())
@@ -844,8 +859,14 @@ impl<'a> AptStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let priv_blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &priv_blob_rec).await?;
+        let priv_blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            self.store,
+            &priv_blob_rec,
+            self.updater,
+        )
+        .await?;
         let priv_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -876,8 +897,14 @@ impl<'a> AptStore<'a> {
             created_at: now,
             store: self.store.to_string(),
         };
-        let pub_blob_id =
-            service::claim_or_reuse_blob(self.kv, self.blobs, self.store, &pub_blob_rec).await?;
+        let pub_blob_id = service::claim_or_reuse_blob_counted(
+            self.kv,
+            self.blobs,
+            self.store,
+            &pub_blob_rec,
+            self.updater,
+        )
+        .await?;
         let pub_record = ArtifactRecord {
             schema_version: CURRENT_RECORD_VERSION,
             id: String::new(),
@@ -904,7 +931,6 @@ impl<'a> AptStore<'a> {
         self.updater
             .dir_changed(self.repo, "_apt/signing_key", cd, bd)
             .await;
-        self.updater.store_changed(self.store, cd, bd).await;
 
         let old_pub = service::put_artifact(self.kv, &repo, "_apt/public_key", &pub_record).await?;
         let (cd, bd) = match &old_pub {
@@ -914,7 +940,6 @@ impl<'a> AptStore<'a> {
         self.updater
             .dir_changed(self.repo, "_apt/public_key", cd, bd)
             .await;
-        self.updater.store_changed(self.store, cd, bd).await;
         Ok(())
     }
 

@@ -14,9 +14,12 @@
 //! - `GET /service/rest/v1/search` — search for components
 //! - `GET /service/rest/v1/status` — health check
 //! - `GET /service/rest/v1/repositories` — list repositories
+//! - `POST /service/rest/v1/staging/move/{destination}` — move components by criteria
+//! - `POST /service/rest/v1/staging/delete` — delete components by criteria
+//! - `POST /service/rest/v1/staging/copy/{destination}` — copy components (incl. cross-store)
 
 use axum::{
-    extract::{Multipart, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
@@ -28,8 +31,9 @@ use depot_core::error::{self, DepotError};
 use depot_core::format_state::FormatState;
 use depot_core::repo::{make_raw_repo, RawRepo};
 use depot_core::service;
-use depot_core::store::kv::{ArtifactFormat, ArtifactRecord, Capability, Pagination};
+use depot_core::store::kv::{ArtifactFormat, ArtifactRecord, Capability, Pagination, RepoType};
 use depot_format_apt::store::AptStore;
+use depot_format_docker::DockerStore;
 use depot_format_helm::store::HelmStore;
 use depot_format_pypi::store::PypiStore;
 use depot_format_yum::store::YumStore;
@@ -897,4 +901,406 @@ async fn upload_component_pypi(
     .await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Staging move / delete (Nexus-compatible)
+// ---------------------------------------------------------------------------
+//
+// `POST /service/rest/v1/staging/move/{destination}` and
+// `POST /service/rest/v1/staging/delete` move/delete components matching the
+// search criteria. Mirrors Sonatype Nexus' Pro staging API: move is a
+// metadata-only operation within a single blob store (cross-store relocation
+// is a separate copy endpoint). Currently scoped to Docker repositories.
+
+/// Search criteria shared by the staging move/delete endpoints.
+#[derive(Debug, Deserialize)]
+pub struct StagingParams {
+    /// Source repository (required).
+    pub repository: Option<String>,
+    /// Docker image name / namespace (e.g. `myriad/api_server`).
+    #[serde(rename = "docker.imageName")]
+    pub docker_image_name: Option<String>,
+    /// Docker image tag (e.g. `1.2.3`).
+    #[serde(rename = "docker.imageTag")]
+    pub docker_image_tag: Option<String>,
+    /// Component tag — accepted as an alias for `docker.imageTag`.
+    pub tag: Option<String>,
+    /// Component name — accepted as an alias for `docker.imageName`.
+    pub name: Option<String>,
+    /// Replace an existing destination tag. Defaults to false.
+    pub overwrite: Option<bool>,
+    /// Delete the source tag after a successful copy (copy endpoint only).
+    /// Defaults to false. Ignored by move (which always removes the source).
+    #[serde(rename = "deleteSource")]
+    pub delete_source: Option<bool>,
+}
+
+/// One component touched by a staging operation (Nexus-style payload item).
+#[derive(Debug, Serialize)]
+pub struct StagingComponent {
+    pub repository: String,
+    pub format: String,
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StagingResponse {
+    pub components: Vec<StagingComponent>,
+}
+
+/// Look up a repository and require it to be a Docker repository.
+async fn load_docker_repo(
+    state: &FormatState,
+    name: &str,
+) -> Result<depot_core::store::kv::RepoConfig, Response> {
+    let cfg = match service::get_repo(state.kv.as_ref(), name).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return Err(
+                DepotError::NotFound(format!("repository '{name}' not found")).into_response(),
+            )
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+    };
+    if cfg.format() != ArtifactFormat::Docker {
+        return Err(DepotError::BadRequest(format!(
+            "staging operations currently support only Docker repositories; '{name}' is {}",
+            cfg.format()
+        ))
+        .into_response());
+    }
+    Ok(cfg)
+}
+
+/// Resolve the `(image, tag)` criteria, requiring at least one so a
+/// criteria-less request can't sweep an entire repository by accident.
+fn staging_criteria(
+    params: &StagingParams,
+) -> Result<(Option<String>, Option<String>), DepotError> {
+    let image = params
+        .docker_image_name
+        .clone()
+        .or_else(|| params.name.clone());
+    let tag = params
+        .docker_image_tag
+        .clone()
+        .or_else(|| params.tag.clone());
+    if image.is_none() && tag.is_none() {
+        return Err(DepotError::BadRequest(
+            "specify at least docker.imageName or docker.imageTag/tag; \
+             refusing to act on all components"
+                .into(),
+        ));
+    }
+    Ok((image, tag))
+}
+
+/// Expand the criteria into the concrete `(image, tag)` pairs to act on.
+/// With an explicit tag this is a single pair; with only an image name it is
+/// every tag currently published under that image namespace.
+async fn enumerate_targets(
+    state: &FormatState,
+    repo: &depot_core::store::kv::RepoConfig,
+    image: Option<String>,
+    tag: Option<String>,
+) -> Result<Vec<(Option<String>, String)>, Response> {
+    if let Some(tag) = tag {
+        return Ok(vec![(image, tag)]);
+    }
+    // `staging_criteria` guarantees `image` is Some when `tag` is None.
+    let blobs = state
+        .blob_store(&repo.store)
+        .await
+        .map_err(|e| e.into_response())?;
+    let store = DockerStore {
+        repo: &repo.name,
+        image: image.as_deref(),
+        kv: state.kv.as_ref(),
+        blobs: blobs.as_ref(),
+        updater: &state.updater,
+        store: &repo.store,
+    };
+    let tags = store.list_tags().await.map_err(|e| e.into_response())?;
+    Ok(tags.into_iter().map(|t| (image.clone(), t)).collect())
+}
+
+/// `POST /service/rest/v1/staging/move/{destination}`
+///
+/// Moves Docker components matching the criteria from the source `repository`
+/// into `{destination}` (same blob store). Metadata-only; the source tag is
+/// removed once the destination copy succeeds.
+pub async fn staging_move(
+    State(state): State<FormatState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(destination): Path<String>,
+    Query(params): Query<StagingParams>,
+) -> Response {
+    let source = match &params.repository {
+        Some(r) => r.clone(),
+        None => {
+            return DepotError::BadRequest("'repository' query parameter is required".into())
+                .into_response()
+        }
+    };
+
+    // Authz: delete on source, write on destination.
+    if let Err(e) = state
+        .auth
+        .check_permission(&user.0, &source, Capability::Delete)
+        .await
+    {
+        return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+    }
+    if let Err(e) = state
+        .auth
+        .check_permission(&user.0, &destination, Capability::Write)
+        .await
+    {
+        return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+    }
+
+    let source_cfg = match load_docker_repo(&state, &source).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let dest_cfg = match load_docker_repo(&state, &destination).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if dest_cfg.repo_type() != RepoType::Hosted {
+        return DepotError::BadRequest(format!(
+            "destination '{destination}' must be a hosted repository"
+        ))
+        .into_response();
+    }
+    if source_cfg.store != dest_cfg.store {
+        return DepotError::BadRequest(format!(
+            "staging move requires the same blob store: '{source}' uses '{}' but \
+             '{destination}' uses '{}'. Use the cross-store copy endpoint instead.",
+            source_cfg.store, dest_cfg.store
+        ))
+        .into_response();
+    }
+
+    let (image, tag) = match staging_criteria(&params) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let blobs = match state.blob_store(&source_cfg.store).await {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let overwrite = params.overwrite.unwrap_or(false);
+
+    // Same-store move: source and destination share the blob store.
+    let target = depot_format_docker::CopyTarget {
+        kv: state.kv.as_ref(),
+        updater: &state.updater,
+        source_repo: &source,
+        source_store: &source_cfg.store,
+        source_blobs: blobs.as_ref(),
+        dest_repo: &destination,
+        dest_store: &source_cfg.store,
+        dest_blobs: blobs.as_ref(),
+    };
+
+    let mut components = Vec::new();
+    for (image, tag) in targets {
+        let name = image.clone().unwrap_or_else(|| source.clone());
+        match depot_format_docker::copy_tag(&target, image.as_deref(), &tag, true, overwrite).await
+        {
+            Ok(_) => components.push(StagingComponent {
+                repository: destination.clone(),
+                format: "docker".into(),
+                name,
+                version: tag,
+            }),
+            Err(e) => return e.into_response(),
+        }
+    }
+
+    Json(StagingResponse { components }).into_response()
+}
+
+/// `POST /service/rest/v1/staging/copy/{destination}`
+///
+/// Depot extension to the staging family: copies Docker components matching the
+/// criteria from the source `repository` into `{destination}`, which may live
+/// in a **different** blob store (the bytes are streamed across). With
+/// `deleteSource=true` the source tag is removed after a successful copy,
+/// giving a cross-store move.
+pub async fn staging_copy(
+    State(state): State<FormatState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(destination): Path<String>,
+    Query(params): Query<StagingParams>,
+) -> Response {
+    let source = match &params.repository {
+        Some(r) => r.clone(),
+        None => {
+            return DepotError::BadRequest("'repository' query parameter is required".into())
+                .into_response()
+        }
+    };
+    let delete_source = params.delete_source.unwrap_or(false);
+
+    // Authz: read on source (delete too if removing it), write on destination.
+    let source_cap = if delete_source {
+        Capability::Delete
+    } else {
+        Capability::Read
+    };
+    if let Err(e) = state
+        .auth
+        .check_permission(&user.0, &source, source_cap)
+        .await
+    {
+        return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+    }
+    if let Err(e) = state
+        .auth
+        .check_permission(&user.0, &destination, Capability::Write)
+        .await
+    {
+        return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+    }
+
+    let source_cfg = match load_docker_repo(&state, &source).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let dest_cfg = match load_docker_repo(&state, &destination).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if dest_cfg.repo_type() != RepoType::Hosted {
+        return DepotError::BadRequest(format!(
+            "destination '{destination}' must be a hosted repository"
+        ))
+        .into_response();
+    }
+
+    let (image, tag) = match staging_criteria(&params) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let source_blobs = match state.blob_store(&source_cfg.store).await {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let dest_blobs = match state.blob_store(&dest_cfg.store).await {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let overwrite = params.overwrite.unwrap_or(false);
+
+    let target = depot_format_docker::CopyTarget {
+        kv: state.kv.as_ref(),
+        updater: &state.updater,
+        source_repo: &source,
+        source_store: &source_cfg.store,
+        source_blobs: source_blobs.as_ref(),
+        dest_repo: &destination,
+        dest_store: &dest_cfg.store,
+        dest_blobs: dest_blobs.as_ref(),
+    };
+
+    let mut components = Vec::new();
+    for (image, tag) in targets {
+        let name = image.clone().unwrap_or_else(|| source.clone());
+        match depot_format_docker::copy_tag(
+            &target,
+            image.as_deref(),
+            &tag,
+            delete_source,
+            overwrite,
+        )
+        .await
+        {
+            Ok(_) => components.push(StagingComponent {
+                repository: destination.clone(),
+                format: "docker".into(),
+                name,
+                version: tag,
+            }),
+            Err(e) => return e.into_response(),
+        }
+    }
+
+    Json(StagingResponse { components }).into_response()
+}
+
+/// `POST /service/rest/v1/staging/delete`
+///
+/// Deletes Docker components matching the criteria from the source
+/// `repository`. The tag is removed; orphaned manifests/blobs are reclaimed by
+/// the Docker GC pass.
+pub async fn staging_delete(
+    State(state): State<FormatState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Query(params): Query<StagingParams>,
+) -> Response {
+    let source = match &params.repository {
+        Some(r) => r.clone(),
+        None => {
+            return DepotError::BadRequest("'repository' query parameter is required".into())
+                .into_response()
+        }
+    };
+
+    if let Err(e) = state
+        .auth
+        .check_permission(&user.0, &source, Capability::Delete)
+        .await
+    {
+        return (StatusCode::FORBIDDEN, e.to_string()).into_response();
+    }
+
+    let source_cfg = match load_docker_repo(&state, &source).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let (image, tag) = match staging_criteria(&params) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+
+    let mut components = Vec::new();
+    for (image, tag) in targets {
+        let name = image.clone().unwrap_or_else(|| source.clone());
+        match depot_format_docker::delete_tag(
+            state.kv.as_ref(),
+            &state.updater,
+            &source,
+            image.as_deref(),
+            &tag,
+        )
+        .await
+        {
+            Ok(true) => components.push(StagingComponent {
+                repository: source.clone(),
+                format: "docker".into(),
+                name,
+                version: tag,
+            }),
+            Ok(false) => {}
+            Err(e) => return e.into_response(),
+        }
+    }
+
+    Json(StagingResponse { components }).into_response()
 }

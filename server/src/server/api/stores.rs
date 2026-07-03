@@ -740,6 +740,53 @@ pub async fn check_store(
     }
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ReconcileEntry {
+    pub store: String,
+    pub blob_count: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ReconcileResponse {
+    pub stores: Vec<ReconcileEntry>,
+}
+
+/// Recompute every store's `blob_count`/`total_bytes` from the authoritative
+/// blob records and persist the corrected values. Use after bulk operations
+/// (e.g. a reorg) or whenever the reported sizes look off; the GC pass also runs
+/// this automatically. Admin only.
+#[utoipa::path(
+    post,
+    path = "/api/v1/stores/reconcile",
+    responses(
+        (status = 200, description = "Reconciled per-store stats", body = ReconcileResponse)
+    ),
+    tag = "stores"
+)]
+pub async fn reconcile_stores(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> impl IntoResponse {
+    if let Err(e) = state.auth.backend.require_admin(&user.0).await {
+        return e.into_response();
+    }
+    match service::reconcile_store_stats(state.repo.kv.as_ref()).await {
+        Ok(stats) => Json(ReconcileResponse {
+            stores: stats
+                .into_iter()
+                .map(|(store, s)| ReconcileEntry {
+                    store,
+                    blob_count: s.blob_count,
+                    total_bytes: s.total_bytes,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -147,7 +147,13 @@ where
         let (raw_name, raw_image) = if let Some(name) = map.remove("name") {
             (name, None)
         } else if let Some(repo) = map.remove("repo") {
-            (repo, map.remove("image"))
+            // The image under a named repo may be one segment ({image}) or two
+            // ({image}/{image2}), e.g. a repo serving `library/nginx`.
+            let image = match (map.remove("image"), map.remove("image2")) {
+                (Some(a), Some(b)) => Some(format!("{a}/{b}")),
+                (a, _) => a,
+            };
+            (repo, image)
         } else {
             return Err(docker_error(
                 "NAME_UNKNOWN",

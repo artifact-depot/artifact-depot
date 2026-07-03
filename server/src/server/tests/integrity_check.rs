@@ -537,6 +537,7 @@ async fn test_check_fails_when_lease_held() {
         cancel,
         true,
         true,
+        depot_core::update::UpdateSender::noop(),
     )
     .await;
 
@@ -582,6 +583,7 @@ async fn test_check_cancelled_before_start() {
         cancel,
         true,
         true,
+        depot_core::update::UpdateSender::noop(),
     )
     .await;
 
@@ -640,6 +642,7 @@ async fn test_check_cancelled_during_verification() {
                 cancel_clone,
                 true,
                 true,
+                depot_core::update::UpdateSender::noop(),
             )
             .await;
         }

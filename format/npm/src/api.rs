@@ -367,10 +367,15 @@ async fn cache_upstream_packument(
             let store = config.store.clone();
             // Best-effort cache fill: on claim failure keep the freshly written
             // blob_id (matching the previously swallowed put_dedup_record error).
-            let tags_blob_id =
-                service::claim_or_reuse_blob(state.kv.as_ref(), blobs.as_ref(), &store, &blob_rec)
-                    .await
-                    .unwrap_or(tags_blob_id);
+            let tags_blob_id = service::claim_or_reuse_blob_counted(
+                state.kv.as_ref(),
+                blobs.as_ref(),
+                &store,
+                &blob_rec,
+                &state.updater,
+            )
+            .await
+            .unwrap_or(tags_blob_id);
             let tags_record = depot_core::store::kv::ArtifactRecord {
                 schema_version: CURRENT_RECORD_VERSION,
                 id: String::new(),
@@ -411,11 +416,12 @@ async fn cache_upstream_packument(
                 let store = config.store.clone();
                 // Best-effort cache fill: on claim failure keep the freshly written
                 // blob_id (matching the previously swallowed put_dedup_record error).
-                let ver_blob_id = service::claim_or_reuse_blob(
+                let ver_blob_id = service::claim_or_reuse_blob_counted(
                     state.kv.as_ref(),
                     blobs.as_ref(),
                     &store,
                     &blob_rec,
+                    &state.updater,
                 )
                 .await
                 .unwrap_or(ver_blob_id);

@@ -199,6 +199,9 @@ pub async fn run_blob_reaper(
                             .mark_completed(task_id, TaskResult::BlobGc(gc_result))
                             .await;
                         transient_retries = 0;
+                        // (gc_pass already writes authoritative per-store stats
+                        // from the live blob set during its sweep, so there is no
+                        // separate reconcile to run here.)
                     }
                     Err(e) => {
                         if e.is_transient() && transient_retries < MAX_TRANSIENT_RETRIES {
