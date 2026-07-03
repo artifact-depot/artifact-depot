@@ -3,7 +3,9 @@
 # SPDX-FileCopyrightText: 2026 Artifact Depot Contributors
 #
 # SPDX-License-Identifier: Apache-2.0
-# Run Playwright UI tests inside a network namespace for isolation.
+# Run Playwright UI tests against a depot server on a free loopback port.
+# The ephemeral port (see net-helpers.sh) keeps parallel worktrees from
+# colliding without a network namespace, so this runs as root or non-root.
 # All artifacts are kept under build/ so parallel worktrees never collide.
 #
 # Usage:
@@ -29,11 +31,11 @@ FRONTEND_DIR="$ROOT/ui/frontend"
 BUILD_DIR="$ROOT/build/test/ui"
 DATA_DIR="$BUILD_DIR/server-data"
 
-source "$SCRIPT_DIR/ns-helpers.sh"
-sweep_leaked_namespaces
+source "$SCRIPT_DIR/net-helpers.sh"
 
-NETNS=$(make_netns_name "depot-ui-test")
-PORT=8080
+# A free ephemeral port keeps parallel suites/worktrees from colliding without
+# needing a network namespace (and therefore without root). See net-helpers.sh.
+PORT=$(pick_free_port)
 BASE_URL="http://127.0.0.1:${PORT}"
 
 cleanup() {
@@ -42,7 +44,6 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
     echo "Stopped depot server (pid $SERVER_PID)"
   fi
-  ip netns del "$NETNS" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -63,11 +64,6 @@ mkdir -p "$FRONTEND_DIR/.nyc_output"
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR/blobs" "$BUILD_DIR"
 
-# --- Create isolated network namespace ---
-ip netns del "$NETNS" 2>/dev/null || true
-ip netns add "$NETNS"
-ip netns exec "$NETNS" ip link set lo up
-
 # --- Write server config ---
 cat > "$DATA_DIR/depotd.toml" <<EOF
 default_admin_password = "admin"
@@ -81,10 +77,10 @@ type = "redb"
 path = "${DATA_DIR}/depot.redb"
 EOF
 
-# --- Start depot server inside namespace ---
+# --- Start depot server ---
 # Forward LLVM_PROFILE_FILE if set so Rust coverage is collected.
-echo "Starting depot server in namespace $NETNS..."
-ip netns exec "$NETNS" env \
+echo "Starting depot server on ${BASE_URL}..."
+env \
   ${LLVM_PROFILE_FILE:+LLVM_PROFILE_FILE="$LLVM_PROFILE_FILE"} \
   "$ROOT/target/debug/depot" -c "$DATA_DIR/depotd.toml" \
   > "$DATA_DIR/server.log" 2>&1 &
@@ -93,7 +89,7 @@ SERVER_PID=$!
 # Wait for health
 echo "Waiting for server health..."
 for _ in $(seq 1 60); do
-  if ip netns exec "$NETNS" curl -sf "${BASE_URL}/api/v1/health" >/dev/null 2>&1; then
+  if curl -sf "${BASE_URL}/api/v1/health" >/dev/null 2>&1; then
     break
   fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -101,13 +97,13 @@ for _ in $(seq 1 60); do
   fi
   sleep 0.5
 done
-ip netns exec "$NETNS" curl -sf "${BASE_URL}/api/v1/health" >/dev/null || {
+curl -sf "${BASE_URL}/api/v1/health" >/dev/null || {
   echo "Server not healthy. Log:"; cat "$DATA_DIR/server.log"; exit 1
 }
 echo "Server is healthy."
 
 # --- Bootstrap: change admin password (required) and create default store ---
-_curl() { ip netns exec "$NETNS" curl -s "$@"; }
+_curl() { curl -s "$@"; }
 
 TOKEN=$(_curl -X POST "${BASE_URL}/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
@@ -147,7 +143,7 @@ PROJECT_ARGS=()
 if ! printf '%s\n' "${EXTRA_ARGS[@]}" | grep -q -- '--project'; then
   PROJECT_ARGS=(--project=parallel --project=serial)
 fi
-ip netns exec "$NETNS" env \
+env \
   DEPOT_TEST_URL="${BASE_URL}" \
   DEPOT_UI_SKIP_SETUP=1 \
   npx playwright test "${PROJECT_ARGS[@]}" "${EXTRA_ARGS[@]}"

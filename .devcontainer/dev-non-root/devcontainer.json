@@ -1,0 +1,103 @@
+{
+	"name": "artifact-depot (dev-non-root)",
+	// Non-root dev container: same tooling as the default community container
+	// (the `dev` stage) plus glab + aws and a sudo-capable host user (the
+	// `dev-non-root` stage), host file/folder access, env-file delivery, and an
+	// optional Beyond Compare install. Pick this via "Dev Containers: Reopen in
+	// Container" -> "artifact-depot (dev-non-root)".
+	"build": {
+		"context": "../..",
+		"dockerfile": "../../Dockerfile",
+		"target": "dev-non-root",
+		"args": {
+			"DOCKER_MIRROR": "",
+			"APT_MIRROR": "",
+			"USERNAME": "${localEnv:USER}"
+		}
+	},
+	// In-container Docker (dind) for the docker-based integration suites
+	// (`make test-docker-auth`, `test-apt`) so they reach a depot bound on the
+	// dev container's localhost. The engine (docker.io/containerd) + the buildx
+	// plugin are baked into the image by the Dockerfile's builder/dev-non-root
+	// stages, and the dev user is in the `docker` group. We do NOT use the
+	// docker-in-docker devcontainer feature: it can no longer be pinned to skip
+	// the (already-present) engine install, and its docker-ce packages conflict
+	// with Debian's docker.io. Instead postStartCommand launches dockerd (see
+	// start-dockerd.sh). The image bakes /etc/docker/daemon.json marking the
+	// loopback registry insecure, matching CI's
+	// `dockerd --insecure-registry 127.0.0.0/8`.
+	"customizations": {
+		"vscode": {
+			"settings": {},
+			"extensions": [
+				"anthropic.claude-code",
+				"eamodio.gitlens",
+				"rust-lang.rust-analyzer",
+				"Vue.volar",
+				"redhat.vscode-yaml",
+				"timonwong.shellcheck",
+				"exiasr.hadolint"
+			]
+		}
+	},
+	// Host-side prep (object form -> labeled, parallel). Ensure bind-mount
+	// sources exist, and snapshot the env that ~/.dev_aliases exports into an
+	// env-file that runArgs imports (so vars like tokens, TZ, and the optional
+	// BC5_LICENSE_KEY_B64 reach the container -- including non-interactive shells).
+	"initializeCommand": {
+		"mkdir-mounts": "mkdir -p \"${localEnv:HOME}${localEnv:USERPROFILE}/.claude\" \"${localEnv:HOME}${localEnv:USERPROFILE}/.ssh\" \"${localEnv:HOME}${localEnv:USERPROFILE}/.aws\"",
+		"history": "touch \"${localEnv:HOME}${localEnv:USERPROFILE}/.artifact-depot.bash_history\"",
+		"dev-aliases": "touch \"${localEnv:HOME}${localEnv:USERPROFILE}/.dev_aliases\"",
+		"env-snapshot": "env -i PATH=/usr/bin:/bin HOME=\"${localEnv:HOME}${localEnv:USERPROFILE}\" bash -c '. \"$HOME/.dev_aliases\" 2>/dev/null; env' | grep -vE '^(PWD|SHLVL|_|PATH|HOME|SHELL)=' > \"${localEnv:HOME}${localEnv:USERPROFILE}/.artifact-depot.devenv\" || true"
+	},
+	"mounts": [
+		"source=artifact-depot-workspace,target=/workspace,type=volume",
+		"source=artifact-depot-worktrees,target=/worktrees,type=volume",
+		"source=artifact-depot-build,target=/build,type=volume",
+		"source=artifact-depot-dind,target=/var/lib/docker,type=volume",
+		"source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/${localEnv:USER}/.ssh,type=bind,readonly",
+		"source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude,target=/home/${localEnv:USER}/.claude,type=bind,consistency=cached",
+		"source=${localEnv:HOME}${localEnv:USERPROFILE}/.aws,target=/home/${localEnv:USER}/.aws,type=bind,consistency=cached",
+		"source=${localEnv:HOME}${localEnv:USERPROFILE}/.artifact-depot.bash_history,target=/home/${localEnv:USER}/.bash_history,type=bind,consistency=cached",
+		"source=${localEnv:HOME}${localEnv:USERPROFILE}/.dev_aliases,target=/home/${localEnv:USER}/.bash_aliases,type=bind,readonly,consistency=cached"
+	],
+	// volume-chown: named volumes are root-owned on first mount; hand them to
+	// the dev user. beyond-compare: optional, installs + licenses Beyond
+	// Compare 5 only when BC5_LICENSE_KEY_B64 is provided via the env-file;
+	// no-op otherwise. See .devcontainer/install-bcompare.sh.
+	"postCreateCommand": {
+		"volume-chown": "sudo chown $(id -u):$(id -g) /workspace /worktrees /build",
+		"beyond-compare": "bash .devcontainer/install-bcompare.sh"
+	},
+	// Launch the in-container Docker daemon on every start (idempotent). This
+	// replaces the docker-in-docker feature; see the dind comment near the top.
+	"postStartCommand": {
+		"dockerd": "bash .devcontainer/start-dockerd.sh"
+	},
+	"appPort": [],
+	// --env-file: import the host env captured by env-snapshot. --sysctl
+	// disables IPv6 so the Claude Code OAuth loopback callback works.
+	"runArgs": [
+		"--env-file=${localEnv:HOME}${localEnv:USERPROFILE}/.artifact-depot.devenv",
+		"--sysctl", "net.ipv6.conf.all.disable_ipv6=1"
+	],
+	"forwardPorts": [4000, 8080],
+	"portsAttributes": {
+		"4000": {
+			"label": "Jekyll docs (make docs-serve)",
+			"onAutoForward": "openBrowser"
+		},
+		"8080": {
+			"label": "Depot server (make demo)",
+			"onAutoForward": "notify"
+		}
+	},
+	"privileged": true,
+	"workspaceMount": "source=${localWorkspaceFolder},target=/workspace/artifact-depot,type=bind",
+	"workspaceFolder": "/workspace/artifact-depot",
+	"remoteEnv": {
+		"TERM": "${localEnv:TERM}"
+	},
+	"remoteUser": "${localEnv:USER}",
+	"updateRemoteUserUID": true
+}
