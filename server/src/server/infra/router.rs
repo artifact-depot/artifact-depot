@@ -42,6 +42,8 @@ use depot_format_docker::api as docker;
         repositories::update_repo,
         repositories::clean_repo,
         repositories::clone_repo,
+        repositories::rotate_signing_key,
+        repositories::import_signing_key,
         // Artifacts
         artifacts::head_artifact,
         artifacts::get_artifact,
@@ -99,6 +101,8 @@ use depot_format_docker::api as docker;
         repositories::UpdateRepoRequest,
         repositories::CloneRepoRequest,
         repositories::RepoResponse,
+        repositories::ImportSigningKeyRequest,
+        repositories::SigningKeyResponse,
         // Artifacts
         artifacts::ArtifactResponse,
         artifacts::DirResponse,
@@ -209,6 +213,10 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
         .route(
             "/api/v1/repositories/{name}/clone",
             post(repositories::clone_repo),
+        )
+        .route(
+            "/api/v1/repositories/{name}/signing-key",
+            post(repositories::rotate_signing_key).put(repositories::import_signing_key),
         )
         .route(
             "/api/v1/repositories/{repo}/artifacts",

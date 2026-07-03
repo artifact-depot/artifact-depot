@@ -929,6 +929,68 @@ impl<'a> AptStore<'a> {
         Ok(None)
     }
 
+    /// Generate a fresh signing keypair, store it, and return the armored public key.
+    pub async fn generate_and_store_signing_key(&self, repo_name: &str) -> error::Result<String> {
+        let (private_armor, public_armor) = super::signing::generate_gpg_keypair(repo_name)?;
+        self.store_signing_key(&private_armor, &public_armor)
+            .await?;
+        Ok(public_armor)
+    }
+
+    /// Ensure a signing key exists, generating one if absent. Returns the armored
+    /// public key when a new key is created, or `None` if one already existed.
+    pub async fn ensure_signing_key(&self, repo_name: &str) -> error::Result<Option<String>> {
+        if self.get_signing_key().await?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(self.generate_and_store_signing_key(repo_name).await?))
+    }
+
+    /// Import an externally-supplied armored secret key, deriving and storing its
+    /// public half. Returns the armored public key.
+    pub async fn import_signing_key(&self, secret_key_armor: &str) -> error::Result<String> {
+        let public_armor = super::signing::public_key_from_secret(secret_key_armor)?;
+        self.store_signing_key(secret_key_armor, &public_armor)
+            .await?;
+        Ok(public_armor)
+    }
+
+    /// List distributions that currently have published metadata (an `InRelease`).
+    pub async fn list_distributions(&self) -> error::Result<Vec<String>> {
+        let repo = self.repo.to_string();
+        service::fold_all_artifacts(
+            self.kv,
+            &repo,
+            "dists/",
+            Vec::new,
+            |acc, sk, _record| {
+                if let Some(rest) = sk.strip_prefix("dists/") {
+                    if let Some(dist) = rest.strip_suffix("/InRelease") {
+                        if !dist.is_empty() && !dist.contains('/') {
+                            acc.push(dist.to_string());
+                        }
+                    }
+                }
+                Ok(())
+            },
+            |mut a, b| {
+                a.extend(b);
+                a
+            },
+        )
+        .await
+    }
+
+    /// Mark every published distribution stale so its `InRelease`/`Release.gpg`
+    /// are rebuilt — and re-signed with the current key — on the next metadata
+    /// fetch. Called after the signing key is rotated or imported.
+    pub async fn resign_all_distributions(&self) -> error::Result<()> {
+        for dist in self.list_distributions().await? {
+            self.set_metadata_stale(&dist).await?;
+        }
+        Ok(())
+    }
+
     /// Store a metadata file fetched from an upstream cache.
     /// Public wrapper around `store_metadata_file` for use by cache repos.
     pub async fn store_cached_metadata(

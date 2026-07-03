@@ -1823,3 +1823,203 @@ async fn test_metadata_visible_in_browse() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
+
+// ===========================================================================
+// Signing key provisioning + management
+// ===========================================================================
+
+/// A hosted apt repo auto-generates a signing key on creation, so its metadata
+/// is signed (clearsigned InRelease + detached Release.gpg) and the public key
+/// is served immediately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_hosted_repo_signed_by_default() {
+    let app = TestApp::new().await;
+    app.create_apt_repo("apt-autosign").await;
+    let token = app.admin_token();
+
+    // public.key is available immediately after creation.
+    let req = app.auth_request(Method::GET, "/repository/apt-autosign/public.key", &token);
+    let (status, body) = app.call(req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "public.key should exist after create"
+    );
+    assert!(
+        body.as_str()
+            .unwrap_or_default()
+            .contains("BEGIN PGP PUBLIC KEY"),
+        "public.key should be an armored public key"
+    );
+
+    let deb = build_synthetic_deb("hello", "1.0", "amd64", "test").unwrap();
+    let req = apt_upload_request("apt-autosign", "hello_1.0_amd64.deb", &deb, None, &token);
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // InRelease must be clearsigned and still carry the Release body.
+    let req = app.auth_request(
+        Method::GET,
+        "/repository/apt-autosign/dists/stable/InRelease",
+        &token,
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let inrelease = body.as_str().unwrap_or_default();
+    assert!(
+        inrelease.contains("BEGIN PGP SIGNED MESSAGE"),
+        "InRelease should be clearsigned"
+    );
+    assert!(
+        inrelease.contains("BEGIN PGP SIGNATURE"),
+        "InRelease should carry a signature"
+    );
+    assert!(
+        inrelease.contains("Suite:"),
+        "InRelease should still contain the Release body"
+    );
+
+    // Release.gpg must be a real detached signature, not the empty fallback.
+    let req = app.auth_request(
+        Method::GET,
+        "/repository/apt-autosign/dists/stable/Release.gpg",
+        &token,
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.as_str()
+            .unwrap_or_default()
+            .contains("BEGIN PGP SIGNATURE"),
+        "Release.gpg should be a detached signature"
+    );
+}
+
+/// POST /signing-key rotates the key: the served public key changes and reflects
+/// the value returned by the endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_signing_key_rotate_api() {
+    let app = TestApp::new().await;
+    app.create_apt_repo("apt-rotate").await;
+    let token = app.admin_token();
+
+    let req = app.auth_request(Method::GET, "/repository/apt-rotate/public.key", &token);
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let before = body.as_str().unwrap_or_default().to_string();
+
+    let req = app.auth_request(
+        Method::POST,
+        "/api/v1/repositories/apt-rotate/signing-key",
+        &token,
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK, "rotate should succeed");
+    let rotated = body["public_key"].as_str().unwrap_or_default().to_string();
+    assert!(rotated.contains("BEGIN PGP PUBLIC KEY"));
+
+    let req = app.auth_request(Method::GET, "/repository/apt-rotate/public.key", &token);
+    let (_, body) = app.call(req).await;
+    let after = body.as_str().unwrap_or_default().to_string();
+    assert_eq!(after, rotated, "public.key should reflect the rotated key");
+    assert_ne!(before, after, "rotation should change the key");
+}
+
+/// PUT /signing-key imports an operator-supplied key; the served public key
+/// matches the imported key's public half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_signing_key_import_api() {
+    let app = TestApp::new().await;
+    app.create_apt_repo("apt-import").await;
+    let token = app.admin_token();
+
+    let (priv_armor, pub_armor) =
+        depot_format_apt::store::generate_gpg_keypair("imported").unwrap();
+
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/repositories/apt-import/signing-key",
+        &token,
+        serde_json::json!({ "signing_key": priv_armor }),
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK, "import should succeed");
+    let returned = body["public_key"].as_str().unwrap_or_default().to_string();
+
+    let req = app.auth_request(Method::GET, "/repository/apt-import/public.key", &token);
+    let (_, body) = app.call(req).await;
+    let served = body.as_str().unwrap_or_default().to_string();
+    assert_eq!(
+        served, returned,
+        "served key should match the import response"
+    );
+    assert_eq!(
+        served.trim(),
+        pub_armor.trim(),
+        "served key should be the imported key's public half"
+    );
+}
+
+/// A repo can be created with an imported signing key in one request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_create_with_imported_signing_key() {
+    let app = TestApp::new().await;
+    let token = app.admin_token();
+    let (priv_armor, pub_armor) =
+        depot_format_apt::store::generate_gpg_keypair("create-import").unwrap();
+
+    app.create_repo(serde_json::json!({
+        "name": "apt-create-import",
+        "repo_type": "hosted",
+        "format": "apt",
+        "store": "default",
+        "signing_key": priv_armor,
+    }))
+    .await;
+
+    let req = app.auth_request(
+        Method::GET,
+        "/repository/apt-create-import/public.key",
+        &token,
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_str().unwrap_or_default().trim(), pub_armor.trim());
+}
+
+/// Signing-key management is apt-only: non-apt repos reject it at both the
+/// endpoint and at create time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_signing_key_rejected_for_non_apt() {
+    let app = TestApp::new().await;
+    app.create_format_repo("raw-nosign", "raw").await;
+    let token = app.admin_token();
+
+    let req = app.auth_request(
+        Method::POST,
+        "/api/v1/repositories/raw-nosign/signing-key",
+        &token,
+    );
+    let (status, _) = app.call(req).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "signing-key endpoint should be apt-only"
+    );
+
+    // signing_key at create time is also rejected for non-apt formats.
+    let req = app.json_request(
+        Method::POST,
+        "/api/v1/repositories",
+        &token,
+        serde_json::json!({
+            "name": "raw-with-key",
+            "repo_type": "hosted",
+            "format": "raw",
+            "store": "default",
+            "signing_key": "not-a-key",
+        }),
+    );
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

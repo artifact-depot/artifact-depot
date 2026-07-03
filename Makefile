@@ -6,7 +6,7 @@
 	notices-cargo notices-npm \
 	lint-cargo-licenses lint-npm-licenses lint-reuse lint-fmt lint-clippy \
 	security-cargo-advisories security-npm-audit \
-	test-debug test-ui test-dynamodb test-docker-auth \
+	test-debug test-ui test-dynamodb test-docker-auth test-apt \
 	docs docs-serve screenshots observability-screenshots
 
 all: test
@@ -93,8 +93,12 @@ test-docker-auth: debug lint
 	@echo "Running Docker auth tests..."
 	@start=$$(date +%s); output=$$(bash scripts/ext-test.sh docker-auth 2>&1) || { echo "$$output"; exit 1; }; echo "  Docker auth tests passed in $$(($$(date +%s) - $$start))s"
 
+test-apt: debug lint
+	@echo "Running APT signing interop tests..."
+	@start=$$(date +%s); output=$$(bash scripts/ext-test.sh apt 2>&1) || { echo "$$output"; exit 1; }; echo "  APT signing interop tests passed in $$(($$(date +%s) - $$start))s"
+
 # All test suites
-test: test-debug test-ui test-dynamodb test-docker-auth
+test: test-debug test-ui test-dynamodb test-docker-auth test-apt
 
 # Legacy targets
 debug_test: debug

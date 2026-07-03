@@ -464,6 +464,7 @@ const MANAGEMENT_ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/repositories/{name}", &["get", "put", "delete"]),
     ("/api/v1/repositories/{name}/clean", &["post"]),
     ("/api/v1/repositories/{name}/clone", &["post"]),
+    ("/api/v1/repositories/{name}/signing-key", &["post", "put"]),
     // Artifacts
     ("/api/v1/repositories/{repo}/artifacts", &["get"]),
     ("/api/v1/repositories/{repo}/bulk-delete", &["post"]),

@@ -27,6 +27,50 @@ use crate::store::{self as apt, AptStore};
 
 store_from_config_fn!(apt_store_from_config, AptStore);
 
+/// Ensure a hosted apt repo has a signing key, generating one on first use.
+/// Returns `Ok(None)` for non-hosted repos: cache repos inherit the upstream
+/// signature, and group/proxy repos opt in explicitly via the API. Callers on
+/// the repo-creation path treat a failure as non-fatal (the repo is still
+/// usable unsigned, and a key can be provisioned later via the API).
+pub async fn ensure_repo_signing_key(
+    state: &FormatState,
+    config: &RepoConfig,
+) -> depot_core::error::Result<Option<String>> {
+    if !matches!(config.kind, RepoKind::Hosted) {
+        return Ok(None);
+    }
+    let blobs = state.blob_store(&config.store).await?;
+    let store = apt_store_from_config(config, state, blobs.as_ref());
+    store.ensure_signing_key(&config.name).await
+}
+
+/// Generate a brand-new signing key for an apt repo (rotation), re-signing any
+/// already-published metadata. Returns the armored public key.
+pub async fn rotate_repo_signing_key(
+    state: &FormatState,
+    config: &RepoConfig,
+) -> depot_core::error::Result<String> {
+    let blobs = state.blob_store(&config.store).await?;
+    let store = apt_store_from_config(config, state, blobs.as_ref());
+    let public = store.generate_and_store_signing_key(&config.name).await?;
+    store.resign_all_distributions().await?;
+    Ok(public)
+}
+
+/// Import an externally-supplied armored secret key for an apt repo, re-signing
+/// any already-published metadata. Returns the armored public key.
+pub async fn import_repo_signing_key(
+    state: &FormatState,
+    config: &RepoConfig,
+    secret_key_armor: &str,
+) -> depot_core::error::Result<String> {
+    let blobs = state.blob_store(&config.store).await?;
+    let store = apt_store_from_config(config, state, blobs.as_ref());
+    let public = store.import_signing_key(secret_key_armor).await?;
+    store.resign_all_distributions().await?;
+    Ok(public)
+}
+
 /// Handle an APT request arriving on `/repository/{repo}/{path}`.
 /// Parses the path to detect `dists/` metadata and dispatches to the
 /// appropriate APT-specific handler, or returns `None` to fall through

@@ -197,6 +197,38 @@ pub async fn apply_initialization(
             deleting: false,
         };
         service::put_repo(state.repo.kv.as_ref(), &cfg).await?;
+
+        // Provision the apt signing key declaratively: import the operator's key
+        // if one was supplied, otherwise auto-generate for hosted repos. Unlike
+        // the REST create path, failures here fail initialization so a misconfig
+        // surfaces at boot rather than silently leaving an unsigned repo.
+        if cfg.format_config.artifact_format() == ArtifactFormat::Apt {
+            let fs = state.format_state();
+            match &req.signing_key {
+                Some(key) => {
+                    depot_format_apt::api::import_repo_signing_key(&fs, &cfg, key)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "initialization.repositories.{}: failed to import signing key: {}",
+                                req.name,
+                                e
+                            )
+                        })?;
+                }
+                None => {
+                    depot_format_apt::api::ensure_repo_signing_key(&fs, &cfg)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "initialization.repositories.{}: failed to generate signing key: {}",
+                                req.name,
+                                e
+                            )
+                        })?;
+                }
+            }
+        }
         summary.repos_created += 1;
     }
 
@@ -397,6 +429,7 @@ mod tests {
                 upstream_auth: None,
                 content_disposition: None,
                 repodata_depth: None,
+                signing_key: None,
             }],
             users: vec![CreateUserRequest {
                 username: "ci".into(),
@@ -504,6 +537,7 @@ mod tests {
                 upstream_auth: None,
                 content_disposition: None,
                 repodata_depth: None,
+                signing_key: None,
             }],
             ..InitializationConfig::default()
         };
