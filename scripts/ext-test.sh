@@ -283,9 +283,25 @@ TOML
       pid=$(pgrep -x dockerd | head -1)
       if [ -n "$pid" ]; then
         as_root kill "$pid" 2>/dev/null || true
-        while as_root kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+        # Wait up to ~10s for a graceful exit, then force it. In CI's nested
+        # container dockerd's SIGTERM shutdown can hang indefinitely (it tears
+        # down its own containerd, shims, and networking), which would spin this
+        # wait forever and hit the 1h job timeout. SIGKILL guarantees progress.
+        for _ in $(seq 1 50); do
+          as_root kill -0 "$pid" 2>/dev/null || break
+          sleep 0.2
+        done
+        as_root kill -9 "$pid" 2>/dev/null || true
+        sleep 1
       fi
-      as_root sh -c "nohup dockerd $DOCKERD_ARGS >/var/log/dockerd.log 2>&1 &"
+      # Relaunch fully detached: a new session (setsid) with stdin/stdout/stderr
+      # off the caller's fds. This dockerd survives the suite (cleanup restarts
+      # it rather than killing it), so under CI's `docker exec dev make` -- which
+      # captures the suite output via $(...) -- a daemon that inherited those fds
+      # would keep the capture/exec pipe open and hang the job until the 1h
+      # timeout even after every test passed. A direct/local run doesn't have the
+      # extra pipe layers, which is why this only bit in CI. Harmless locally.
+      as_root sh -c "setsid dockerd $DOCKERD_ARGS </dev/null >/var/log/dockerd.log 2>&1 &"
       for _ in $(seq 1 30); do
         docker info >/dev/null 2>&1 && return 0
         sleep 1
