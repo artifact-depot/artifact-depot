@@ -98,6 +98,17 @@ RUN mkdir -p "$DYNAMODB_LOCAL_DIR" \
     && tar xzf /tmp/dynamodb_local.tar.gz -C "$DYNAMODB_LOCAL_DIR" \
     && rm -f /tmp/dynamodb_local.tar.gz
 
+# CI mounts the runner-owned checkout into /workspace and runs `make` as root,
+# so git flags "dubious ownership" and refuses to operate on the repo. Tools
+# that shell out to git then misbehave -- notably `reuse lint`, whose
+# .gitignore detection fails, so it scans the build output (target/,
+# node_modules/) the debug build produced before lint runs and errors on it.
+# Trust any bind-mounted repo so git-backed tooling works regardless of the
+# checkout's owner. Dev containers UID-match the checkout, so this is a no-op
+# there; the image is a single-purpose build/CI/dev container, so trust-all is
+# acceptable.
+RUN git config --system --add safe.directory '*'
+
 # --- Community dev container layer (NOT built by CI or the release image) --
 # Builder plus the developer conveniences most contributors want. Targeted by
 # the default .devcontainer/devcontainer.json. CI targets `builder` and the
