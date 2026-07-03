@@ -86,7 +86,7 @@ lzma-rs = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 chrono = { version = "0.4", features = ["serde"] }
 rmp-serde = "1"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 arc-swap = "1"
 moka = { version = "0.12", features = ["sync"] }
 # Held at 1.x: bloomfilter 3.0 is a full API rewrite (sip_keys/bitmap/from_existing
