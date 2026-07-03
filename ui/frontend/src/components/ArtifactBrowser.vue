@@ -531,7 +531,15 @@ async function load() {
     if (dockerDefault.value && dirs.value.some(d => d.name === '_tags')) {
       atImage.value = true
       const tagsPrefix = prefix.value + '_tags/'
-      const t = await api.listArtifacts(props.repoName, { prefix: tagsPrefix, limit: 1000 })
+      // Page through the tags with the standard pagination controls: an image
+      // (or a group aggregating several repos) can serve thousands of tags, so
+      // a flat capped fetch would silently truncate the list.
+      const t = await api.listArtifacts(props.repoName, {
+        prefix: tagsPrefix,
+        limit: pageLimit.value,
+        offset: pageOffset.value,
+      })
+      totalArtifacts.value = t.total ?? t.artifacts.length
       dockerTagItems.value = t.artifacts.map(a => ({
         name: a.path,
         path: tagsPrefix + a.path,
