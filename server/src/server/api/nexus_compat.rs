@@ -1021,6 +1021,7 @@ async fn enumerate_targets(
         blobs: blobs.as_ref(),
         updater: &state.updater,
         store: &repo.store,
+        track_access: true,
     };
     let tags = store.list_tags().await.map_err(|e| e.into_response())?;
     Ok(tags.into_iter().map(|t| (image.clone(), t)).collect())

@@ -552,6 +552,10 @@ export const api = {
       {
         headers: {
           ...authHeaders(),
+          // Browsing metadata (tag sizes, drill-in details) is not a pull:
+          // don't refresh last_accessed_at, or the browser bumps every tag it
+          // renders and retention data becomes self-polluted.
+          'X-Depot-No-Atime': '1',
           Accept: [
             'application/vnd.docker.distribution.manifest.v2+json',
             'application/vnd.docker.distribution.manifest.list.v2+json',

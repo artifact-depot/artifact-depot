@@ -13,7 +13,14 @@ use depot_core::error::DepotError;
 use depot_core::format_state::FormatState;
 use depot_core::store::kv::{ArtifactFormat, Capability, RepoConfig};
 
-use crate::store::DockerStore;
+use crate::store::{DockerStore, NO_ATIME_HEADER};
+
+/// Whether a read should refresh `last_accessed_at`. A request opts out by
+/// sending [`NO_ATIME_HEADER`] (used by read-only tooling like the reorg CLI),
+/// in which case the serve path builds a [`DockerStore::without_atime`].
+pub fn wants_atime(req_headers: &HeaderMap) -> bool {
+    !req_headers.contains_key(NO_ATIME_HEADER)
+}
 
 pub fn docker_error(code: &str, message: &str, status: StatusCode) -> Response {
     let body = serde_json::json!({
@@ -165,6 +172,7 @@ pub fn hosted_store<'a>(
         blobs,
         updater: &state.updater,
         store,
+        track_access: true,
     }
 }
 

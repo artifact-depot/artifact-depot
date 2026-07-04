@@ -41,6 +41,14 @@ pub const DOCKER_MANIFEST_LIST: &str = "application/vnd.docker.distribution.mani
 pub const OCI_MANIFEST_V1: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const OCI_INDEX_V1: &str = "application/vnd.oci.image.index.v1+json";
 
+/// Request header that suppresses `last_accessed_at` updates on read.
+///
+/// Read-only tooling (e.g. `depot-bench reorg`) sends it so dry-runs and
+/// audits don't disturb retention bookkeeping — a plan-only pass must not
+/// make an artifact look freshly used. HEAD probes never touch atime
+/// regardless of this header; a normal GET without the header still does.
+pub const NO_ATIME_HEADER: &str = "x-depot-no-atime";
+
 /// All manifest media types we accept.
 pub const MANIFEST_TYPES: &[&str] = &[
     DOCKER_MANIFEST_V2,
@@ -116,9 +124,21 @@ pub struct DockerStore<'a> {
     pub blobs: &'a dyn BlobStore,
     pub updater: &'a UpdateSender,
     pub store: &'a str,
+    /// When false, read operations do not refresh `last_accessed_at`.
+    /// Set for HEAD probes and read-only tooling (see [`NO_ATIME_HEADER`]).
+    /// Defaults to true via `hosted_store`.
+    pub track_access: bool,
 }
 
 impl<'a> DockerStore<'a> {
+    /// Return a copy of this store that never refreshes `last_accessed_at`
+    /// on read. Used by HEAD probes and read-only tooling so an audit or
+    /// existence check doesn't reset retention timers.
+    pub fn without_atime(mut self) -> Self {
+        self.track_access = false;
+        self
+    }
+
     // --- Path helpers (image-namespace-aware) ---
 
     fn manifest_path(&self, digest: &str) -> String {
@@ -162,8 +182,10 @@ impl<'a> DockerStore<'a> {
             Some(r) => r,
             None => return Ok(None),
         };
-        self.updater
-            .touch(self.repo, &self.blob_ref_path(digest), now_utc());
+        if self.track_access {
+            self.updater
+                .touch(self.repo, &self.blob_ref_path(digest), now_utc());
+        }
         let blob_id = record.blob_id.as_deref().unwrap_or("");
         let data = self.blobs.get(blob_id).await?.ok_or_else(|| {
             DepotError::DataIntegrity(format!("blob missing for blob_id {}", blob_id))
@@ -179,8 +201,10 @@ impl<'a> DockerStore<'a> {
             Some(r) => r,
             None => return Ok(None),
         };
-        self.updater
-            .touch(self.repo, &self.blob_ref_path(digest), now_utc());
+        if self.track_access {
+            self.updater
+                .touch(self.repo, &self.blob_ref_path(digest), now_utc());
+        }
         self.blobs
             .open_read(record.blob_id.as_deref().unwrap_or(""))
             .await
@@ -376,8 +400,10 @@ impl<'a> DockerStore<'a> {
             Some(r) => r,
             None => return Ok(None),
         };
-        self.updater
-            .touch(self.repo, &self.manifest_path(digest), now_utc());
+        if self.track_access {
+            self.updater
+                .touch(self.repo, &self.manifest_path(digest), now_utc());
+        }
 
         let blob_id = record.blob_id.as_deref().unwrap_or("");
         if blob_id.is_empty() {
@@ -423,7 +449,9 @@ impl<'a> DockerStore<'a> {
         };
         match self.get_manifest_by_digest(&digest).await? {
             Some((data, ct)) => {
-                self.updater.touch(self.repo, &path, now_utc());
+                if self.track_access {
+                    self.updater.touch(self.repo, &path, now_utc());
+                }
                 Ok(Some((data, ct, digest)))
             }
             None => {

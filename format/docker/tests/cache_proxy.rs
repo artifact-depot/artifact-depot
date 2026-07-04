@@ -340,6 +340,7 @@ async fn test_cache_head_blob_local_hit() {
         blobs: blobs.as_ref(),
         updater: &noop_atime,
         store: "default",
+        track_access: true,
     };
     docker_store.put_blob(data).await.unwrap();
 

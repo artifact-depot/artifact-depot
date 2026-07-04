@@ -168,6 +168,7 @@ pub async fn do_start_upload(
                 blobs: from_blobs.as_ref(),
                 updater: &state.updater,
                 store: from_store_name,
+                track_access: true,
             };
             if let Ok(Some((size, blob_id, content_hash))) =
                 from_store.blob_exists(mount_digest).await
@@ -870,6 +871,7 @@ pub async fn do_complete_upload(
         blobs: blobs.as_ref(),
         updater: &state.updater,
         store: &store_name,
+        track_access: true,
     };
 
     let mut record = depot_core::store::kv::ArtifactRecord {

@@ -106,6 +106,12 @@ const MANIFEST_ACCEPT_ALL: &str = "application/vnd.docker.distribution.manifest.
     application/vnd.oci.image.manifest.v1+json, \
     application/vnd.oci.image.index.v1+json";
 
+/// Request header that tells the server not to refresh `last_accessed_at`.
+/// The reorg driver sends it on every read so a dry-run (or the apply's
+/// digest comparisons) stays truly read-only and doesn't reset retention
+/// timers. Mirror of `depot_format_docker::store::NO_ATIME_HEADER`.
+const NO_ATIME_HEADER: &str = "x-depot-no-atime";
+
 impl DepotClient {
     pub fn new(base_url: &str, username: &str, password: &str, insecure: bool) -> Result<Self> {
         let http = Client::builder()
@@ -978,6 +984,7 @@ impl DepotClient {
             ))
             .header("Authorization", format!("Basic {}", self.basic_auth))
             .header("Accept", MANIFEST_ACCEPT_ALL)
+            .header(NO_ATIME_HEADER, "1")
             .send()
             .await?;
         let status = resp.status();
@@ -1008,6 +1015,7 @@ impl DepotClient {
                 self.base_url, repo, image, digest
             ))
             .header("Authorization", format!("Basic {}", self.basic_auth))
+            .header(NO_ATIME_HEADER, "1")
             .send()
             .await?;
         let status = resp.status();
@@ -1078,6 +1086,7 @@ impl DepotClient {
             ))
             .header("Authorization", format!("Basic {}", self.basic_auth))
             .header("Accept", MANIFEST_ACCEPT_ALL)
+            .header(NO_ATIME_HEADER, "1")
             .send()
             .await?;
         let status = resp.status().as_u16();

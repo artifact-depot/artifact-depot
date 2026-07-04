@@ -18,7 +18,7 @@ use crate::store as docker;
 
 use super::helpers::{
     check_docker_permission, docker_blob_headers, docker_error, hosted_store, resolve_blob_store,
-    validate_docker_repo,
+    validate_docker_repo, wants_atime,
 };
 
 pub async fn do_get_blob(
@@ -55,11 +55,18 @@ pub async fn do_get_blob(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let store = hosted_store(state, repo_name, image, blobs.as_ref(), &config.store);
+            let mut store = hosted_store(state, repo_name, image, blobs.as_ref(), &config.store);
+            if !wants_atime(req_headers) {
+                store = store.without_atime();
+            }
             blob_stream_response(store.open_blob(digest).await, digest)
         }
-        RepoType::Cache => cache_get_blob(state, &config, image, digest).await,
-        RepoType::Proxy => proxy_get_blob(state, &config, image, digest, 0).await,
+        RepoType::Cache => {
+            cache_get_blob(state, &config, image, digest, wants_atime(req_headers)).await
+        }
+        RepoType::Proxy => {
+            proxy_get_blob(state, &config, image, digest, wants_atime(req_headers), 0).await
+        }
     }
 }
 
@@ -143,12 +150,16 @@ async fn cache_get_blob(
     config: &RepoConfig,
     image: Option<&str>,
     digest: &str,
+    track_access: bool,
 ) -> Response {
     let blobs = match resolve_blob_store(state, config).await {
         Ok(b) => b,
         Err(r) => return r,
     };
-    let store = hosted_store(state, &config.name, image, blobs.as_ref(), &config.store);
+    let mut store = hosted_store(state, &config.name, image, blobs.as_ref(), &config.store);
+    if !track_access {
+        store = store.without_atime();
+    }
 
     // Check local cache — stream from file, no memory buffering.
     if let Ok(Some(_)) = store.blob_exists(digest).await {
@@ -310,6 +321,7 @@ async fn proxy_get_blob(
     config: &RepoConfig,
     image: Option<&str>,
     digest: &str,
+    track_access: bool,
     depth: u8,
 ) -> Response {
     if depth > MAX_PROXY_DEPTH {
@@ -340,20 +352,23 @@ async fn proxy_get_blob(
                     Ok(b) => b,
                     Err(r) => return r,
                 };
-                let store = hosted_store(
+                let mut store = hosted_store(
                     state,
                     member_name,
                     image,
                     blobs.as_ref(),
                     &member_config.store,
                 );
+                if !track_access {
+                    store = store.without_atime();
+                }
                 // Stream from file handle — KV lock released before I/O.
                 if let Ok(Some(_)) = store.blob_exists(digest).await {
                     return blob_stream_response(store.open_blob(digest).await, digest);
                 }
             }
             RepoType::Cache => {
-                let resp = cache_get_blob(state, &member_config, image, digest).await;
+                let resp = cache_get_blob(state, &member_config, image, digest, track_access).await;
                 if resp.status() != StatusCode::NOT_FOUND {
                     return resp;
                 }
@@ -364,6 +379,7 @@ async fn proxy_get_blob(
                     &member_config,
                     image,
                     digest,
+                    track_access,
                     depth + 1,
                 ))
                 .await;
