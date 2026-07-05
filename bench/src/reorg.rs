@@ -1005,6 +1005,36 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
     preflight_repos(client, &groups, rules.usage_repo.as_deref()).await?;
 
     let mut resolved = ResolvedPlan::default();
+
+    // The upstream authority ([check_authority]) — consulted DIRECTLY for
+    // insight-class released-tag verification, triage evidence, and the
+    // non-released diff. Classify rules require it: checking the local cache
+    // instead would only reflect what happens to have been pulled through it,
+    // and probing the cache would fetch-and-cache misses as a side effect.
+    let classify_configured = groups
+        .iter()
+        .any(|g| g.rules.iter().any(|r| r.action == Action::Classify));
+    let authority = match &rules.check_authority {
+        Some(a) => match build_authority(a, cfg.insecure).await {
+            Ok(auth) => Some(auth),
+            Err(e) if classify_configured => {
+                return Err(e.context(
+                    "classify rules verify released tags against the upstream authority; \
+                     it must be reachable",
+                ));
+            }
+            Err(e) => {
+                resolved.non_released_note = Some(e.to_string());
+                None
+            }
+        },
+        None if classify_configured => bail!(
+            "classify rules require a [check_authority] section: released tags are \
+             verified against the upstream registry, never the local cache"
+        ),
+        None => None,
+    };
+
     // Each scanned repo's current `(image, tag)` set — reused to detect, with no
     // extra I/O, whether a move's destination already holds the tag (no-clobber).
     let mut inventories: HashMap<String, std::collections::HashSet<(String, String)>> =
@@ -1077,20 +1107,44 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
             }
 
             // Resolve reconciles: compare the source digest against the canonical
-            // check repo. Absent → MoveTo dest (supplementary) or Flag (insight
-            // image missing upstream — never dropped); present + same digest →
-            // delete the redundant source copy; present + different → flag/review.
+            // check copy. Two shapes share the machinery:
+            //  * MoveTo (`reconcile` action): the check copy lives in a LOCAL
+            //    check repo; absent → move to dest (supplementary).
+            //  * Flag (`classify` insight image): the check copy is resolved
+            //    against the UPSTREAM AUTHORITY directly — never the local
+            //    cache (cache contents are a usage record, and probing a cache
+            //    repo would fetch-and-cache misses as a side effect). Present +
+            //    same digest → delete the redundant source copy; different →
+            //    mismatch review; absent → flag, never dropped (it may be the
+            //    only copy anywhere).
             for rec in plan.reconciles {
-                let (check_status, _, check_digest) = client
-                    .docker_head_manifest(&rec.check_repo, &rec.tag.image, &rec.tag.tag)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "reconcile check {}/{}:{}",
-                            rec.check_repo, rec.tag.image, rec.tag.tag
-                        )
-                    })?;
-                if check_status != 200 {
+                let check = match &rec.absent {
+                    AbsentAction::Flag => {
+                        let auth = authority
+                            .as_ref()
+                            .expect("classify requires [check_authority]; validated at startup");
+                        auth.head(&rec.tag.image, &rec.tag.tag)
+                            .await?
+                            .map(|(repo, digest)| (repo, digest, true))
+                    }
+                    AbsentAction::MoveTo(_) => {
+                        let (status, _, digest) = client
+                            .docker_head_manifest(&rec.check_repo, &rec.tag.image, &rec.tag.tag)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "reconcile check {}/{}:{}",
+                                    rec.check_repo, rec.tag.image, rec.tag.tag
+                                )
+                            })?;
+                        if status == 200 {
+                            Some((rec.check_repo.clone(), digest, false))
+                        } else {
+                            None
+                        }
+                    }
+                };
+                let Some((check_repo, check_digest, via_authority)) = check else {
                     match &rec.absent {
                         // Supplementary → move to dest (unless already there — a
                         // repo may be its own source).
@@ -1139,7 +1193,7 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                         }
                     }
                     continue;
-                }
+                };
                 let (_, _, src_digest) = client
                     .docker_head_manifest(&rec.tag.source_repo, &rec.tag.image, &rec.tag.tag)
                     .await
@@ -1151,15 +1205,20 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                     })?;
                 if !check_digest.is_empty() && check_digest == src_digest {
                     // Redundant duplicate. Drop the source copy — but NEVER out of
-                    // the check repo itself (the cache holds the canonical copy);
+                    // the check repo itself (it holds the canonical local copy);
                     // only drop copies that live elsewhere.
                     if rec.tag.source_repo == rec.check_repo {
                         resolved.kept.push(rec.tag);
                     } else {
-                        let reason = format!(
-                            "identical digest already in {} (redundant duplicate)",
-                            rec.check_repo
-                        );
+                        let reason = if via_authority {
+                            format!(
+                                "identical digest already upstream in {check_repo} (redundant duplicate)"
+                            )
+                        } else {
+                            format!(
+                                "identical digest already in {check_repo} (redundant duplicate)"
+                            )
+                        };
                         if let Some(c) = resolve_built(
                             client,
                             &rec.tag.source_repo,
@@ -1184,15 +1243,23 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
                     }
                 } else {
                     // A real mismatch: gather the build-time evidence so the plan
-                    // can explain it and the `mismatch` group can act on it.
+                    // can explain it and the `mismatch` group can act on it. The
+                    // check copy's build date comes from wherever the check copy
+                    // lives — the upstream authority or the local check repo.
                     let source_built =
                         resolve_built(client, &rec.tag.source_repo, &rec.tag.image, &rec.tag.tag)
                             .await;
-                    let check_built =
-                        resolve_built(client, &rec.check_repo, &rec.tag.image, &rec.tag.tag).await;
+                    let check_built = if via_authority {
+                        let auth = authority
+                            .as_ref()
+                            .expect("classify requires [check_authority]; validated at startup");
+                        resolve_built(&auth.client, &check_repo, &rec.tag.image, &rec.tag.tag).await
+                    } else {
+                        resolve_built(client, &check_repo, &rec.tag.image, &rec.tag.tag).await
+                    };
                     resolved.mismatched.push(MismatchInfo {
                         tag: rec.tag,
-                        check_repo: rec.check_repo,
+                        check_repo,
                         source_digest: src_digest,
                         check_digest,
                         source_built,
@@ -1204,29 +1271,21 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
 
             // Resolve triage (classify: image on neither list). Gather evidence —
             // upstream presence + digest match + source build date — so the
-            // operator can decide which list each image belongs on. Never touched.
-            // The insight repo to probe is the classify rule's `insight_repo`.
-            let insight_repo = group
-                .rules
-                .iter()
-                .find(|r| r.action == Action::Classify)
-                .and_then(|r| r.insight_repo.clone());
+            // operator can decide which list each image belongs on. Never
+            // touched. Evidence comes from the UPSTREAM AUTHORITY directly:
+            // probing the local cache would fetch-and-cache misses (a cache is
+            // a record of real pulls, not a probe target).
             for tag in plan.triage {
-                let (present, same_digest) = if let Some(ir) = &insight_repo {
-                    let (st, _, up_digest) = client
-                        .docker_head_manifest(ir, &tag.image, &tag.tag)
-                        .await
-                        .with_context(|| {
-                            format!("triage check {}/{}:{}", ir, tag.image, tag.tag)
-                        })?;
-                    if st == 200 {
-                        let (_, _, src_digest) = client
-                            .docker_head_manifest(&tag.source_repo, &tag.image, &tag.tag)
-                            .await
-                            .unwrap_or_default();
-                        (true, !up_digest.is_empty() && up_digest == src_digest)
-                    } else {
-                        (false, false)
+                let (present, same_digest) = if let Some(auth) = authority.as_ref() {
+                    match auth.head(&tag.image, &tag.tag).await? {
+                        Some((_, up_digest)) => {
+                            let (_, _, src_digest) = client
+                                .docker_head_manifest(&tag.source_repo, &tag.image, &tag.tag)
+                                .await
+                                .unwrap_or_default();
+                            (true, !up_digest.is_empty() && up_digest == src_digest)
+                        }
+                        None => (false, false),
                     }
                 } else {
                     (false, false)
@@ -1412,38 +1471,37 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
     // ones are pollution to delete from the local cache; x.y.z ones are releases
     // the upstream is MISSING and should be copied up (review). Needs the
     // upstream (UPSTREAM_USERNAME / UPSTREAM_PASSWORD) to compute.
-    match (&rules.check_authority, &released_re) {
-        (Some(auth), Some(re)) => match upstream_tag_set(auth, cfg.insecure).await {
-            Ok(upstream_set) => {
-                let is_fp =
-                    |image: &str| prefixes.iter().any(|pre| image.starts_with(pre.as_str()));
-                for (repo, tags) in &cache_contents {
-                    let local: Vec<(String, String)> = tags
-                        .iter()
-                        .filter(|t| is_fp(&t.image))
-                        .map(|t| (t.image.clone(), t.tag.clone()))
-                        .collect();
-                    for (image, ts) in cache_pollution(&local, &upstream_set) {
-                        for tag in ts {
-                            let t = TagRef {
-                                source_repo: repo.clone(),
-                                image: image.clone(),
-                                tag,
-                            };
-                            if re.is_match(&t.tag) {
-                                resolved.copy_upstream.push(t);
-                            } else {
-                                resolved.non_released.push(t);
-                            }
+    match (&authority, &released_re) {
+        (Some(auth), Some(re)) => {
+            let is_fp = |image: &str| prefixes.iter().any(|pre| image.starts_with(pre.as_str()));
+            for (repo, tags) in &cache_contents {
+                let local: Vec<(String, String)> = tags
+                    .iter()
+                    .filter(|t| is_fp(&t.image))
+                    .map(|t| (t.image.clone(), t.tag.clone()))
+                    .collect();
+                for (image, ts) in cache_pollution(&local, &auth.tag_set) {
+                    for tag in ts {
+                        let t = TagRef {
+                            source_repo: repo.clone(),
+                            image: image.clone(),
+                            tag,
+                        };
+                        if re.is_match(&t.tag) {
+                            resolved.copy_upstream.push(t);
+                        } else {
+                            resolved.non_released.push(t);
                         }
                     }
                 }
             }
-            Err(e) => resolved.non_released_note = Some(e.to_string()),
-        },
+        }
         (None, _) => {
-            resolved.non_released_note =
-                Some("no [check_authority] upstream configured".to_string())
+            // Keep a build-failure note from startup if one was recorded.
+            if resolved.non_released_note.is_none() {
+                resolved.non_released_note =
+                    Some("no [check_authority] upstream configured".to_string());
+            }
         }
         (_, None) => {
             resolved.non_released_note = Some("no `released` pattern in rules".to_string())
@@ -2417,36 +2475,72 @@ fn print_repo_summary(before: &RepoSummary, after: Option<&RepoSummary>) {
     }
 }
 
-/// Enumerate the UPSTREAM registry's `image:tag` set (union of the configured
-/// upstream repos). Requires `UPSTREAM_USERNAME` / `UPSTREAM_PASSWORD` — the
-/// local-cache-vs-upstream diff is meaningless without the upstream, so a
-/// missing credential is an error the caller reports, not a silent skip.
-async fn upstream_tag_set(
-    authority: &CheckAuthority,
-    insecure: bool,
-) -> Result<std::collections::HashSet<String>> {
+/// Live handle to the authoritative upstream registry from `[check_authority]`:
+/// a client, the configured repos, and their full `image:tag` inventory. Built
+/// once per run. Every consult goes to the upstream directly — never through a
+/// local cache repo: cache contents are a record of what the team actually
+/// pulls, and a cache-miss HEAD would fetch-and-cache as a side effect.
+struct UpstreamAuthority {
+    url: String,
+    client: DepotClient,
+    repos: Vec<String>,
+    /// `image:tag` keys of every tag the upstream serves across `repos`.
+    tag_set: std::collections::HashSet<String>,
+}
+
+impl UpstreamAuthority {
+    /// HEAD `image:tag` across the configured upstream repos; the first 200
+    /// wins. Returns the serving repo and its manifest digest, or `None` when
+    /// no upstream repo serves the tag.
+    async fn head(&self, image: &str, tag: &str) -> Result<Option<(String, String)>> {
+        for repo in &self.repos {
+            let (status, _, digest) = self
+                .client
+                .docker_head_manifest(repo, image, tag)
+                .await
+                .with_context(|| {
+                    format!("authority check {repo}/{image}:{tag} via {}", self.url)
+                })?;
+            if status == 200 {
+                return Ok(Some((repo.clone(), digest)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Build the [`UpstreamAuthority`]. Requires `UPSTREAM_USERNAME` /
+/// `UPSTREAM_PASSWORD` — verification against the authority is meaningless
+/// without the upstream, so a missing credential is an error the caller
+/// reports, not a silent skip.
+async fn build_authority(authority: &CheckAuthority, insecure: bool) -> Result<UpstreamAuthority> {
     let (Some(user), Some(pass)) = (
         std::env::var("UPSTREAM_USERNAME").ok(),
         std::env::var("UPSTREAM_PASSWORD").ok(),
     ) else {
         anyhow::bail!(
-            "set UPSTREAM_USERNAME / UPSTREAM_PASSWORD to diff the insight cache against {}",
+            "set UPSTREAM_USERNAME / UPSTREAM_PASSWORD to consult the upstream authority {}",
             authority.upstream_url
         );
     };
-    let upstream = DepotClient::new(&authority.upstream_url, &user, &pass, insecure)
+    let client = DepotClient::new(&authority.upstream_url, &user, &pass, insecure)
         .with_context(|| format!("build upstream client for {}", authority.upstream_url))?;
-    let mut set: std::collections::HashSet<String> = Default::default();
+    let mut tag_set: std::collections::HashSet<String> = Default::default();
     for repo in &authority.upstream_repos {
-        let tags = list_repo_tags(&upstream, repo).await.with_context(|| {
+        let tags = list_repo_tags(&client, repo).await.with_context(|| {
             format!(
                 "upstream repo '{repo}' unreachable via {}",
                 authority.upstream_url
             )
         })?;
-        set.extend(tags.into_iter().map(|(i, t)| format!("{i}:{t}")));
+        tag_set.extend(tags.into_iter().map(|(i, t)| format!("{i}:{t}")));
     }
-    Ok(set)
+    Ok(UpstreamAuthority {
+        url: authority.upstream_url.clone(),
+        client,
+        repos: authority.upstream_repos.clone(),
+        tag_set,
+    })
 }
 
 /// Local `(image, tag)` entries whose `image:tag` key is absent from the
