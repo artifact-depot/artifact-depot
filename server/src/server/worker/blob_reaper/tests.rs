@@ -1697,3 +1697,116 @@ async fn run_blob_reaper_fires_at_fixed_start_time() {
         "fixed-start-time scheduling should have fired a GC pass despite a huge gc_interval"
     );
 }
+
+// -----------------------------------------------------------------------
+// record_expired reason selection (feeds the depot.cleanup audit events)
+// -----------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_expired_reports_which_policy_fired() {
+    use super::repo_cleanup::{record_expired, ExpiryReason};
+    use chrono::{Duration, Utc};
+
+    let (kv, _blobs, _registry, _dir) = setup_test_env().await;
+    let now = Utc::now();
+    let rec = |created_days: i64, accessed_days: i64, internal: bool| ArtifactRecord {
+        schema_version: CURRENT_RECORD_VERSION,
+        id: String::new(),
+        size: 1,
+        content_type: "text/plain".to_string(),
+        kind: ArtifactKind::Raw,
+        created_at: now - Duration::days(created_days),
+        updated_at: now,
+        last_accessed_at: now - Duration::days(accessed_days),
+        path: String::new(),
+        internal,
+        blob_id: None,
+        content_hash: None,
+        etag: None,
+    };
+    let age_cutoff = Some(now - Duration::days(30));
+    let unaccessed_cutoff = Some(now - Duration::days(30));
+
+    // Old but recently accessed: only the age policy can fire.
+    let old = rec(100, 0, false);
+    assert_eq!(
+        record_expired(kv.as_ref(), "r", "a.txt", &old, false, age_cutoff, None).await,
+        Some(ExpiryReason::MaxAge)
+    );
+    assert_eq!(
+        record_expired(
+            kv.as_ref(),
+            "r",
+            "a.txt",
+            &old,
+            false,
+            None,
+            unaccessed_cutoff
+        )
+        .await,
+        None,
+        "recently accessed artifact must survive an unaccessed policy"
+    );
+
+    // Recently created but long unaccessed (no tree entry: record fallback).
+    let stale = rec(0, 100, false);
+    assert_eq!(
+        record_expired(
+            kv.as_ref(),
+            "r",
+            "b.txt",
+            &stale,
+            false,
+            None,
+            unaccessed_cutoff
+        )
+        .await,
+        Some(ExpiryReason::Unaccessed)
+    );
+
+    // Both policies would fire: age wins the label.
+    let ancient = rec(100, 100, false);
+    assert_eq!(
+        record_expired(
+            kv.as_ref(),
+            "r",
+            "c.txt",
+            &ancient,
+            false,
+            age_cutoff,
+            unaccessed_cutoff
+        )
+        .await,
+        Some(ExpiryReason::MaxAge)
+    );
+
+    // Internal artifacts and docker bookkeeping paths never expire.
+    let internal = rec(100, 100, true);
+    assert_eq!(
+        record_expired(
+            kv.as_ref(),
+            "r",
+            "d.txt",
+            &internal,
+            false,
+            age_cutoff,
+            unaccessed_cutoff
+        )
+        .await,
+        None
+    );
+    let bookkeeping = rec(100, 100, false);
+    assert_eq!(
+        record_expired(
+            kv.as_ref(),
+            "r",
+            "img/_manifests/sha256:abc",
+            &bookkeeping,
+            true,
+            age_cutoff,
+            unaccessed_cutoff
+        )
+        .await,
+        None
+    );
+}

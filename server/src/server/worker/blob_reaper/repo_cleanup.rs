@@ -41,8 +41,26 @@ async fn tree_last_accessed_at(
     Some(entry.last_accessed_at)
 }
 
-/// Decide whether an artifact record is expired under a repo's cleanup policy.
-/// Shared by the GC pass and the per-repo cleanup sweep so the two can't drift.
+/// Which cleanup policy expired an artifact — carried into the audit events
+/// so an expiry can be explained after the fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExpiryReason {
+    MaxAge,
+    Unaccessed,
+}
+
+impl ExpiryReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            ExpiryReason::MaxAge => "max_age",
+            ExpiryReason::Unaccessed => "max_unaccessed",
+        }
+    }
+}
+
+/// Decide whether an artifact record is expired under a repo's cleanup policy;
+/// `Some(reason)` if so. Shared by the GC pass and the per-repo cleanup sweep
+/// so the two can't drift.
 ///
 /// `max_age` compares the record's creation time. `max_unaccessed` compares the
 /// **authoritative** access time, which lives on the browse-tree file entry
@@ -57,13 +75,16 @@ pub(super) async fn record_expired(
     is_docker: bool,
     max_age_cutoff: Option<chrono::DateTime<chrono::Utc>>,
     max_unaccessed_cutoff: Option<chrono::DateTime<chrono::Utc>>,
-) -> bool {
+) -> Option<ExpiryReason> {
     if record.internal || (is_docker && depot_format_docker::store::is_bookkeeping_path(sk)) {
-        return false;
+        return None;
     }
     let age_expired = max_age_cutoff
         .map(|c| record.created_at < c)
         .unwrap_or(false);
+    if age_expired {
+        return Some(ExpiryReason::MaxAge);
+    }
     let unaccessed_expired = match max_unaccessed_cutoff {
         Some(c) => {
             tree_last_accessed_at(kv, repo, sk)
@@ -73,7 +94,41 @@ pub(super) async fn record_expired(
         }
         None => false,
     };
-    age_expired || unaccessed_expired
+    if unaccessed_expired {
+        Some(ExpiryReason::Unaccessed)
+    } else {
+        None
+    }
+}
+
+/// Itemize expired artifacts to the OTel log pipeline (target
+/// `depot.cleanup`), one event per artifact, so "what did cleanup delete?"
+/// is a Loki query instead of a snapshot diff. Bursts of a few thousand
+/// lines per pass are well within the pipeline's budget; per-path volume
+/// belongs here, not in the task log.
+pub(super) fn emit_expiry_events(repo: &str, entries: &[(&str, u64, ExpiryReason)]) {
+    for &(path, size, reason) in entries {
+        tracing::info!(
+            target: "depot.cleanup",
+            repo,
+            path,
+            size,
+            reason = reason.as_str(),
+            "artifact expired"
+        );
+    }
+}
+
+/// Per-repo cleanup summary to the same target, for the coarse view.
+pub(super) fn emit_expiry_summary(repo: &str, expired: u64) {
+    if expired > 0 {
+        tracing::info!(
+            target: "depot.cleanup",
+            repo,
+            expired,
+            "repo cleanup expired artifacts"
+        );
+    }
 }
 
 /// Expire artifacts in a single repository based on its cleanup policy
@@ -135,7 +190,7 @@ pub(super) async fn expire_repo_artifacts(
                     )
                     .await?;
 
-                let mut expired_entries: Vec<(&str, u64)> = Vec::new();
+                let mut expired_entries: Vec<(&str, u64, ExpiryReason)> = Vec::new();
                 for (sk, value) in &result.items {
                     let record =
                         match rmp_serde::from_slice::<depot_core::store::kv::ArtifactRecord>(value)
@@ -157,14 +212,14 @@ pub(super) async fn expire_repo_artifacts(
                     )
                     .await;
 
-                    if expired {
-                        expired_entries.push((sk, record.size));
+                    if let Some(reason) = expired {
+                        expired_entries.push((sk, record.size, reason));
                     } else {
                         local_scanned += 1;
                     }
                 }
                 if !expired_entries.is_empty() {
-                    let paths: Vec<&str> = expired_entries.iter().map(|(sk, _)| *sk).collect();
+                    let paths: Vec<&str> = expired_entries.iter().map(|(sk, _, _)| *sk).collect();
                     depot_core::service::delete_artifacts_paired_batch(
                         kv.as_ref(),
                         &repo_name,
@@ -172,7 +227,8 @@ pub(super) async fn expire_repo_artifacts(
                     )
                     .await?;
                     local_expired += expired_entries.len() as u64;
-                    for &(sk, size) in &expired_entries {
+                    emit_expiry_events(&repo_name, &expired_entries);
+                    for &(sk, size, _) in &expired_entries {
                         updater
                             .dir_changed(&repo_name, sk, -1, -(size as i64))
                             .await;
@@ -212,6 +268,7 @@ pub(super) async fn expire_repo_artifacts(
         scanned_bytes += local_bytes;
         expired_artifacts += local_expired;
     }
+    emit_expiry_summary(repo_name, expired_artifacts);
 
     Ok((scanned_artifacts, scanned_bytes, expired_artifacts))
 }
