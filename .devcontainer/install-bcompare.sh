@@ -35,7 +35,25 @@ if [ -z "${BC5_LICENSE_KEY_B64:-}" ]; then
     exit 0
 fi
 
-BC5_DEB_URL="https://www.scootersoftware.com/files/bcompare-5.2.2.32209_amd64.deb"
+# Fallback when the download page can't be scraped (site down or layout
+# changed): the last version this script was tested against.
+BC5_FALLBACK_DEB="files/bcompare-5.2.2.32209_amd64.deb"
+
+# Float to the latest 5.x: scrape the current amd64 .deb path from Scooter's
+# download page. Pinned to major 5 -- the license key is a BC5 key, so a
+# future BC6 must be an explicit move, not a silent upgrade. (We deliberately
+# don't use Scooter's apt repo; see the /etc/default/bcompare note below.)
+bc5_deb="$(curl -fsSL https://www.scootersoftware.com/download 2>/dev/null \
+    | grep -oE 'files/bcompare-5[0-9.]*_amd64\.deb' | head -1 || true)"
+if [ -z "$bc5_deb" ]; then
+    echo "[bcompare] could not resolve latest version, using fallback ${BC5_FALLBACK_DEB}"
+    bc5_deb="$BC5_FALLBACK_DEB"
+fi
+BC5_DEB_URL="https://www.scootersoftware.com/${bc5_deb}"
+# files/bcompare-5.2.3.32296_amd64.deb -> 5.2.3-32296. The last filename dot
+# separates the build number, which the package's dpkg Version carries after a
+# dash (5.2.3-32296); compare in dpkg form or the same version reads as older.
+target_version="$(basename "$bc5_deb" | sed -E 's/^bcompare-([0-9.]+)_amd64\.deb$/\1/; s/\.([0-9]+)$/-\1/')"
 
 sudo apt-get update
 
@@ -48,19 +66,24 @@ sudo apt-get update
 #                        wrong fallback.
 sudo apt-get install -y qt6-wayland fonts-dejavu-core
 
-if ! command -v bcompare >/dev/null 2>&1; then
-    echo "[bcompare] installing Beyond Compare 5 ..."
+# Install when absent, upgrade when older than the resolved version -- so a
+# reused container converges on the latest 5.x instead of keeping whatever it
+# installed first.
+installed_version="$(dpkg-query -W -f='${Version}' bcompare 2>/dev/null || true)"
+if [ -z "$installed_version" ] \
+    || dpkg --compare-versions "$installed_version" lt "$target_version"; then
+    echo "[bcompare] installing Beyond Compare ${target_version} (had: ${installed_version:-none}) ..."
     tmpdeb="$(mktemp --suffix=.deb)"
+    trap 'rm -f "$tmpdeb"' EXIT
     curl -fsSL "$BC5_DEB_URL" -o "$tmpdeb"
     # Pre-create an empty /etc/default/bcompare so the .deb postinst does NOT
     # add Scooter's apt source for auto-updates -- unwanted in an ephemeral
     # dev container. (Scooter KB: kb/linux_install.)
     sudo touch /etc/default/bcompare
-    sudo apt-get install -y "$tmpdeb"
-    rm -f "$tmpdeb"
+    sudo apt-get install -y --allow-downgrades "$tmpdeb"
     sudo apt-get clean
 else
-    echo "[bcompare] Beyond Compare already installed"
+    echo "[bcompare] Beyond Compare ${installed_version} already current"
 fi
 
 # Scooter's /usr/bin/bcompare wrapper hardcodes `export QT_QPA_PLATFORM=xcb`.
