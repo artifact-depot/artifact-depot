@@ -335,6 +335,7 @@ mod tests {
                 event_bus,
                 model: Arc::new(ModelHandle::new(MaterializedModel::empty())),
                 scan_trigger: Arc::new(tokio::sync::Notify::new()),
+                request_stream: Arc::new(crate::server::infra::request_stream::RequestStream::new()),
             },
             settings: Arc::new(SettingsHandle::new(Settings::default())),
             rate_limiter: Arc::new(DynamicRateLimiter::new(None)),

@@ -208,6 +208,9 @@ async fn test_app_setup() -> TestAppSetup {
                 depot_server::server::infra::event_bus::MaterializedModel::empty(),
             )),
             scan_trigger: Arc::new(tokio::sync::Notify::new()),
+            request_stream: Arc::new(
+                depot_server::server::infra::request_stream::RequestStream::new(),
+            ),
         },
         settings: Arc::new(SettingsHandle::new(Settings {
             access_log: false,

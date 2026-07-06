@@ -9,6 +9,7 @@ pub mod log_export;
 pub mod metrics;
 pub mod middleware;
 pub mod rate_limit;
+pub mod request_stream;
 pub mod router;
 pub mod sampler;
 pub mod state;

@@ -16,6 +16,7 @@ import RoleDetail from './views/RoleDetail.vue'
 import SettingsView from './views/Settings.vue'
 import Tasks from './views/Tasks.vue'
 import Backup from './views/Backup.vue'
+import Activity from './views/Activity.vue'
 import ApiDocs from './views/ApiDocs.vue'
 import Login from './views/Login.vue'
 import NotFound from './views/NotFound.vue'
@@ -41,6 +42,7 @@ export const router = createRouter({
     { path: '/settings', name: 'settings', component: SettingsView },
     { path: '/tasks', name: 'tasks', component: Tasks },
     { path: '/backup', name: 'backup', component: Backup },
+    { path: '/activity', name: 'activity', component: Activity },
     { path: '/api-docs', name: 'api-docs', component: ApiDocs },
     { path: '/:pathMatch(.*)*', name: 'not-found', component: NotFound },
   ],

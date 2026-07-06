@@ -92,6 +92,21 @@ pub async fn request_event_middleware(
         );
     }
 
+    // Feed the admin Activity view regardless of the access_log setting —
+    // it is a live view, not a log.
+    state.bg.request_stream.publish(
+        &request_id,
+        &username,
+        &ip,
+        &method,
+        &path,
+        status,
+        &action,
+        elapsed_ns,
+        bytes_recv,
+        bytes_sent,
+    );
+
     response
 }
 

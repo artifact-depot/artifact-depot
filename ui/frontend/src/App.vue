@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { tokenRef, clearToken } from './api'
+import { tokenRef, clearToken, isAdmin } from './api'
 import { useEventStream } from './composables/useEventStream'
 import { useHealthStore } from './stores/healthStore'
 import BaseModal from './components/BaseModal.vue'
@@ -15,6 +15,9 @@ const routerInstance = useRouter()
 const healthStore = useHealthStore()
 const health = computed(() => healthStore.health)
 const isAuthenticated = computed(() => !!tokenRef.value)
+// Hide nav entries whose every endpoint requires admin; the server still
+// enforces authorization on each request.
+const admin = computed(() => isAdmin())
 const isLoginPage = computed(() => route.name === 'login')
 const menuOpen = ref(false)
 const showLicenseModal = ref(false)
@@ -59,12 +62,13 @@ function logout() {
     <button class="menu-toggle" @click="menuOpen = !menuOpen" aria-label="Toggle menu">&#9776;</button>
     <nav v-if="isAuthenticated" :class="{ 'menu-open': menuOpen }">
       <router-link to="/repositories">Repositories</router-link>
-      <router-link to="/stores">Stores</router-link>
-      <router-link to="/users">Users</router-link>
-      <router-link to="/roles">Roles</router-link>
-      <router-link to="/settings">Settings</router-link>
-      <router-link to="/tasks">Tasks</router-link>
-      <router-link to="/backup">Backup</router-link>
+      <router-link v-if="admin" to="/stores">Stores</router-link>
+      <router-link v-if="admin" to="/users">Users</router-link>
+      <router-link v-if="admin" to="/roles">Roles</router-link>
+      <router-link v-if="admin" to="/settings">Settings</router-link>
+      <router-link v-if="admin" to="/tasks">Tasks</router-link>
+      <router-link v-if="admin" to="/backup">Backup</router-link>
+      <router-link v-if="admin" to="/activity">Activity</router-link>
       <router-link to="/api-docs">API</router-link>
     </nav>
     <div class="spacer"></div>

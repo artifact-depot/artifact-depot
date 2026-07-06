@@ -12,6 +12,7 @@ pub mod error_responses;
 pub mod event_stream;
 pub mod integrity_check;
 pub mod nexus_compat;
+pub mod request_stream;
 pub mod router_coverage;
 pub mod staging;
 pub mod state_scanner;

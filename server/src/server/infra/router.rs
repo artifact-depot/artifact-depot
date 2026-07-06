@@ -17,6 +17,7 @@ use crate::server::api::{
     settings as api_settings, stores, system, tasks, users,
 };
 use crate::server::infra::event_stream;
+use crate::server::infra::request_stream;
 use crate::server::infra::state::AppState;
 use depot_format_docker::api as docker;
 
@@ -90,6 +91,7 @@ use depot_format_docker::api as docker;
         tasks::delete_task,
         // Streaming
         event_stream::event_stream,
+        request_stream::request_stream,
     ),
     components(schemas(
         system::HealthResponse,
@@ -309,6 +311,11 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
         )
         // Model event stream (real-time data model for the UI)
         .route("/api/v1/events/stream", get(event_stream::event_stream))
+        // Live request feed (admin only, enforced in the handler)
+        .route(
+            "/api/v1/requests/stream",
+            get(request_stream::request_stream),
+        )
         // Nexus-compatible REST API
         .route(
             "/service/rest/v1/search/assets/download",
