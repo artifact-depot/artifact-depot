@@ -45,3 +45,6 @@ docs/_site/
 docs/.jekyll-cache/
 docs/.bundle/
 docs/vendor/
+
+# Dropped by DynamoDB Local when run from the repo root
+dynamodb-local-metadata.json
