@@ -522,3 +522,158 @@ async fn test_s3_store_retry_validation() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "update bad retry_mode");
 }
+
+// ===========================================================================
+// Partial-update semantics (absent = preserve, null = clear)
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_put_settings_partial_body_preserves_absent_fields() {
+    let app = TestApp::new().await;
+    let token = app.admin_token();
+
+    // Establish non-default values for two unrelated fields.
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/settings",
+        &token,
+        json!({"default_docker_repo": "docker", "base_url": "https://depot.example.com"}),
+    );
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A partial PUT naming only gc_interval_secs must not disturb them.
+    // (A body exactly like this one nulled default_docker_repo in production.)
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/settings",
+        &token,
+        json!({"gc_interval_secs": 43200}),
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["gc_interval_secs"], 43200);
+    assert_eq!(body["default_docker_repo"], "docker");
+    assert_eq!(body["base_url"], "https://depot.example.com");
+
+    // Explicit null clears.
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/settings",
+        &token,
+        json!({"default_docker_repo": null}),
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["default_docker_repo"], serde_json::Value::Null);
+    assert_eq!(body["base_url"], "https://depot.example.com");
+
+    // Merged documents are still validated as a whole.
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/settings",
+        &token,
+        json!({"gc_start_time": "not a time"}),
+    );
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Non-object bodies are rejected.
+    let req = app.json_request(Method::PUT, "/api/v1/settings", &token, json!([1, 2]));
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_update_repo_partial_body_preserves_absent_fields() {
+    let app = TestApp::new().await;
+    let token = app.admin_token();
+
+    app.create_repo(json!({
+        "name": "part-cache",
+        "format": "docker",
+        "repo_type": "cache",
+        "upstream_url": "https://upstream.example.com",
+        "cache_ttl_secs": 300,
+        "upstream_auth": {"username": "pull-user", "password": "s3cret"},
+        "cleanup_max_age_days": 30,
+        "cleanup_max_unaccessed_days": 14,
+    }))
+    .await;
+
+    // Reproduces the production wipe: a partial update naming only an
+    // unrelated field used to null upstream_auth and both cleanup policies.
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/repositories/part-cache",
+        &token,
+        json!({"cache_ttl_secs": 600}),
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cache_ttl_secs"], 600);
+    assert_eq!(body["upstream_auth"]["username"], "pull-user");
+    assert_eq!(body["cleanup_max_age_days"], 30);
+    assert_eq!(body["cleanup_max_unaccessed_days"], 14);
+
+    // The stored password (not just the masked response) must survive.
+    let stored = depot_core::service::get_repo(app.state.repo.kv.as_ref(), "part-cache")
+        .await
+        .unwrap()
+        .unwrap();
+    let depot_core::store::kv::RepoKind::Cache { upstream_auth, .. } = &stored.kind else {
+        panic!("expected cache repo");
+    };
+    assert_eq!(
+        upstream_auth.as_ref().and_then(|a| a.password.as_deref()),
+        Some("s3cret")
+    );
+
+    // The masked-password sentinel still round-trips without clobbering it.
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/repositories/part-cache",
+        &token,
+        json!({"upstream_auth": {"username": "pull-user2", "password": "********"}}),
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = depot_core::service::get_repo(app.state.repo.kv.as_ref(), "part-cache")
+        .await
+        .unwrap()
+        .unwrap();
+    let depot_core::store::kv::RepoKind::Cache { upstream_auth, .. } = &stored.kind else {
+        panic!("expected cache repo");
+    };
+    assert_eq!(
+        upstream_auth.as_ref().map(|a| a.username.as_str()),
+        Some("pull-user2")
+    );
+    assert_eq!(
+        upstream_auth.as_ref().and_then(|a| a.password.as_deref()),
+        Some("s3cret")
+    );
+
+    // Explicit nulls clear exactly the named fields.
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/repositories/part-cache",
+        &token,
+        json!({"upstream_auth": null, "cleanup_max_unaccessed_days": null}),
+    );
+    let (status, body) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["upstream_auth"], serde_json::Value::Null);
+    assert_eq!(body["cleanup_max_unaccessed_days"], serde_json::Value::Null);
+    assert_eq!(body["cleanup_max_age_days"], 30);
+
+    // Zero is still rejected.
+    let req = app.json_request(
+        Method::PUT,
+        "/api/v1/repositories/part-cache",
+        &token,
+        json!({"cleanup_max_age_days": 0}),
+    );
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
