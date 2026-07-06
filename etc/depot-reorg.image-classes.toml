@@ -1,7 +1,7 @@
 # First-party Docker image classification for the `released` (x.y.z) rule.
 #
-# Generated from each project's `.gitlab-ci.yml` publish_release job on
-# gitlab.mdh.quantum.com (default branch `develop`):
+# Generated from each project's `.gitlab-ci.yml` publish_release job
+# (default branch `develop`):
 #
 #   myriad        myriad/myriad         -O ${DOCKER_EXTERNAL}=release(insight)  / ${DOCKER_INTERNAL}=release_aux
 #   qkp           quantum/qkp           -O ${DOCKER_REPO}=release(insight)      / ${DOCKER_REPO_AUX}=release_aux

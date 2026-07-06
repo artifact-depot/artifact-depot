@@ -3,7 +3,7 @@
 # Everything is data-driven from this file — no repo names, image prefixes, or
 # tag conventions are compiled into depot. Run a dry run first:
 #
-#   depot-bench reorg --url https://depot-dev.lab.mdh.quantum.com \
+#   depot-bench reorg --url https://repository.example.com \
 #       --username admin --password ... --rules etc/depot-reorg.example.toml
 #
 # then add --apply to execute (or --copy for a non-destructive pass that uses
@@ -31,7 +31,11 @@ usage_repo = "docker"
 # upstream is unreachable.
 [check_authority]
 cache_repo     = "docker-insight"
-upstream_url   = "https://insight.quantum.com:8081"
+upstream_url   = "https://repository.example.com:8081"
+# When running from a dev box that reaches the upstream through an SSH
+# port-forward (e.g. ssh -L 8082:repository.example.com:8081), point at the
+# tunnel instead:
+# upstream_url = "https://localhost:8082"
 upstream_repos = ["docker-external", "docker-release"]
 
 # A buildx pipeline tags each platform separately (e.g. `1.4.0-dev.80-linux_amd64`,
