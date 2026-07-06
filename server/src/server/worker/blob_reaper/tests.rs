@@ -1810,3 +1810,71 @@ async fn record_expired_reports_which_policy_fired() {
         None
     );
 }
+
+/// The seed-match invariant behind the whole sharded-GC design: building N
+/// seed-identical shard filters and merging them must yield EXACTLY the
+/// filter a single sequential build over the same keys produces — same
+/// bitmap bytes, same membership. Guards against any drift in
+/// `bloom_empty_like`/merge (e.g. a shard silently getting its own seed),
+/// which would make live blobs read as orphans. Written against the public
+/// helpers so it validates any future `bloomfilter` crate migration
+/// unchanged.
+#[test]
+fn sharded_merge_equals_single_filter_build() {
+    let n_shards = 16;
+    let keys_per_shard = 128;
+    let template: Bloom<[u8]> = Bloom::new_for_fp_rate(n_shards * keys_per_shard, 0.01);
+
+    // Reference: one filter, all keys, sequential.
+    let mut single = bloom_empty_like(&template);
+    for i in 0..n_shards {
+        for j in 0..keys_per_shard {
+            single.set(format!("blob-{i}-{j}").as_bytes());
+        }
+    }
+
+    // Sharded: each shard sets its own keys into its own filter; merge both
+    // ways (bloom_union fold and BloomAccumulator).
+    let shards: Vec<Bloom<[u8]>> = (0..n_shards)
+        .map(|i| {
+            let mut bf = bloom_empty_like(&template);
+            for j in 0..keys_per_shard {
+                bf.set(format!("blob-{i}-{j}").as_bytes());
+            }
+            bf
+        })
+        .collect();
+
+    let mut via_union = bloom_empty_like(&template);
+    for s in &shards {
+        bloom_union(&mut via_union, s);
+    }
+    let acc = BloomAccumulator::empty_like(&template);
+    for s in &shards {
+        acc.or_from(s);
+    }
+    let via_acc = acc.finalize();
+
+    // Exact bitmap equality against the single build — not just membership.
+    assert_eq!(
+        single.bitmap(),
+        via_union.bitmap(),
+        "union-merged shards must be byte-identical to a single build"
+    );
+    assert_eq!(
+        single.bitmap(),
+        via_acc.bitmap(),
+        "accumulator-merged shards must be byte-identical to a single build"
+    );
+
+    // And the membership contract that GC actually relies on: no false
+    // negatives — every key set in any shard reads as present post-merge.
+    for i in 0..n_shards {
+        for j in 0..keys_per_shard {
+            let key = format!("blob-{i}-{j}");
+            assert!(single.check(key.as_bytes()));
+            assert!(via_union.check(key.as_bytes()));
+            assert!(via_acc.check(key.as_bytes()));
+        }
+    }
+}
