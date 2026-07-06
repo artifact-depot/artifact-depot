@@ -1508,7 +1508,7 @@ pub async fn run(client: &DepotClient, cfg: ReorgConfig) -> Result<()> {
         }
     }
 
-    print_plan(&resolved, cfg.copy, &dest_classes);
+    print_plan(&resolved, cfg.copy, cfg.verbose, &dest_classes);
 
     // Snapshot of the repositories this run involves (sources, move dests, purge
     // repos, and check/cache repos), with current artifact counts + sizes.
@@ -1921,9 +1921,20 @@ fn print_delete_listing(p: &ResolvedPlan, items: &[&DeleteItem]) {
 
 /// One `▸ \`--apply <group>\`` section per action group, each with its full
 /// listing directly underneath — nothing about a group lives anywhere else.
+/// Where to find the full per-tag move list, depending on whether the caller
+/// already asked for it.
+fn move_list_hint(verbose: bool) -> &'static str {
+    if verbose {
+        "(full per-tag list: Detail section at the end of this dry run)"
+    } else {
+        "(full per-tag list: --verbose)"
+    }
+}
+
 fn print_group_sections(
     p: &ResolvedPlan,
     copy: bool,
+    verbose: bool,
     dest_classes: &BTreeMap<String, Vec<String>>,
 ) {
     let counts = group_counts(p);
@@ -1962,7 +1973,7 @@ fn print_group_sections(
         }
         let parts: Vec<String> = by_src.iter().map(|(r, n)| format!("{r} {n}")).collect();
         println!("     from: {}", parts.join(" · "));
-        println!("     (full per-tag list: --verbose)");
+        println!("     {}", move_list_hint(verbose));
     }
 
     // ▸ --apply redundant / --apply superseded — split the delete list.
@@ -2254,13 +2265,18 @@ async fn print_destination_retention(
     Ok(())
 }
 
-fn print_plan(p: &ResolvedPlan, copy: bool, dest_classes: &BTreeMap<String, Vec<String>>) {
+fn print_plan(
+    p: &ResolvedPlan,
+    copy: bool,
+    verbose: bool,
+    dest_classes: &BTreeMap<String, Vec<String>>,
+) {
     // Summary up top, then one ▸ section per --apply group (each with its full
     // listing directly underneath), then the review-only leftovers. The summary
     // repeats at the very end of the dry run, after the reference sections.
     println!("================ Reorg plan ================");
     print_summary(p, copy);
-    print_group_sections(p, copy, dest_classes);
+    print_group_sections(p, copy, verbose, dest_classes);
     print_review_only(p);
 }
 
@@ -3309,5 +3325,14 @@ mod tests {
         assert!(client_loser
             .kept
             .contains("newer copy in docker-development-local"));
+    }
+
+    #[test]
+    fn move_list_hint_matches_verbosity() {
+        assert_eq!(move_list_hint(false), "(full per-tag list: --verbose)");
+        assert!(
+            move_list_hint(true).contains("Detail section"),
+            "with --verbose already on, don't tell the user to pass --verbose"
+        );
     }
 }
