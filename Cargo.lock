@@ -1552,12 +1552,15 @@ name = "depot-bench"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "chrono",
  "clap",
+ "depot-core",
  "depot-format-apt",
  "depot-format-helm",
  "depot-format-yum",
+ "depot-test-support",
  "flate2",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
