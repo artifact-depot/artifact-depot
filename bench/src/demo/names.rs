@@ -17,7 +17,7 @@ use rand::RngCore;
 const GROUPS: &[&str] = &[
     "com/example",
     "org/acme",
-    "io/quantum",
+    "io/quartz",
     "net/widgets",
     "com/internal",
     "org/platform",

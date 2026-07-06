@@ -499,10 +499,10 @@ mod tests {
     fn external_origin_http_listener_no_proxy() {
         // The reported bug: a direct HTTP client (no proxy header) must get an
         // http:// origin, not the historical hardcoded https://.
-        let h = headers(&[("host", "depot-dev.lab.mdh.quantum.com")]);
+        let h = headers(&[("host", "depot-dev.lab.example.com")]);
         assert_eq!(
             external_origin_resolved(None, &h, None, "http"),
-            "http://depot-dev.lab.mdh.quantum.com"
+            "http://depot-dev.lab.example.com"
         );
     }
 
@@ -535,13 +535,8 @@ mod tests {
         // hard override (Nexus "Base URL" capability semantics).
         let h = headers(&[("host", "internal:8080"), ("x-forwarded-proto", "https")]);
         assert_eq!(
-            external_origin_resolved(
-                Some("http://depot-dev.lab.mdh.quantum.com"),
-                &h,
-                None,
-                "http"
-            ),
-            "http://depot-dev.lab.mdh.quantum.com"
+            external_origin_resolved(Some("http://depot-dev.lab.example.com"), &h, None, "http"),
+            "http://depot-dev.lab.example.com"
         );
     }
 

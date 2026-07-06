@@ -2844,8 +2844,8 @@ mod tests {
         let toml = r#"
             [[group]]
             format = "docker"
-            first_party_prefixes = ["quantum-orchestrator/"]
-            retired_prefixes = ["orchestrator/", "quantum_orchestrator/"]
+            first_party_prefixes = ["acme-orchestrator/"]
+            retired_prefixes = ["orchestrator/", "acme_orchestrator/"]
         "#;
         let g = compile_groups(&RulesFile::from_toml(toml).unwrap(), Path::new("."))
             .unwrap()
@@ -2853,10 +2853,10 @@ mod tests {
             .unwrap();
         // Retired namespaces match; the current (dash) one does not.
         assert!(g.is_retired("orchestrator/orchestrator"));
-        assert!(g.is_retired("quantum_orchestrator/orchestrator"));
-        assert!(!g.is_retired("quantum-orchestrator/orchestrator"));
+        assert!(g.is_retired("acme_orchestrator/orchestrator"));
+        assert!(!g.is_retired("acme-orchestrator/orchestrator"));
         // The current name is first-party, not retired (disjoint).
-        assert!(g.is_first_party("quantum-orchestrator/orchestrator"));
+        assert!(g.is_first_party("acme-orchestrator/orchestrator"));
         assert!(!g.is_first_party("orchestrator/orchestrator"));
     }
 
@@ -2867,13 +2867,13 @@ mod tests {
             format = "docker"
             [check_authority]
             cache_repo = "docker-insight"
-            upstream_url = "https://insight.quantum.com:8081"
+            upstream_url = "https://repository.example.com:8081"
             upstream_repos = ["docker-external", "docker-release"]
         "#;
         let r = RulesFile::from_toml(toml).unwrap();
         let a = r.check_authority.expect("check_authority present");
         assert_eq!(a.cache_repo, "docker-insight");
-        assert_eq!(a.upstream_url, "https://insight.quantum.com:8081");
+        assert_eq!(a.upstream_url, "https://repository.example.com:8081");
         assert_eq!(a.upstream_repos, vec!["docker-external", "docker-release"]);
     }
 
@@ -2884,7 +2884,7 @@ mod tests {
             ("myriad/master".to_string(), "1.6.0-dev.168".to_string()),
             ("myriad/master".to_string(), "1.4.0-dev.117".to_string()),
             (
-                "quantum-orchestrator/orchestrator".to_string(),
+                "acme-orchestrator/orchestrator".to_string(),
                 "develop".to_string(),
             ),
         ];
@@ -2902,7 +2902,7 @@ mod tests {
             &vec!["1.4.0-dev.117".to_string(), "1.6.0-dev.168".to_string()]
         );
         assert_eq!(
-            p.get("quantum-orchestrator/orchestrator").unwrap(),
+            p.get("acme-orchestrator/orchestrator").unwrap(),
             &vec!["develop".to_string()]
         );
         // A clean cache (all tags upstream) yields no entries.

@@ -625,7 +625,7 @@ impl<'a> DockerStore<'a> {
 ///
 /// Docker tag and manifest records live at `<image>/_tags/<tag>` and
 /// `<image>/_manifests/<digest>`. Image names may contain slashes
-/// (e.g. `qkp/quantum_leaf`), so we locate the boundary marker rather
+/// (e.g. `qkp/nested_leaf`), so we locate the boundary marker rather
 /// than splitting on the first `/`.
 ///
 /// Returns `None` for keys with no image namespace (e.g. `_blobs/...`,
@@ -960,12 +960,12 @@ mod path_tests {
     #[test]
     fn extracts_namespaced_image() {
         assert_eq!(
-            image_from_artifact_key("qkp/quantum_leaf/_tags/v1"),
-            Some("qkp/quantum_leaf")
+            image_from_artifact_key("qkp/nested_leaf/_tags/v1"),
+            Some("qkp/nested_leaf")
         );
         assert_eq!(
-            image_from_artifact_key("qkp/quantum_leaf/_manifests/sha256:abc"),
-            Some("qkp/quantum_leaf")
+            image_from_artifact_key("qkp/nested_leaf/_manifests/sha256:abc"),
+            Some("qkp/nested_leaf")
         );
     }
 
