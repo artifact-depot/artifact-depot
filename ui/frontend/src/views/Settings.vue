@@ -77,7 +77,11 @@ function loadProxies(s: Settings) {
 }
 
 function buildSettings(): Settings {
+  // Overlay the edited fields on the full loaded document so fields this
+  // form doesn't render (base_url, task_retention_secs, ...) survive a save
+  // instead of being reset server-side.
   return {
+    ...settings.value,
     access_log: settings.value.access_log,
     max_artifact_bytes: settings.value.max_artifact_bytes,
     default_docker_repo: dockerRepoEnabled.value && dockerRepo.value ? dockerRepo.value : null,

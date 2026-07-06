@@ -30,7 +30,6 @@ const form = ref<CreateRepoRequest>({
   cleanup_max_age_days: undefined,
   cleanup_max_unaccessed_days: undefined,
   cleanup_untagged_manifests: undefined,
-  apt_components: undefined,
   upstream_auth: undefined,
   content_disposition: undefined,
   repodata_depth: undefined,
@@ -39,7 +38,6 @@ const form = ref<CreateRepoRequest>({
 const members = ref<string[]>([])
 const repos = computed(() => repoStore.repos)
 const newMember = ref('')
-const aptComponentsInput = ref('')
 const authUsername = ref('')
 const authPassword = ref('')
 
@@ -115,10 +113,6 @@ async function submit() {
     }
     if (form.value.format === 'raw' && form.value.content_disposition) {
       req.content_disposition = form.value.content_disposition
-    }
-    if (form.value.format === 'apt') {
-      const comps = aptComponentsInput.value.split(',').map(s => s.trim()).filter(Boolean)
-      if (comps.length) req.apt_components = comps
     }
     if (form.value.format === 'yum' && form.value.repodata_depth != null) {
       req.repodata_depth = form.value.repodata_depth
@@ -254,13 +248,6 @@ async function submit() {
         <label for="repodata_depth">Repodata Depth</label>
         <input id="repodata_depth" v-model.number="form.repodata_depth" type="number" min="0" max="5" placeholder="0 (default)" />
         <p class="hint">Number of directory levels for repodata grouping (0 = single repodata at root)</p>
-      </div>
-
-      <!-- Apt-specific fields -->
-      <div v-if="form.format === 'apt'" class="form-group">
-        <label for="apt_comp">APT Components</label>
-        <input id="apt_comp" v-model="aptComponentsInput" placeholder="main, contrib" />
-        <p class="hint">Comma-separated list of components</p>
       </div>
 
       <!-- Cleanup fields (all types) -->

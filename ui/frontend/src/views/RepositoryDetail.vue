@@ -46,7 +46,6 @@ const newMember = ref('')
 const formWriteMember = ref('')
 const formListen = ref('')
 const formCleanupUntagged = ref(false)
-const formAptComponents = ref('')
 const aptDistributions = ref<string[]>([])
 const snapshotSource = ref('')
 const snapshotName = ref('')
@@ -66,7 +65,6 @@ function populateForm(r: Repo) {
   formWriteMember.value = r.write_member || ''
   formListen.value = r.listen || ''
   formCleanupUntagged.value = r.cleanup_untagged_manifests || false
-  formAptComponents.value = r.apt_components?.join(', ') || ''
   formContentDisposition.value = r.content_disposition || 'attachment'
   formRepodataDepth.value = r.repodata_depth ?? undefined
   formCleanupMaxAge.value = r.cleanup_max_age_days ?? undefined
@@ -150,11 +148,6 @@ async function save() {
     if (repo.value.format === 'docker') {
       req.listen = formListen.value || null
       req.cleanup_untagged_manifests = formCleanupUntagged.value || null
-    }
-    if (repo.value.format === 'apt') {
-      req.apt_components = formAptComponents.value
-        ? formAptComponents.value.split(',').map(s => s.trim()).filter(Boolean)
-        : null
     }
     if (repo.value.format === 'yum') {
       req.repodata_depth = formRepodataDepth.value != null && (formRepodataDepth.value as unknown) !== '' ? Number(formRepodataDepth.value) : null
@@ -437,12 +430,6 @@ onMounted(async () => {
 
         <!-- Apt-specific fields -->
         <template v-if="repo.format === 'apt'">
-          <div class="form-group">
-            <label for="apt_comp">APT Default Components</label>
-            <input id="apt_comp" v-model="formAptComponents" placeholder="main, contrib" />
-            <p class="hint">Comma-separated list of default components</p>
-          </div>
-
           <div class="form-group" v-if="aptDistributions.length">
             <label>Distributions</label>
             <ul class="dist-list">
