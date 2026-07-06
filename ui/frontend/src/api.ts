@@ -245,6 +245,7 @@ export interface Settings {
   rate_limit: RateLimitConfig | null
   gc_interval_secs: number | null
   gc_min_interval_secs: number | null
+  gc_start_time?: string | null
   jwt_expiry_secs: number
   jwt_rotation_interval_secs: number
   logging?: LoggingConfig | null
@@ -255,6 +256,7 @@ export interface SchedulerStatus {
   gc_last_started_at: string | null
   gc_interval_secs: number
   gc_min_interval_secs: number
+  gc_start_time: string | null
 }
 
 // --- Task types ---

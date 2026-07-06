@@ -117,6 +117,33 @@ test('save settings shows success message', async ({ authedPage: page, uiScreens
   await uiScreenshot('success-message')
 })
 
+test('gc start time saves and persists across reload', async ({ authedPage: page }) => {
+  await page.goto('/settings')
+  await expect(page.locator('form')).toBeVisible()
+
+  const startTime = page.locator('[data-testid="gc-start-time"]')
+  await expect(startTime).toBeVisible()
+  await expect(startTime).toHaveValue('') // interval mode by default
+
+  // Set a fixed daily start time and save.
+  await startTime.fill('07:00')
+  await page.locator('button[type="submit"]', { hasText: /save/i }).click()
+  await expect(page.locator('.success', { hasText: 'Settings saved' })).toBeVisible()
+
+  // Round-trips through the settings API.
+  await page.reload()
+  await expect(page.locator('form')).toBeVisible()
+  await expect(startTime).toHaveValue('07:00')
+
+  // Clear it back to interval mode and save.
+  await startTime.fill('')
+  await page.locator('button[type="submit"]', { hasText: /save/i }).click()
+  await expect(page.locator('.success', { hasText: 'Settings saved' })).toBeVisible()
+  await page.reload()
+  await expect(page.locator('form')).toBeVisible()
+  await expect(startTime).toHaveValue('')
+})
+
 test('reset button restores original values', async ({ authedPage: page }) => {
   await page.goto('/settings')
   await expect(page.locator('form')).toBeVisible()

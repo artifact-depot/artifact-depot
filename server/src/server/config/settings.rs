@@ -69,6 +69,15 @@ pub struct Settings {
     #[serde(default = "default_gc_min_interval_secs")]
     pub gc_min_interval_secs: Option<u64>,
 
+    /// Optional fixed start time for automatic GC passes, as a UTC time of
+    /// day in `HH:MM` form (e.g. `"07:00"`). When set, passes anchor to this
+    /// hour daily instead of running `gc_interval_secs` after the previous
+    /// pass, so the schedule does not drift with pass duration or manual
+    /// runs. `gc_min_interval_secs` still applies. When unset (the default),
+    /// interval-based scheduling is used.
+    #[serde(default)]
+    pub gc_start_time: Option<String>,
+
     /// How often the state scanner polls KV for cross-instance changes.
     /// Default: 1000 (1 second).
     #[serde(default = "default_state_scan_interval_ms")]
@@ -158,6 +167,7 @@ impl Default for Settings {
             jwt_rotation_interval_secs: default_jwt_rotation_interval_secs(),
             gc_max_orphan_candidates: default_gc_max_orphan_candidates(),
             gc_min_interval_secs: default_gc_min_interval_secs(),
+            gc_start_time: None,
             state_scan_interval_ms: default_state_scan_interval_ms(),
             task_retention_secs: default_task_retention_secs(),
             logging: None,
@@ -210,6 +220,13 @@ impl Settings {
         if let (Some(interval), Some(min)) = (self.gc_interval_secs, self.gc_min_interval_secs) {
             if interval < min {
                 errors.push("gc_interval_secs must be >= gc_min_interval_secs".to_string());
+            }
+        }
+        if let Some(ref t) = self.gc_start_time {
+            if chrono::NaiveTime::parse_from_str(t, "%H:%M").is_err() {
+                errors.push(format!(
+                    "gc_start_time must be a UTC time of day in HH:MM form (e.g. \"07:00\"), got {t:?}"
+                ));
             }
         }
 
@@ -463,6 +480,29 @@ mod tests {
             let errs = s.validate().unwrap_err();
             assert!(
                 errs.iter().any(|e| e.contains("base_url")),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_gc_start_time_ok() {
+        for ok in ["00:00", "07:00", "7:05", "23:59"] {
+            let mut s = Settings::default();
+            s.gc_start_time = Some(ok.to_string());
+            s.validate()
+                .unwrap_or_else(|e| panic!("{ok:?} should be valid, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn test_validate_gc_start_time_bad() {
+        for bad in ["24:00", "07:60", "0700", "7pm", "07:00:00", ""] {
+            let mut s = Settings::default();
+            s.gc_start_time = Some(bad.to_string());
+            let errs = s.validate().unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains("gc_start_time")),
                 "{bad:?} should be rejected"
             );
         }

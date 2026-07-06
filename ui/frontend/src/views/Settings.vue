@@ -41,6 +41,7 @@ const rateLimitEnabled = ref(false)
 const rateLimit = ref<RateLimitConfig>({ requests_per_second: 100, burst_size: 50 })
 const gcIntervalHours = ref(24)
 const gcMinIntervalMinutes = ref(60)
+const gcStartTime = ref('')
 
 // Logging endpoints
 const loggingOtlpEndpoint = ref('')
@@ -69,6 +70,7 @@ function loadProxies(s: Settings) {
   }
   gcIntervalHours.value = (s.gc_interval_secs ?? 86400) / 3600
   gcMinIntervalMinutes.value = (s.gc_min_interval_secs ?? 3600) / 60
+  gcStartTime.value = s.gc_start_time ?? ''
   // Logging endpoints
   loggingOtlpEndpoint.value = s.logging?.otlp_endpoint ?? ''
   tracingEndpoint.value = s.tracing_endpoint ?? ''
@@ -88,6 +90,7 @@ function buildSettings(): Settings {
     rate_limit: rateLimitEnabled.value ? { ...rateLimit.value } : null,
     gc_interval_secs: gcIntervalHours.value * 3600,
     gc_min_interval_secs: gcMinIntervalMinutes.value * 60,
+    gc_start_time: gcStartTime.value || null,
     jwt_expiry_secs: settings.value.jwt_expiry_secs,
     jwt_rotation_interval_secs: settings.value.jwt_rotation_interval_secs,
     logging: {
@@ -173,6 +176,11 @@ async function save() {
             <span>Min Interval (minutes)</span>
             <input type="number" v-model.number="gcMinIntervalMinutes" min="1" step="1" class="input-sm" />
             <span class="hint">Minimum cooldown between any two garbage collection runs</span>
+          </label>
+          <label class="field-row">
+            <span>Start Time (UTC)</span>
+            <input type="time" v-model="gcStartTime" class="input-sm" data-testid="gc-start-time" />
+            <span class="hint">Optional fixed daily start time; leave empty to run on the interval</span>
           </label>
         </div>
       </details>
