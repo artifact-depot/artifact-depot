@@ -65,7 +65,7 @@ source_repos         = [
     # repo itself is kept, only the first-party/retired prefixes are purged.
     "docker-upstream",
 ]
-first_party_prefixes = ["myriad/", "qkp/", "quantum-orchestrator/"]
+first_party_prefixes = ["myriad/", "qkp/", "quantum-orchestrator/", "uui/"]
 # No wholesale-purge repos: third-party images outside first_party_prefixes /
 # retired_prefixes are none of the reorg's business and are left untouched.
 purge_repos          = []
