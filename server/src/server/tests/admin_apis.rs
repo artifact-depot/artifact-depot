@@ -677,3 +677,41 @@ async fn test_update_repo_partial_body_preserves_absent_fields() {
     let (status, _) = app.call(req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_task_endpoints_require_admin() {
+    let app = TestApp::new().await;
+    app.create_user_with_roles("task-viewer", "password", vec!["read-only"])
+        .await;
+    let token = app.token_for("task-viewer").await;
+
+    for (method, path) in [
+        (Method::GET, "/api/v1/tasks"),
+        (Method::GET, "/api/v1/tasks/scheduler"),
+        (Method::POST, "/api/v1/tasks/gc"),
+        (Method::POST, "/api/v1/tasks/check"),
+        (Method::POST, "/api/v1/tasks/rebuild-dir-entries"),
+        (
+            Method::GET,
+            "/api/v1/tasks/00000000-0000-0000-0000-000000000000",
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/tasks/00000000-0000-0000-0000-000000000000",
+        ),
+    ] {
+        let req = app.auth_request(method.clone(), path, &token);
+        let (status, _) = app.call(req).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {path} must require admin"
+        );
+    }
+
+    // Admin still has full access.
+    let admin = app.admin_token();
+    let req = app.auth_request(Method::GET, "/api/v1/tasks", &admin);
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+}

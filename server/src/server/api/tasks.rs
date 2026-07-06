@@ -17,6 +17,8 @@ use crate::server::worker::blob_reaper;
 use crate::server::worker::check;
 use crate::server::worker::update as update_worker;
 use crate::server::AppState;
+use axum::Extension;
+use depot_core::auth::AuthenticatedUser;
 use depot_core::error::DepotError;
 use depot_core::service;
 
@@ -55,8 +57,10 @@ pub struct StartGcRequest {
 )]
 pub async fn start_check(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     body: Option<Json<StartCheckRequest>>,
 ) -> Result<impl IntoResponse, DepotError> {
+    state.auth.backend.require_admin(&user.0).await?;
     let dry_run = body.as_ref().map(|b| b.dry_run).unwrap_or(true);
     let verify_blob_hashes = body.as_ref().map(|b| b.verify_blob_hashes).unwrap_or(true);
 
@@ -108,8 +112,10 @@ pub async fn start_check(
 )]
 pub async fn start_gc(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     body: Option<Json<StartGcRequest>>,
 ) -> Result<impl IntoResponse, DepotError> {
+    state.auth.backend.require_admin(&user.0).await?;
     let dry_run = body.as_ref().map(|b| b.dry_run).unwrap_or(false);
 
     if state.bg.tasks.has_running_gc().await {
@@ -226,7 +232,9 @@ pub async fn start_gc(
 )]
 pub async fn start_rebuild_dir_entries(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<impl IntoResponse, DepotError> {
+    state.auth.backend.require_admin(&user.0).await?;
     if state.bg.tasks.has_running_rebuild_dir_entries().await {
         return Err(DepotError::Conflict(
             "A rebuild-dir-entries task is already running".to_string(),
@@ -291,8 +299,12 @@ pub async fn start_rebuild_dir_entries(
     ),
     tag = "tasks"
 )]
-pub async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TaskInfo>> {
-    Json(state.bg.tasks.list().await)
+pub async fn list_tasks(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<Json<Vec<TaskInfo>>, DepotError> {
+    state.auth.backend.require_admin(&user.0).await?;
+    Ok(Json(state.bg.tasks.list().await))
 }
 
 /// Get a single task by ID.
@@ -307,8 +319,10 @@ pub async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TaskInfo>> {
 )]
 pub async fn get_task(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskInfo>, DepotError> {
+    state.auth.backend.require_admin(&user.0).await?;
     let uuid = uuid::Uuid::parse_str(&id)
         .map_err(|_| DepotError::BadRequest("Invalid task ID".to_string()))?;
     let task_id = TaskId(uuid);
@@ -330,8 +344,10 @@ pub async fn get_task(
 )]
 pub async fn delete_task(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, DepotError> {
+    state.auth.backend.require_admin(&user.0).await?;
     let uuid = uuid::Uuid::parse_str(&id)
         .map_err(|_| DepotError::BadRequest("Invalid task ID".to_string()))?;
     let task_id = TaskId(uuid);
@@ -365,7 +381,11 @@ pub struct SchedulerStatus {
     ),
     tag = "tasks"
 )]
-pub async fn get_scheduler_status(State(state): State<AppState>) -> Json<SchedulerStatus> {
+pub async fn get_scheduler_status(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<Json<SchedulerStatus>, DepotError> {
+    state.auth.backend.require_admin(&user.0).await?;
     let s = state.settings.load();
     let gc_interval_secs = s.gc_interval_secs.unwrap_or(86400);
     let gc_min_interval_secs = s.gc_min_interval_secs.unwrap_or(3600);
@@ -378,10 +398,10 @@ pub async fn get_scheduler_status(State(state): State<AppState>) -> Json<Schedul
         .flatten()
         .map(|t| t.to_rfc3339());
 
-    Json(SchedulerStatus {
+    Ok(Json(SchedulerStatus {
         gc_last_started_at,
         gc_interval_secs,
         gc_min_interval_secs,
         gc_start_time,
-    })
+    }))
 }
