@@ -148,7 +148,9 @@ pub(super) async fn docker_gc(
 
     // Build bloom filter of digests referenced by manifests.
     let manifest_count = manifests.len().max(1);
-    let mut layer_bf = Bloom::new_for_fp_rate(manifest_count * 10, 0.01); // ~10 layers per manifest
+    // ~10 layers per manifest.
+    let mut layer_bf = Bloom::new_for_fp_rate(manifest_count * 10, 0.01)
+        .map_err(|e| depot_core::error::DepotError::Internal(format!("bloom filter: {e}")))?;
 
     for (_, _, ref record) in &manifests {
         if let Some(json) = read_manifest_json(&blobs, record).await {

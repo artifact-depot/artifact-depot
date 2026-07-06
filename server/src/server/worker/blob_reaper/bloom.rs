@@ -5,42 +5,69 @@
 // ---------------------------------------------------------------------------
 // Bloom filter helpers (using `bloomfilter` crate)
 // ---------------------------------------------------------------------------
+//
+// The GC pass builds per-shard filters in parallel and merges them by
+// bitwise-OR, which is only sound when every shard filter hashes identically
+// (same seed, same k, same size). bloomfilter 3.x serializes a filter as a
+// fixed header (version, length, k, seed) followed by the raw bitmap, so
+// "same parameters" is exactly "same header bytes": every merge asserts
+// header equality before touching a bit, making a parameter mismatch — the
+// failure mode that would turn live blobs into orphans — a loud failure
+// instead of silent corruption.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use bloomfilter::Bloom;
+use depot_core::error::DepotError;
 
-/// Create an empty bloom filter with the same dimensions and hash seeds as
+fn bloom_err(context: &str, e: &str) -> DepotError {
+    DepotError::Internal(format!("bloom filter {context}: {e}"))
+}
+
+/// Length of the serialized header preceding the bitmap payload. Derived,
+/// not hardcoded: total serialized length minus the bitmap length implied by
+/// the filter's bit count.
+fn header_len(filter: &Bloom<[u8]>) -> usize {
+    let total = filter.as_slice().len();
+    let bitmap_bytes = (filter.len() / 8) as usize;
+    total.saturating_sub(bitmap_bytes)
+}
+
+/// Create an empty bloom filter with the same dimensions and hash seed as
 /// `template`, for parallel construction followed by merging into a
 /// `BloomAccumulator` or via `bloom_union`.
-pub(crate) fn bloom_empty_like(template: &Bloom<[u8]>) -> Bloom<[u8]> {
-    let bits = template.number_of_bits();
-    Bloom::from_existing(
-        &vec![0u8; (bits / 8) as usize],
-        bits,
-        template.number_of_hash_functions(),
-        template.sip_keys(),
-    )
+pub(crate) fn bloom_empty_like(template: &Bloom<[u8]>) -> depot_core::error::Result<Bloom<[u8]>> {
+    // Round-trip through the serialized form (`Bloom<[u8]>` has no `Clone`:
+    // the derive requires `[u8]: Clone`), then drop the copied bits. The
+    // round-trip cannot fail on a well-formed input; the error path exists
+    // to satisfy the crate's fallible API without panicking.
+    let mut b = Bloom::from_bytes(template.to_bytes()).map_err(|e| bloom_err("clone", e))?;
+    b.clear();
+    Ok(b)
 }
 
 /// Merge `source` into `target` via bitwise OR. Both filters must have
-/// identical dimensions (created via `bloom_empty_like`).
+/// identical parameters (created via `bloom_empty_like`); a mismatch is an
+/// error rather than a filter that hashes differently than its inputs —
+/// merging mismatched filters would make live blobs read as orphans.
 ///
-/// Allocates a fresh bitmap per call. For tight merge loops in hot paths,
+/// Allocates a fresh buffer per call. For tight merge loops in hot paths,
 /// prefer `BloomAccumulator::or_from` which ORs atomically in place.
-pub(crate) fn bloom_union(target: &mut Bloom<[u8]>, source: &Bloom<[u8]>) {
-    let merged: Vec<u8> = target
-        .bitmap()
-        .iter()
-        .zip(source.bitmap().iter())
-        .map(|(a, b)| a | b)
-        .collect();
-    *target = Bloom::from_existing(
-        &merged,
-        target.number_of_bits(),
-        target.number_of_hash_functions(),
-        target.sip_keys(),
-    );
+pub(crate) fn bloom_union(
+    target: &mut Bloom<[u8]>,
+    source: &Bloom<[u8]>,
+) -> depot_core::error::Result<()> {
+    let h = header_len(target);
+    let mut merged = target.to_bytes();
+    let src = source.as_slice();
+    if merged.get(..h) != src.get(..h) || merged.len() != src.len() {
+        return Err(bloom_err("union", "filter parameter mismatch"));
+    }
+    for (t, s) in merged.iter_mut().skip(h).zip(src.iter().skip(h)) {
+        *t |= s;
+    }
+    *target = Bloom::from_bytes(merged).map_err(|e| bloom_err("union", e))?;
+    Ok(())
 }
 
 /// Lock-free accumulator that folds shard-local bloom filters into one
@@ -50,28 +77,24 @@ pub(crate) fn bloom_union(target: &mut Bloom<[u8]>, source: &Bloom<[u8]>) {
 /// concurrent scan tasks rather than the total number of shards.
 ///
 /// The `bloomfilter` crate has no atomic view of its bitmap, so the
-/// accumulator owns its own `Vec<AtomicU8>` and materialises a plain
-/// `Bloom<[u8]>` once via `finalize`.
+/// accumulator keeps the template's serialized header plus its own
+/// `Vec<AtomicU8>` payload, and materialises a plain `Bloom<[u8]>` once via
+/// `finalize`.
 pub(crate) struct BloomAccumulator {
+    header: Vec<u8>,
     bits: Vec<AtomicU8>,
-    num_bits: u64,
-    num_hashes: u32,
-    sip_keys: [(u64, u64); 2],
 }
 
 impl BloomAccumulator {
-    /// Create an all-zero accumulator matching `template`'s dimensions.
+    /// Create an all-zero accumulator matching `template`'s parameters.
     pub(crate) fn empty_like(template: &Bloom<[u8]>) -> Self {
-        let num_bits = template.number_of_bits();
-        let byte_count = (num_bits / 8) as usize;
-        let mut bits = Vec::with_capacity(byte_count);
-        bits.resize_with(byte_count, || AtomicU8::new(0));
-        Self {
-            bits,
-            num_bits,
-            num_hashes: template.number_of_hash_functions(),
-            sip_keys: template.sip_keys(),
-        }
+        let h = header_len(template);
+        let serialized = template.as_slice();
+        let header = serialized.get(..h).unwrap_or_default().to_vec();
+        let payload_len = serialized.len().saturating_sub(h);
+        let mut bits = Vec::with_capacity(payload_len);
+        bits.resize_with(payload_len, || AtomicU8::new(0));
+        Self { header, bits }
     }
 
     /// OR `source`'s bitmap into this accumulator via per-byte atomic OR.
@@ -82,35 +105,18 @@ impl BloomAccumulator {
     /// every contributor has observed its `or_from` return).
     ///
     /// `source` must have been built from a template with identical
-    /// dimensions (typically via `bloom_empty_like`). A mismatch would
-    /// cause `zip` to silently truncate and drop bits from one side, which
-    /// would corrupt the live-blob filter and cause real blobs to be
-    /// treated as orphans. Guarded with a runtime assertion.
-    pub(crate) fn or_from(&self, source: &Bloom<[u8]>) {
-        let src = source.bitmap();
-        assert_eq!(
-            self.bits.len(),
-            src.len(),
-            "BloomAccumulator::or_from dimension mismatch: accumulator has {} bytes, source has {} bytes",
-            self.bits.len(),
-            src.len()
-        );
-        assert_eq!(
-            self.num_bits,
-            source.number_of_bits(),
-            "BloomAccumulator::or_from num_bits mismatch"
-        );
-        assert_eq!(
-            self.num_hashes,
-            source.number_of_hash_functions(),
-            "BloomAccumulator::or_from num_hashes mismatch"
-        );
-        assert_eq!(
-            self.sip_keys,
-            source.sip_keys(),
-            "BloomAccumulator::or_from sip_keys mismatch"
-        );
-        for (dst, s) in self.bits.iter().zip(src.iter()) {
+    /// parameters (typically via `bloom_empty_like`). A mismatch would OR
+    /// bits hashed under a different scheme into the live-blob filter and
+    /// cause real blobs to be treated as orphans, so it is checked, not
+    /// assumed.
+    pub(crate) fn or_from(&self, source: &Bloom<[u8]>) -> depot_core::error::Result<()> {
+        let src = source.as_slice();
+        if src.get(..self.header.len()) != Some(self.header.as_slice())
+            || src.len() != self.header.len() + self.bits.len()
+        {
+            return Err(bloom_err("accumulate", "filter parameter mismatch"));
+        }
+        for (dst, s) in self.bits.iter().zip(src.iter().skip(self.header.len())) {
             // Avoid the atomic RMW for bytes whose src contribution is 0 —
             // the common case for sparse shard filters. Saves bus traffic
             // on the dense final fold.
@@ -118,12 +124,15 @@ impl BloomAccumulator {
                 dst.fetch_or(*s, Ordering::Relaxed);
             }
         }
+        Ok(())
     }
 
     /// Materialise the accumulated bits as a `Bloom<[u8]>` ready for `check`.
     /// Consumes `self` so the temporary atomic storage is freed.
-    pub(crate) fn finalize(self) -> Bloom<[u8]> {
-        let bytes: Vec<u8> = self.bits.into_iter().map(|b| b.into_inner()).collect();
-        Bloom::from_existing(&bytes, self.num_bits, self.num_hashes, self.sip_keys)
+    pub(crate) fn finalize(self) -> depot_core::error::Result<Bloom<[u8]>> {
+        let mut bytes = self.header;
+        bytes.reserve(self.bits.len());
+        bytes.extend(self.bits.into_iter().map(|b| b.into_inner()));
+        Bloom::from_bytes(bytes).map_err(|e| bloom_err("finalize", e))
     }
 }

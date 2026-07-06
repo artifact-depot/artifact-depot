@@ -93,7 +93,7 @@ moka = { version = "0.12", features = ["sync"] }
 # removed, set/check now fallible). The blob-GC reaper relies on those internals to
 # build seed-identical shard filters and merge them; a mistranslation would treat
 # live blobs as orphans. Migrate in a dedicated, test-covered PR, not a group bump.
-bloomfilter = "1"
+bloomfilter = "3"
 gethostname = "1.1"
 
 [dev-dependencies]
