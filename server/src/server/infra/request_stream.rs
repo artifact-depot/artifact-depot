@@ -26,6 +26,27 @@ use tokio::sync::broadcast;
 use crate::server::AppState;
 use depot_core::auth::AuthenticatedUser;
 
+/// Response-extension marker set by the SPA/static fallback: the web UI
+/// serving itself (index.html for any UI route, /assets/*, favicon) is
+/// noise in a feed about artifact traffic — a single page load is dozens
+/// of fetches that would also flush the snapshot ring. Marked responses
+/// stay in the access log; they just don't enter the live feed.
+#[derive(Clone, Copy)]
+pub struct UiServed;
+
+/// Endpoint paths excluded from the feed:
+/// - the SSE streams complete only on client disconnect, so they would
+///   surface as bogus minutes-long requests whenever a tab closes (and the
+///   Activity page would report on itself);
+/// - health probes are infrastructure heartbeat (LB checks would drip
+///   identical rows forever). All remain in the access log.
+pub fn is_feed_noise(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/v1/events/stream" | "/api/v1/requests/stream" | "/api/v1/health"
+    )
+}
+
 /// How many recent events the connect-time snapshot replays.
 const RECENT_CAPACITY: usize = 100;
 /// Broadcast ring size per subscriber before a slow client lags out.

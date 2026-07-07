@@ -93,7 +93,16 @@ pub async fn request_event_middleware(
     }
 
     // Feed the admin Activity view regardless of the access_log setting —
-    // it is a live view, not a log.
+    // it is a live view, not a log. The UI serving itself (marked by the
+    // SPA fallback) and self-referential endpoints are excluded as noise.
+    if response
+        .extensions()
+        .get::<crate::server::infra::request_stream::UiServed>()
+        .is_some()
+        || crate::server::infra::request_stream::is_feed_noise(&path)
+    {
+        return response;
+    }
     state.bg.request_stream.publish(
         &request_id,
         &username,

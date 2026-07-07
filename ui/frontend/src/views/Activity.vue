@@ -89,6 +89,13 @@ function statusClass(status: number): string {
   return 'status-server-error'
 }
 
+/// Real classifications are compact labels (docker.pull_manifest); the
+/// unclassified fallback is "METHOD /path", which just duplicates the
+/// Method and Path columns — render it as a dash.
+function actionLabel(action: string): string {
+  return action.includes('/') ? '\u2014' : action
+}
+
 function formatDuration(ns: number): string {
   const ms = ns / 1e6
   if (ms < 1) return '<1ms'
@@ -225,7 +232,7 @@ onUnmounted(() => {
               <td>{{ e.method }}</td>
               <td class="mono path-col" :title="e.path">{{ e.path }}</td>
               <td><span class="status-badge" :class="statusClass(e.status)">{{ e.status }}</span></td>
-              <td>{{ e.action }}</td>
+              <td>{{ actionLabel(e.action) }}</td>
               <td class="nowrap">{{ formatDuration(e.elapsed_ns) }}</td>
               <td class="nowrap">{{ formatBytes(e.bytes_recv + e.bytes_sent) }}</td>
             </tr>
@@ -259,7 +266,7 @@ onUnmounted(() => {
   color: var(--color-warning, #ed6c02);
 }
 .path-col {
-  max-width: 28rem;
+  max-width: 48rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

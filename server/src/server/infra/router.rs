@@ -540,7 +540,12 @@ async fn root_fallback(uri: axum::http::Uri) -> axum::response::Response {
     if path == "/v2" || path.starts_with("/v2/") {
         docker::v2_not_found().await
     } else {
-        depot_ui::static_handler(uri).await
+        let mut response = depot_ui::static_handler(uri).await;
+        // Mark UI self-serving so the live request feed can skip it.
+        response
+            .extensions_mut()
+            .insert(crate::server::infra::request_stream::UiServed);
+        response
     }
 }
 
