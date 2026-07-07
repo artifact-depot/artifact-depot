@@ -10,6 +10,10 @@ import { useSettingsStore } from '../stores/settingsStore'
 const settingsStore = useSettingsStore()
 const loading = computed(() => !settingsStore.loaded)
 const saving = ref(false)
+// True once the user has touched any field; suppresses store-driven form
+// reloads so a settings event from elsewhere (another admin, a background
+// save's late materialization) cannot clobber in-progress edits.
+const dirty = ref(false)
 const error = ref('')
 const success = ref('')
 const settings = ref<Settings>({
@@ -105,6 +109,7 @@ function buildSettings(): Settings {
 }
 
 function resetForm() {
+  dirty.value = false
   if (settingsStore.settings) {
     settings.value = { ...settingsStore.settings }
     loadProxies(settings.value)
@@ -112,7 +117,7 @@ function resetForm() {
 }
 
 watch(() => settingsStore.settings, (s) => {
-  if (s && !saving.value) {
+  if (s && !saving.value && !dirty.value) {
     settings.value = { ...s }
     loadProxies(settings.value)
   }
@@ -124,6 +129,7 @@ async function save() {
   success.value = ''
   try {
     await api.updateSettings(buildSettings())
+    dirty.value = false
     success.value = 'Settings saved.'
     setTimeout(() => { success.value = '' }, 3000)
   } catch (e: any) {
@@ -143,7 +149,7 @@ async function save() {
     <div v-if="success" class="success">{{ success }}</div>
     <div v-if="loading" class="muted"><span class="loading-spinner"></span> Loading...</div>
 
-    <form v-else @submit.prevent="save">
+    <form v-else @submit.prevent="save" @input="dirty = true" @change="dirty = true">
       <!-- Access Log -->
       <details class="settings-section" open>
         <summary>Logging <span class="badge-live">live</span></summary>
