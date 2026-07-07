@@ -28,7 +28,7 @@ use super::repo_cleanup::clean_repo_artifacts;
 
 #[test]
 fn bloom_filter_basic() {
-    let mut bf: Bloom<[u8]> = Bloom::new_for_fp_rate(100, 0.01);
+    let mut bf: Bloom<[u8]> = Bloom::new_for_fp_rate(100, 0.01).unwrap();
     bf.set(b"hello" as &[u8]);
     bf.set(b"world" as &[u8]);
     assert!(bf.check(b"hello" as &[u8]));
@@ -38,12 +38,12 @@ fn bloom_filter_basic() {
 
 #[test]
 fn bloom_filter_union() {
-    let mut bf1: Bloom<[u8]> = Bloom::new_for_fp_rate(100, 0.01);
-    let mut bf2 = bloom_empty_like(&bf1);
+    let mut bf1: Bloom<[u8]> = Bloom::new_for_fp_rate(100, 0.01).unwrap();
+    let mut bf2 = bloom_empty_like(&bf1).unwrap();
     bf1.set(b"alpha" as &[u8]);
     bf2.set(b"beta" as &[u8]);
 
-    bloom_union(&mut bf1, &bf2);
+    bloom_union(&mut bf1, &bf2).unwrap();
     assert!(bf1.check(b"alpha" as &[u8]));
     assert!(bf1.check(b"beta" as &[u8]));
 }
@@ -53,10 +53,12 @@ fn bloom_filter_union() {
 /// locks in the semantic equivalence used by the hot path in `gc_pass`.
 #[test]
 fn bloom_accumulator_matches_union() {
-    let template: Bloom<[u8]> = Bloom::new_for_fp_rate(1000, 0.01);
+    let template: Bloom<[u8]> = Bloom::new_for_fp_rate(1000, 0.01).unwrap();
 
     // Build several shard-local filters with overlapping and disjoint keys.
-    let mut shards: Vec<Bloom<[u8]>> = (0..8).map(|_| bloom_empty_like(&template)).collect();
+    let mut shards: Vec<Bloom<[u8]>> = (0..8)
+        .map(|_| bloom_empty_like(&template).unwrap())
+        .collect();
     for (i, shard) in shards.iter_mut().enumerate() {
         for j in 0..64 {
             shard.set(format!("shard-{i}-item-{j}").as_bytes());
@@ -67,25 +69,21 @@ fn bloom_accumulator_matches_union() {
     }
 
     // Reference: fold via the allocating `bloom_union` path.
-    let mut via_union = bloom_empty_like(&template);
+    let mut via_union = bloom_empty_like(&template).unwrap();
     for s in &shards {
-        bloom_union(&mut via_union, s);
+        bloom_union(&mut via_union, s).unwrap();
     }
 
     // New path: fold via `BloomAccumulator::or_from` and finalize.
     let acc = BloomAccumulator::empty_like(&template);
     for s in &shards {
-        acc.or_from(s);
+        acc.or_from(s).unwrap();
     }
-    let via_acc = acc.finalize();
+    let via_acc = acc.finalize().unwrap();
 
-    assert_eq!(via_union.bitmap(), via_acc.bitmap());
-    assert_eq!(via_union.number_of_bits(), via_acc.number_of_bits());
-    assert_eq!(
-        via_union.number_of_hash_functions(),
-        via_acc.number_of_hash_functions()
-    );
-    assert_eq!(via_union.sip_keys(), via_acc.sip_keys());
+    // Full serialized equality covers the bitmap AND every parameter
+    // (bit count, hash count, seed) in one comparison.
+    assert_eq!(via_union.as_slice(), via_acc.as_slice());
 
     // And verify the check() behaviour matches for a sample of inserted
     // and non-inserted keys.
@@ -108,14 +106,14 @@ fn bloom_accumulator_concurrent_or_matches_sequential() {
     use std::sync::Arc;
     use std::thread;
 
-    let template: Bloom<[u8]> = Bloom::new_for_fp_rate(10_000, 0.01);
+    let template: Bloom<[u8]> = Bloom::new_for_fp_rate(10_000, 0.01).unwrap();
     let n_shards = 32;
     let items_per_shard = 64;
 
     // Build shard-local filters with overlapping and disjoint keys.
     let shards: Vec<Bloom<[u8]>> = (0..n_shards)
         .map(|i| {
-            let mut bf = bloom_empty_like(&template);
+            let mut bf = bloom_empty_like(&template).unwrap();
             for j in 0..items_per_shard {
                 bf.set(format!("shard-{i}-item-{j}").as_bytes());
             }
@@ -128,9 +126,9 @@ fn bloom_accumulator_concurrent_or_matches_sequential() {
     // Sequential reference.
     let seq_acc = BloomAccumulator::empty_like(&template);
     for s in &shards {
-        seq_acc.or_from(s);
+        seq_acc.or_from(s).unwrap();
     }
-    let seq = seq_acc.finalize();
+    let seq = seq_acc.finalize().unwrap();
 
     // Concurrent fold.
     let par_acc = Arc::new(BloomAccumulator::empty_like(&template));
@@ -138,7 +136,7 @@ fn bloom_accumulator_concurrent_or_matches_sequential() {
         .into_iter()
         .map(|bf| {
             let acc = Arc::clone(&par_acc);
-            thread::spawn(move || acc.or_from(&bf))
+            thread::spawn(move || acc.or_from(&bf).unwrap())
         })
         .collect();
     for h in handles {
@@ -146,9 +144,10 @@ fn bloom_accumulator_concurrent_or_matches_sequential() {
     }
     let par = Arc::try_unwrap(par_acc)
         .unwrap_or_else(|_| panic!("leaked Arc"))
-        .finalize();
+        .finalize()
+        .unwrap();
 
-    assert_eq!(seq.bitmap(), par.bitmap());
+    assert_eq!(seq.as_slice(), par.as_slice());
     for i in 0..n_shards {
         for j in 0..items_per_shard {
             assert!(par.check(format!("shard-{i}-item-{j}").as_bytes()));
@@ -161,7 +160,7 @@ fn bloom_accumulator_concurrent_or_matches_sequential() {
 #[test]
 fn bloom_filter_false_positive_rate() {
     let n = 10_000;
-    let mut bf: Bloom<[u8]> = Bloom::new_for_fp_rate(n, 0.01);
+    let mut bf: Bloom<[u8]> = Bloom::new_for_fp_rate(n, 0.01).unwrap();
     for i in 0..n {
         bf.set(format!("item-{i}").as_bytes());
     }
@@ -1809,4 +1808,72 @@ async fn record_expired_reports_which_policy_fired() {
         .await,
         None
     );
+}
+
+/// The seed-match invariant behind the whole sharded-GC design: building N
+/// seed-identical shard filters and merging them must yield EXACTLY the
+/// filter a single sequential build over the same keys produces — same
+/// bitmap bytes, same membership. Guards against any drift in
+/// `bloom_empty_like`/merge (e.g. a shard silently getting its own seed),
+/// which would make live blobs read as orphans. Written against the public
+/// helpers so it validates any future `bloomfilter` crate migration
+/// unchanged.
+#[test]
+fn sharded_merge_equals_single_filter_build() {
+    let n_shards = 16;
+    let keys_per_shard = 128;
+    let template: Bloom<[u8]> = Bloom::new_for_fp_rate(n_shards * keys_per_shard, 0.01).unwrap();
+
+    // Reference: one filter, all keys, sequential.
+    let mut single = bloom_empty_like(&template).unwrap();
+    for i in 0..n_shards {
+        for j in 0..keys_per_shard {
+            single.set(format!("blob-{i}-{j}").as_bytes());
+        }
+    }
+
+    // Sharded: each shard sets its own keys into its own filter; merge both
+    // ways (bloom_union fold and BloomAccumulator).
+    let shards: Vec<Bloom<[u8]>> = (0..n_shards)
+        .map(|i| {
+            let mut bf = bloom_empty_like(&template).unwrap();
+            for j in 0..keys_per_shard {
+                bf.set(format!("blob-{i}-{j}").as_bytes());
+            }
+            bf
+        })
+        .collect();
+
+    let mut via_union = bloom_empty_like(&template).unwrap();
+    for s in &shards {
+        bloom_union(&mut via_union, s).unwrap();
+    }
+    let acc = BloomAccumulator::empty_like(&template);
+    for s in &shards {
+        acc.or_from(s).unwrap();
+    }
+    let via_acc = acc.finalize().unwrap();
+
+    // Exact bitmap equality against the single build — not just membership.
+    assert_eq!(
+        single.as_slice(),
+        via_union.as_slice(),
+        "union-merged shards must be byte-identical to a single build"
+    );
+    assert_eq!(
+        single.as_slice(),
+        via_acc.as_slice(),
+        "accumulator-merged shards must be byte-identical to a single build"
+    );
+
+    // And the membership contract that GC actually relies on: no false
+    // negatives — every key set in any shard reads as present post-merge.
+    for i in 0..n_shards {
+        for j in 0..keys_per_shard {
+            let key = format!("blob-{i}-{j}");
+            assert!(single.check(key.as_bytes()));
+            assert!(via_union.check(key.as_bytes()));
+            assert!(via_acc.check(key.as_bytes()));
+        }
+    }
 }

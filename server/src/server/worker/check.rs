@@ -279,8 +279,24 @@ pub async fn run_check(
         p.phase = "Listing blob stores".to_string();
     });
 
-    let bf_template = Bloom::new_for_fp_rate(total_blobs.max(1000), 0.01);
-    let mut combined_bf = bloom_empty_like(&bf_template);
+    let bf_template = match Bloom::new_for_fp_rate(total_blobs.max(1000), 0.01) {
+        Ok(bf) => bf,
+        Err(e) => {
+            task_manager
+                .mark_failed(task_id, format!("Failed to build blob filter: {e}"))
+                .await;
+            return;
+        }
+    };
+    let mut combined_bf = match bloom_empty_like(&bf_template) {
+        Ok(bf) => bf,
+        Err(e) => {
+            task_manager
+                .mark_failed(task_id, format!("Failed to build blob filter: {e}"))
+                .await;
+            return;
+        }
+    };
     let mut actual_blob_count: u64 = 0;
 
     for store_rec in &store_list {
@@ -298,7 +314,15 @@ pub async fn run_check(
         // Drive listing through the BlobStore trait — the backend decides
         // how to iterate (filesystem walk vs. S3 ListObjectsV2 fan-out).
         let (store_bf, count) = {
-            let mut bf = bloom_empty_like(&bf_template);
+            let mut bf = match bloom_empty_like(&bf_template) {
+                Ok(bf) => bf,
+                Err(e) => {
+                    task_manager
+                        .mark_failed(task_id, format!("Failed to build blob filter: {e}"))
+                        .await;
+                    return;
+                }
+            };
             let mut count: u64 = 0;
             let Some(blob_store) = stores.get(&store_rec.name).await else {
                 task_manager
@@ -341,7 +365,12 @@ pub async fn run_check(
             (bf, count)
         };
 
-        bloom_union(&mut combined_bf, &store_bf);
+        if let Err(e) = bloom_union(&mut combined_bf, &store_bf) {
+            task_manager
+                .mark_failed(task_id, format!("Failed to merge blob filters: {e}"))
+                .await;
+            return;
+        }
         actual_blob_count += count;
 
         task_manager

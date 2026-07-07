@@ -42,11 +42,6 @@ updates:
         update-types:
           - "version-update:semver-minor"
           - "version-update:semver-major"
-      # bloomfilter 3.x is a full API rewrite; the blob-GC reaper depends on
-      # 1.x internals. Unblock when the dedicated migration PR lands.
-      - dependency-name: "bloomfilter"
-        update-types:
-          - "version-update:semver-major"
       # redb 3.0+ reads only the v3 on-disk format; deployed stores are v2 and
       # depot never runs Database::upgrade(). Bumping breaks startup on existing
       # single-node installs. Needs a dedicated PR with a v2->v3 operator runbook.

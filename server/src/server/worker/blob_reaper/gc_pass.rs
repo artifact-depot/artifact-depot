@@ -257,7 +257,10 @@ pub async fn gc_pass(
     // keeps peak memory bounded by the number of concurrent scans
     // (rather than the total shard count) and parallelises the fold
     // across cores.
-    let template = Arc::new(Bloom::new_for_fp_rate(estimated_total, 0.01));
+    let template = Arc::new(
+        Bloom::new_for_fp_rate(estimated_total, 0.01)
+            .map_err(|e| depot_core::error::DepotError::Internal(format!("bloom filter: {e}")))?,
+    );
     let combined_acc = Arc::new(BloomAccumulator::empty_like(&template));
     let mut scanned_artifacts = 0u64;
     let mut expired_artifacts = 0u64;
@@ -329,7 +332,7 @@ pub async fn gc_pass(
                     .await
                     .map_err(|e| depot_core::error::DepotError::Internal(e.to_string()))?;
                 let pk = keys::artifact_shard_pk(&repo_name, shard);
-                let mut local_bf = bloom_empty_like(&tmpl);
+                let mut local_bf = bloom_empty_like(&tmpl)?;
                 let mut local_scanned = 0u64;
                 let mut local_expired = 0u64;
 
@@ -421,7 +424,7 @@ pub async fn gc_pass(
                 // `local_bf`. This is the one write point that needs to
                 // happen before task end so the combined filter sees this
                 // shard's contributions.
-                acc.or_from(&local_bf);
+                acc.or_from(&local_bf)?;
                 drop(local_bf);
 
                 Ok::<_, depot_core::error::DepotError>((repo_idx, local_scanned, local_expired))
@@ -463,7 +466,7 @@ pub async fn gc_pass(
             "BloomAccumulator still has outstanding references after join".to_string(),
         )
     })?;
-    let combined = Arc::new(combined_acc.finalize());
+    let combined = Arc::new(combined_acc.finalize()?);
 
     // Stop the progress ticker and do a final update.
     ticker_done.cancel();
