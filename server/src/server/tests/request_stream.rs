@@ -73,8 +73,9 @@ async fn request_stream_snapshot_replays_recent_requests() {
     let app = TestApp::new().await;
     let token = app.admin_token();
 
-    // Generate a request that the middleware should record.
-    let req = app.auth_request(Method::GET, "/api/v1/health", &token);
+    // Generate a request that the middleware should record. (Not /api/v1/health
+    // — heartbeat endpoints are deliberately excluded from the feed.)
+    let req = app.auth_request(Method::GET, "/api/v1/users", &token);
     let (status, _) = app.call(req).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -87,8 +88,8 @@ async fn request_stream_snapshot_replays_recent_requests() {
     let events = snapshot.as_array().expect("snapshot is an array");
     let health = events
         .iter()
-        .find(|e| e["path"] == "/api/v1/health")
-        .expect("snapshot should contain the recorded /api/v1/health request");
+        .find(|e| e["path"] == "/api/v1/users")
+        .expect("snapshot should contain the recorded /api/v1/users request");
     assert_eq!(health["method"], "GET");
     assert_eq!(health["status"], 200);
     assert_eq!(health["username"], "admin");
@@ -142,4 +143,59 @@ fn request_stream_ring_caps_and_sequences() {
     assert_eq!(snapshot.last().unwrap().path, "/p/149");
     // Sequence numbers are strictly increasing.
     assert!(snapshot.windows(2).all(|w| w[1].seq == w[0].seq + 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_stream_excludes_ui_and_noise() {
+    let app = TestApp::new().await;
+    let token = app.admin_token();
+
+    // UI self-serving (any SPA route or asset) and heartbeat noise must not
+    // enter the feed; artifact/API traffic must.
+    for path in [
+        "/",
+        "/repositories",
+        "/activity",
+        "/assets/index-abc123.js",
+        "/favicon.svg",
+        "/api/v1/health",
+    ] {
+        let req = app.auth_request(Method::GET, path, &token);
+        let _ = app.call_resp(req).await;
+    }
+    let req = app.auth_request(Method::GET, "/api/v1/repositories", &token);
+    let (status, _) = app.call(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let req = app.auth_request(Method::GET, "/api/v1/requests/stream", &token);
+    let resp = app.call_resp(req).await;
+    let mut body = resp.into_body();
+    let snapshot = read_sse_event(&mut body, "snapshot").await;
+    let paths: Vec<String> = snapshot
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap_or_default().to_string())
+        .collect();
+
+    assert!(
+        paths.iter().any(|p| p == "/api/v1/repositories"),
+        "API request should be in the feed: {paths:?}"
+    );
+    for noise in [
+        "/",
+        "/repositories",
+        "/activity",
+        "/favicon.svg",
+        "/api/v1/health",
+    ] {
+        assert!(
+            !paths.iter().any(|p| p == noise),
+            "{noise} should be excluded from the feed: {paths:?}"
+        );
+    }
+    assert!(
+        !paths.iter().any(|p| p.starts_with("/assets/")),
+        "asset requests should be excluded: {paths:?}"
+    );
 }
