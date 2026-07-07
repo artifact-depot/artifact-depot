@@ -1,7 +1,7 @@
 # First-party Docker image classification for the `released` (x.y.z) rule.
 #
-# Generated from each project's `.gitlab-ci.yml` publish_release job on
-# gitlab.mdh.quantum.com (default branch `develop`):
+# Generated from each project's `.gitlab-ci.yml` publish_release job
+# (default branch `develop`):
 #
 #   myriad        myriad/myriad         -O ${DOCKER_EXTERNAL}=release(insight)  / ${DOCKER_INTERNAL}=release_aux
 #   qkp           quantum/qkp           -O ${DOCKER_REPO}=release(insight)      / ${DOCKER_REPO_AUX}=release_aux
@@ -24,6 +24,11 @@
 # Source copies are redundant; dropped only when the same digest is confirmed
 # upstream, and never out of the cache repo itself.
 insight_images = [
+  # uui (quantum/uui publish_release: uui/uninstall/sync -> DOCKER_EXTERNAL=release; cba published external 2023-11..2026-05, retired MD-7086)
+  "uui/uui",
+  "uui/uninstall",
+  "uui/sync",
+  "uui/cba",
   # myriad (23)
   "myriad/api_alert_manager",
   "myriad/api_internal",
@@ -66,6 +71,8 @@ insight_images = [
 
 # ---- AUX images (x.y.z → docker-release-aux) ---------------------------------
 aux_images = [
+  # uui (publish_release: builder -> DOCKER_INTERNAL=release_aux)
+  "uui/builder",
   # myriad (32)
   "myriad/api_alert_manager_debug",
   "myriad/api_internal_debug",

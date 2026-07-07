@@ -271,7 +271,7 @@ async fn test_catalog_includes_namespaced_image_names() {
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!(
-            "/repository/ns-cat/v2/qkp/quantum_leaf/blobs/uploads/?digest={}",
+            "/repository/ns-cat/v2/qkp/nested_leaf/blobs/uploads/?digest={}",
             cfg_digest
         ))
         .header(header::AUTHORIZATION, format!("Bearer {}", token))
@@ -293,7 +293,7 @@ async fn test_catalog_includes_namespaced_image_names() {
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!(
-            "/repository/ns-cat/v2/qkp/quantum_leaf/blobs/uploads/?digest={}",
+            "/repository/ns-cat/v2/qkp/nested_leaf/blobs/uploads/?digest={}",
             layer_digest
         ))
         .header(header::AUTHORIZATION, format!("Bearer {}", token))
@@ -306,7 +306,7 @@ async fn test_catalog_includes_namespaced_image_names() {
     let body = serde_json::to_vec(&manifest).unwrap();
     let req = axum::http::Request::builder()
         .method(Method::PUT)
-        .uri("/repository/ns-cat/v2/qkp/quantum_leaf/manifests/v1")
+        .uri("/repository/ns-cat/v2/qkp/nested_leaf/manifests/v1")
         .header(header::AUTHORIZATION, format!("Bearer {}", token))
         .header(
             header::CONTENT_TYPE,
@@ -327,8 +327,8 @@ async fn test_catalog_includes_namespaced_image_names() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert!(
-        names.contains(&"qkp/quantum_leaf"),
-        "expected qkp/quantum_leaf as a single entry, got {names:?}"
+        names.contains(&"qkp/nested_leaf"),
+        "expected qkp/nested_leaf as a single entry, got {names:?}"
     );
     assert!(!names.contains(&"qkp"), "got {names:?}");
 }

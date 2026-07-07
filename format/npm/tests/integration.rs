@@ -542,7 +542,7 @@ async fn test_packument_tarball_url_honors_forwarded_headers() {
             header::AUTHORIZATION,
             format!("Bearer {}", app.admin_token()),
         )
-        .header(header::HOST, "repository.mdh.quantum.com")
+        .header(header::HOST, "repository.example.com")
         .header("x-forwarded-proto", "https")
         .body(Body::empty())
         .unwrap();
@@ -554,7 +554,7 @@ async fn test_packument_tarball_url_honors_forwarded_headers() {
         .unwrap();
     assert_eq!(
         tarball_url,
-        "https://repository.mdh.quantum.com/repository/npm-fwd/fwd-pkg/-/fwd-pkg-2.1.0.tgz"
+        "https://repository.example.com/repository/npm-fwd/fwd-pkg/-/fwd-pkg-2.1.0.tgz"
     );
 }
 
@@ -579,7 +579,7 @@ async fn test_packument_tarball_url_http_listener_defaults_to_http() {
             header::AUTHORIZATION,
             format!("Bearer {}", app.admin_token()),
         )
-        .header(header::HOST, "depot-dev.lab.mdh.quantum.com")
+        .header(header::HOST, "depot-dev.lab.example.com")
         .body(Body::empty())
         .unwrap();
     let (status, body) = app.call(req).await;
@@ -591,13 +591,13 @@ async fn test_packument_tarball_url_http_listener_defaults_to_http() {
     // TC1 (scheme is http), TC2 (absolute, has "://"), TC3 (host parity).
     assert_eq!(
         tarball_url,
-        "http://depot-dev.lab.mdh.quantum.com/repository/npm-http/http-pkg/-/http-pkg-1.60.0.tgz"
+        "http://depot-dev.lab.example.com/repository/npm-http/http-pkg/-/http-pkg-1.60.0.tgz"
     );
 
     // TC4: the exact baked URL is fetchable. Strip the origin and GET the path
     // back through the same app; it must return the published tarball bytes.
     let path = tarball_url
-        .strip_prefix("http://depot-dev.lab.mdh.quantum.com")
+        .strip_prefix("http://depot-dev.lab.example.com")
         .expect("baked URL must be rooted at the request host");
     let req = app.auth_request(Method::GET, path, &app.admin_token());
     let (status, data) = app.call_raw(req).await;
@@ -629,7 +629,7 @@ async fn test_scoped_packument_tarball_url_http_listener_defaults_to_http() {
         .method(Method::GET)
         .uri("/repository/npm-http-scoped/@myorg/widget")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::HOST, "depot-dev.lab.mdh.quantum.com")
+        .header(header::HOST, "depot-dev.lab.example.com")
         .body(Body::empty())
         .unwrap();
     let (status, body) = app.call(req).await;
@@ -640,7 +640,7 @@ async fn test_scoped_packument_tarball_url_http_listener_defaults_to_http() {
         .unwrap();
     assert_eq!(
         tarball_url,
-        "http://depot-dev.lab.mdh.quantum.com/repository/npm-http-scoped/@myorg/widget/-/widget-2.0.0.tgz"
+        "http://depot-dev.lab.example.com/repository/npm-http-scoped/@myorg/widget/-/widget-2.0.0.tgz"
     );
 }
 
@@ -650,7 +650,7 @@ async fn test_scoped_packument_tarball_url_http_listener_defaults_to_http() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_packument_tarball_url_base_url_override_wins() {
     let app = TestApp::new().await;
-    app.set_base_url(Some("http://depot-dev.lab.mdh.quantum.com"));
+    app.set_base_url(Some("http://depot-dev.lab.example.com"));
     app.create_npm_repo("npm-base").await;
 
     let req = npm_publish_request(&app, "npm-base", "base-pkg", "3.0.0", b"data");
@@ -678,7 +678,7 @@ async fn test_packument_tarball_url_base_url_override_wins() {
         .unwrap();
     assert_eq!(
         tarball_url,
-        "http://depot-dev.lab.mdh.quantum.com/repository/npm-base/base-pkg/-/base-pkg-3.0.0.tgz"
+        "http://depot-dev.lab.example.com/repository/npm-base/base-pkg/-/base-pkg-3.0.0.tgz"
     );
 }
 

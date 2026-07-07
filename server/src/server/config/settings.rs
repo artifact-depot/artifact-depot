@@ -439,7 +439,7 @@ mod tests {
     fn test_validate_base_url_ok() {
         for ok in [
             "https://depot.example.com",
-            "http://depot-dev.lab.mdh.quantum.com",
+            "http://depot-dev.lab.example.com",
             "https://depot.example.com:8443",
             "https://depot.example.com/", // trailing slash tolerated
         ] {

@@ -4,9 +4,9 @@ description: Artifact Depot -- Rust-native, scale-out artifact repository manage
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
-home: https://github.com/quantum/artifact-depot
+home: https://github.com/artifact-depot/artifact-depot
 sources:
-  - https://github.com/quantum/artifact-depot
+  - https://github.com/artifact-depot/artifact-depot
 keywords:
   - artifact
   - repository
