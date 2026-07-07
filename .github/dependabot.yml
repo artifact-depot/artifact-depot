@@ -42,9 +42,10 @@ updates:
         update-types:
           - "version-update:semver-minor"
           - "version-update:semver-major"
-      # redb 3.0+ reads only the v3 on-disk format; deployed stores are v2 and
-      # depot never runs Database::upgrade(). Bumping breaks startup on existing
-      # single-node installs. Needs a dedicated PR with a v2->v3 operator runbook.
+      # redb 3.0+ reads only the v3 on-disk format. Depot now upgrades v2
+      # files in place at startup (docs/redb_v3_migration.md); keep the bump
+      # ignored until every deployment has booted once on that build, then do
+      # the redb 4 PR (Phase 2 of #56) and drop this entry.
       - dependency-name: "redb"
         update-types:
           - "version-update:semver-major"

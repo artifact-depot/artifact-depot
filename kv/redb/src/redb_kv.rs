@@ -108,14 +108,31 @@ impl RedbKvStore {
     }
 
     pub fn open_with_cache(path: &Path, cache_bytes: usize) -> error::Result<Self> {
-        let db = if cache_bytes > 0 {
-            Database::builder()
-                .set_cache_size(cache_bytes)
-                .create(path)
-                .map_err(DepotError::storage_permanent)?
-        } else {
-            Database::create(path).map_err(DepotError::storage_permanent)?
-        };
+        // New files are created in the v3 format; existing v2 files (redb 2.x
+        // created v2 by default, and depot never upgraded) are converted in
+        // place on open. redb 3.0+ reads ONLY v3, so every deployed store
+        // must have booted once through this path before the crate can move
+        // past 2.6 — see docs/redb_v3_migration.md.
+        let mut builder = Database::builder();
+        if cache_bytes > 0 {
+            builder.set_cache_size(cache_bytes);
+        }
+        builder.create_with_file_format_v3(true);
+        let mut db = builder
+            .create(path)
+            .map_err(DepotError::storage_permanent)?;
+        match db.upgrade() {
+            Ok(true) => {
+                tracing::info!(path = %path.display(), "redb file upgraded to the v3 format")
+            }
+            Ok(false) => {}
+            // Savepoints or open read transactions block the upgrade; depot
+            // creates neither, and nothing else has the file open yet.
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "redb v3 upgrade failed");
+                return Err(DepotError::storage_permanent(e));
+            }
+        }
 
         // Pre-create all known tables so reads never hit TableDoesNotExist.
         let txn = db.begin_write().map_err(DepotError::storage_permanent)?;
@@ -1011,5 +1028,73 @@ mod tests {
                 .expect("key present");
             assert_eq!(v, i.to_le_bytes());
         }
+    }
+
+    /// A store written in the legacy v2 file format (redb 2.x default) must
+    /// be converted to v3 in place on open, keeping its contents. This is
+    /// the prerequisite for ever moving to redb >= 3, which cannot open v2
+    /// files at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v2_file_upgrades_to_v3_on_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = db_path(&dir);
+        let fixture = redb::TableDefinition::<&[u8], &[u8]>::new("v2-fixture");
+
+        // Build a v2-format file with raw redb (2.x creates v2 by default)
+        // holding one row outside the store's own tables.
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(fixture).unwrap();
+                t.insert(b"k".as_slice(), b"v".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        // Opening through the store performs the in-place upgrade; the store
+        // must be fully usable afterwards.
+        {
+            let mut store = RedbKvStore::open(&path).unwrap();
+            store
+                .put(TBL, "p".into(), "a".into(), b"one")
+                .await
+                .unwrap();
+            let (v, _) = store
+                .get_versioned(TBL, "p".into(), "a".into())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(v, b"one");
+            store.close().await;
+        }
+
+        // The file is now v3 — a fresh handle has no upgrade left to do —
+        // and the pre-upgrade row survived the conversion.
+        let mut db = Database::create(&path).unwrap();
+        assert!(
+            !db.upgrade().unwrap(),
+            "file should already be in the v3 format after a store open"
+        );
+        let txn = db.begin_read().unwrap();
+        let t = txn.open_table(fixture).unwrap();
+        assert_eq!(t.get(b"k".as_slice()).unwrap().unwrap().value(), b"v");
+    }
+
+    /// Fresh stores are created directly in the v3 format.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_store_is_v3() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = db_path(&dir);
+        {
+            let mut store = RedbKvStore::open(&path).unwrap();
+            store
+                .put(TBL, "p".into(), "a".into(), b"one")
+                .await
+                .unwrap();
+            store.close().await;
+        }
+        let mut db = Database::create(&path).unwrap();
+        assert!(!db.upgrade().unwrap(), "fresh store should be v3 already");
     }
 }
