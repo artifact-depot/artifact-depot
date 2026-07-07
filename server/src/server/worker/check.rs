@@ -30,8 +30,44 @@ use depot_core::store::kv::KvStore;
 use depot_core::store::kv::{ArtifactFormat, ArtifactKind, BlobRecord, RepoKind};
 use depot_core::store_registry::StoreRegistry;
 
-/// Maximum in-flight blob verification tasks.
+/// Upper bound on in-flight blob verification tasks.
 const BLOB_CHECK_IN_FLIGHT: usize = 1024;
+
+/// File descriptors left for everything else the server holds open while a
+/// check runs (listener sockets, KV shards, log pipes, upstream fetches).
+const BLOB_CHECK_FD_HEADROOM: u64 = 256;
+
+/// In-flight bound for blob verification: each in-flight task holds an open
+/// blob file, so the bound must fit inside the process's descriptor budget
+/// or the check EMFILEs itself partway through on default container limits.
+fn blob_check_in_flight() -> usize {
+    in_flight_for_limit(nofile_soft_limit())
+}
+
+/// `min(1024, soft limit - headroom)`, floor 16; the cap when the limit is
+/// unknown (non-Linux, parse failure, or unlimited).
+fn in_flight_for_limit(soft_limit: Option<u64>) -> usize {
+    match soft_limit {
+        Some(limit) => {
+            let budget = limit.saturating_sub(BLOB_CHECK_FD_HEADROOM).max(16);
+            (budget as usize).min(BLOB_CHECK_IN_FLIGHT)
+        }
+        None => BLOB_CHECK_IN_FLIGHT,
+    }
+}
+
+/// The process's soft `RLIMIT_NOFILE`, from `/proc/self/limits` (avoids a
+/// libc dependency; depot deployments are Linux). `None` off-Linux, on parse
+/// failure, or for an unlimited soft limit.
+fn nofile_soft_limit() -> Option<u64> {
+    let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
+    let line = limits.lines().find(|l| l.starts_with("Max open files"))?;
+    line.strip_prefix("Max open files")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
 
 /// Lease TTL for the check task (1 hour). The check explicitly releases
 /// the lease on completion; the TTL is a safety net for crashes.
@@ -372,7 +408,20 @@ pub async fn run_check(
         .flat_map(|s| (0..keys::NUM_SHARDS).map(move |shard| keys::blob_shard_pk(&s.name, shard)))
         .collect();
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(BLOB_CHECK_IN_FLIGHT));
+    let in_flight = blob_check_in_flight();
+    if in_flight < BLOB_CHECK_IN_FLIGHT {
+        task_manager
+            .append_log(
+                task_id,
+                format!(
+                    "Limiting blob verification to {in_flight} in flight \
+                     (RLIMIT_NOFILE soft limit {})",
+                    nofile_soft_limit().unwrap_or_default()
+                ),
+            )
+            .await;
+    }
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(in_flight));
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     for pk in &pks {
@@ -1454,5 +1503,18 @@ mod tests {
             error.unwrap().contains("Failed to list repos"),
             "should fail on list_repos"
         );
+    }
+
+    #[test]
+    fn in_flight_respects_fd_budget() {
+        // Unknown limit (non-Linux / unlimited): full cap.
+        assert_eq!(in_flight_for_limit(None), BLOB_CHECK_IN_FLIGHT);
+        // Plenty of descriptors: capped at 1024.
+        assert_eq!(in_flight_for_limit(Some(1_048_576)), BLOB_CHECK_IN_FLIGHT);
+        // Default container limit: fits under it with headroom to spare.
+        assert_eq!(in_flight_for_limit(Some(1024)), 768);
+        // Tiny limits still make progress.
+        assert_eq!(in_flight_for_limit(Some(64)), 16);
+        assert_eq!(in_flight_for_limit(Some(0)), 16);
     }
 }
