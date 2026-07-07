@@ -22,7 +22,7 @@ use depot_core::update::UpdateSender;
 
 use super::bloom::{bloom_empty_like, bloom_union, BloomAccumulator};
 use super::docker_gc::extract_manifest_refs;
-use super::gc_loop::run_blob_reaper;
+use super::gc_loop::{gc_due, run_blob_reaper};
 use super::gc_pass::{gc_pass, GcState};
 use super::repo_cleanup::clean_repo_artifacts;
 
@@ -1546,5 +1546,154 @@ async fn staging_moved_old_tag_expires_by_destination_age_policy() {
             .unwrap()
             .is_none(),
         "expired tag must not leave a ghost browse-tree entry"
+    );
+}
+
+// -----------------------------------------------------------------------
+// gc_due scheduling tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn gc_due_interval_mode() {
+    use chrono::{Duration, Utc};
+    let now = Utc::now();
+    // Not due before the interval elapses, due after.
+    assert!(!gc_due(now - Duration::seconds(100), now, 3600, 60, None));
+    assert!(gc_due(now - Duration::seconds(3600), now, 3600, 60, None));
+    // Min interval guards even when the interval has elapsed.
+    assert!(!gc_due(
+        now - Duration::seconds(3600),
+        now,
+        3600,
+        7200,
+        None
+    ));
+}
+
+#[test]
+fn gc_due_fixed_time_mode() {
+    use chrono::{DateTime, Duration, NaiveTime, Utc};
+    let t = NaiveTime::from_hms_opt(7, 0, 0).unwrap();
+    let noon: DateTime<Utc> = "2026-07-06T12:00:00Z".parse().unwrap();
+
+    // Last pass yesterday, today's 07:00 occurrence has passed -> due, even
+    // though a huge gc_interval would say otherwise (fixed time wins).
+    assert!(gc_due(
+        noon - Duration::days(1),
+        noon,
+        999_999_999,
+        60,
+        Some(t)
+    ));
+
+    // Last pass started at today's occurrence -> not due again today.
+    let today_at_7: DateTime<Utc> = "2026-07-06T07:00:10Z".parse().unwrap();
+    assert!(!gc_due(today_at_7, noon, 86400, 60, Some(t)));
+
+    // A manual pass after the occurrence does not re-anchor: still not due
+    // until tomorrow's occurrence.
+    let manual: DateTime<Utc> = "2026-07-06T10:00:00Z".parse().unwrap();
+    assert!(!gc_due(manual, noon, 86400, 60, Some(t)));
+    let tomorrow_8: DateTime<Utc> = "2026-07-07T08:00:00Z".parse().unwrap();
+    assert!(gc_due(manual, tomorrow_8, 86400, 60, Some(t)));
+
+    // Before today's occurrence the schedule looks at yesterday's: a pass
+    // that ran after it is not due yet.
+    let six_am: DateTime<Utc> = "2026-07-06T06:00:00Z".parse().unwrap();
+    assert!(!gc_due(
+        six_am - Duration::hours(20),
+        six_am,
+        86400,
+        60,
+        Some(t)
+    ));
+    // ...but one that predates yesterday's occurrence is.
+    assert!(gc_due(
+        six_am - Duration::days(2),
+        six_am,
+        86400,
+        60,
+        Some(t)
+    ));
+
+    // Min interval still guards a pass started moments ago.
+    let just_after_7: DateTime<Utc> = "2026-07-06T07:00:30Z".parse().unwrap();
+    assert!(!gc_due(
+        just_after_7 - Duration::seconds(20),
+        just_after_7,
+        86400,
+        3600,
+        Some(t)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_blob_reaper_fires_at_fixed_start_time() {
+    use chrono::{Duration, Utc};
+
+    let (kv, _blobs, registry, _dir) = setup_test_env().await;
+
+    // Persist a last-started timestamp of ~25h ago so a scheduled
+    // occurrence of the configured start time has passed since then.
+    service::set_gc_last_started_at(kv.as_ref(), Utc::now() - Duration::hours(25))
+        .await
+        .unwrap();
+
+    // Start time = one minute ago (UTC time-of-day); interval is huge so
+    // only the fixed-time path can fire this pass.
+    let start_time = (Utc::now() - Duration::minutes(1))
+        .format("%H:%M")
+        .to_string();
+    let mut s = Settings::default();
+    s.gc_interval_secs = Some(999_999_999);
+    s.gc_min_interval_secs = Some(60);
+    s.gc_start_time = Some(start_time);
+    let settings = Arc::new(SettingsHandle::new(s));
+
+    let cancel = CancellationToken::new();
+    let task_manager = Arc::new(TaskManager::new(kv.clone(), "test-instance".into()));
+
+    let reaper = tokio::spawn({
+        let kv = kv.clone();
+        let registry = registry.clone();
+        let cancel = cancel.clone();
+        let settings = settings.clone();
+        let task_manager = task_manager.clone();
+        async move {
+            run_blob_reaper(
+                kv,
+                registry,
+                "test-instance".to_string(),
+                cancel,
+                settings,
+                task_manager,
+                UpdateSender::noop(),
+                Arc::new(tokio::sync::Mutex::new(GcState::new())),
+            )
+            .await;
+        }
+    });
+
+    // Wait for the reaper to complete a GC pass (ticks every 60s).
+    for _ in 0..700 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let tasks = task_manager.list().await;
+        if tasks
+            .iter()
+            .any(|t| t.kind == TaskKind::BlobGc && t.status == TaskStatus::Completed)
+        {
+            break;
+        }
+    }
+
+    cancel.cancel();
+    reaper.await.unwrap();
+
+    let tasks = task_manager.list().await;
+    assert!(
+        tasks
+            .iter()
+            .any(|t| t.kind == TaskKind::BlobGc && t.status == TaskStatus::Completed),
+        "fixed-start-time scheduling should have fired a GC pass despite a huge gc_interval"
     );
 }

@@ -22,6 +22,40 @@ use depot_core::update::UpdateSender;
 use super::gc_pass::{gc_pass, GcState};
 use super::{DEFAULT_GC_INTERVAL_SECS, DEFAULT_GC_MIN_INTERVAL_SECS};
 
+/// Decide whether an automatic GC pass is due.
+///
+/// Interval mode (`start_time` unset): due once `gc_interval` has elapsed
+/// since the last pass started. Fixed-time mode: due once a scheduled
+/// occurrence of `start_time` (a UTC time of day) has passed since the last
+/// pass started, so passes anchor to the configured hour instead of
+/// drifting with the previous pass's start (or with manual runs).
+/// `gc_min_interval` applies in both modes.
+pub(super) fn gc_due(
+    last: DateTime<Utc>,
+    now: DateTime<Utc>,
+    gc_interval: u64,
+    gc_min_interval: u64,
+    start_time: Option<chrono::NaiveTime>,
+) -> bool {
+    let elapsed = (now - last).num_seconds().max(0) as u64;
+    if elapsed < gc_min_interval {
+        return false;
+    }
+    match start_time {
+        Some(t) => {
+            // Most recent scheduled occurrence at or before `now`.
+            let today = now.date_naive().and_time(t).and_utc();
+            let sched = if today <= now {
+                today
+            } else {
+                today - chrono::Duration::days(1)
+            };
+            last < sched
+        }
+        None => elapsed >= gc_interval,
+    }
+}
+
 /// Run the GC loop. Reads `gc_interval_secs` from settings each tick.
 ///
 /// Only the instance holding the `gc` lease runs GC passes. The lease TTL
@@ -65,26 +99,36 @@ pub async fn run_blob_reaper(
                 let s = settings.load();
                 let gc_interval = s.gc_interval_secs.unwrap_or(DEFAULT_GC_INTERVAL_SECS);
                 let gc_min_interval = s.gc_min_interval_secs.unwrap_or(DEFAULT_GC_MIN_INTERVAL_SECS);
+                let gc_start_time = s
+                    .gc_start_time
+                    .as_deref()
+                    .and_then(|t| chrono::NaiveTime::parse_from_str(t, "%H:%M").ok());
                 drop(s);
 
-                // Check if enough time has elapsed before acquiring the
-                // lease.  This avoids holding the lease while idling
-                // between passes, which would block the check job.
+                // Check if the schedule is due before acquiring the lease.
+                // This avoids holding the lease while idling between
+                // passes, which would block the check job.
                 if let Some(last) = last_gc_utc {
-                    let elapsed = (Utc::now() - last).num_seconds().max(0) as u64;
-                    if elapsed < gc_interval || elapsed < gc_min_interval {
+                    if !gc_due(last, Utc::now(), gc_interval, gc_min_interval, gc_start_time) {
                         continue;
                     }
                 }
 
                 // Try to acquire or renew the GC lease.
-                // TTL = gc_interval so a dead holder's grace period expires
-                // before anyone else can take over.
+                // TTL = the effective scheduling interval so a dead holder's
+                // grace period expires before anyone else can take over. In
+                // fixed-time mode the effective cadence is daily, so the TTL
+                // is at least a day regardless of gc_interval_secs.
+                let lease_ttl = if gc_start_time.is_some() {
+                    gc_interval.max(DEFAULT_GC_INTERVAL_SECS)
+                } else {
+                    gc_interval
+                };
                 match crate::server::worker::cluster::try_acquire_lease(
                     kv.as_ref(),
                     crate::server::worker::cluster::LEASE_GC,
                     &lease_holder,
-                    gc_interval,
+                    lease_ttl,
                 )
                 .await
                 {

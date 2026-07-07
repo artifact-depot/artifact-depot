@@ -352,6 +352,8 @@ pub struct SchedulerStatus {
     pub gc_interval_secs: u64,
     /// Configured minimum seconds between GC runs.
     pub gc_min_interval_secs: u64,
+    /// Fixed daily GC start time (UTC `HH:MM`), or null for interval mode.
+    pub gc_start_time: Option<String>,
 }
 
 /// Get scheduler status (GC timing information).
@@ -367,6 +369,7 @@ pub async fn get_scheduler_status(State(state): State<AppState>) -> Json<Schedul
     let s = state.settings.load();
     let gc_interval_secs = s.gc_interval_secs.unwrap_or(86400);
     let gc_min_interval_secs = s.gc_min_interval_secs.unwrap_or(3600);
+    let gc_start_time = s.gc_start_time.clone();
     drop(s);
 
     let gc_last_started_at = service::get_gc_last_started_at(state.repo.kv.as_ref())
@@ -379,5 +382,6 @@ pub async fn get_scheduler_status(State(state): State<AppState>) -> Json<Schedul
         gc_last_started_at,
         gc_interval_secs,
         gc_min_interval_secs,
+        gc_start_time,
     })
 }
