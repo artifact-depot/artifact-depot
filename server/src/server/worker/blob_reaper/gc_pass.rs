@@ -355,7 +355,8 @@ pub async fn gc_pass(
                         )
                         .await?;
 
-                    let mut expired_entries: Vec<(&str, u64)> = Vec::new();
+                    let mut expired_entries: Vec<(&str, u64, super::repo_cleanup::ExpiryReason)> =
+                        Vec::new();
                     for (sk, value) in &result.items {
                         let record = match rmp_serde::from_slice::<
                             depot_core::store::kv::ArtifactRecord,
@@ -376,8 +377,8 @@ pub async fn gc_pass(
                         )
                         .await;
 
-                        if expired {
-                            expired_entries.push((sk, record.size));
+                        if let Some(reason) = expired {
+                            expired_entries.push((sk, record.size, reason));
                         } else {
                             if let Some(ref blob_id) = record.blob_id {
                                 local_bf.set(blob_id.as_bytes());
@@ -386,11 +387,13 @@ pub async fn gc_pass(
                         }
                     }
                     if !expired_entries.is_empty() && !dry_run {
-                        let paths: Vec<&str> = expired_entries.iter().map(|(sk, _)| *sk).collect();
+                        let paths: Vec<&str> =
+                            expired_entries.iter().map(|(sk, _, _)| *sk).collect();
                         service::delete_artifacts_paired_batch(kv.as_ref(), &repo_name, &paths)
                             .await?;
                         local_expired += expired_entries.len() as u64;
-                        for &(sk, size) in &expired_entries {
+                        super::repo_cleanup::emit_expiry_events(&repo_name, &expired_entries);
+                        for &(sk, size, _) in &expired_entries {
                             updater
                                 .dir_changed(&repo_name, sk, -1, -(size as i64))
                                 .await;
@@ -427,15 +430,25 @@ pub async fn gc_pass(
     }
 
     let mut shards_done_per_repo = vec![0u16; repos.len()];
+    let mut expired_per_repo = vec![0u64; repos.len()];
     while let Some(res) = js.join_next().await {
         let (repo_idx, local_scanned, local_expired) = res??;
         scanned_artifacts += local_scanned;
         expired_artifacts += local_expired;
+        if let Some(slot) = expired_per_repo.get_mut(repo_idx) {
+            *slot += local_expired;
+        }
         if let Some(slot) = shards_done_per_repo.get_mut(repo_idx) {
             *slot += 1;
             if *slot == keys::NUM_SHARDS {
                 if let Some(tx) = progress_tx {
                     tx.send_modify(|p| p.completed_repos += 1);
+                }
+                if let Some(repo) = repos.get(repo_idx) {
+                    super::repo_cleanup::emit_expiry_summary(
+                        &repo.name,
+                        expired_per_repo.get(repo_idx).copied().unwrap_or(0),
+                    );
                 }
             }
         }
