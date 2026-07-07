@@ -32,7 +32,14 @@ pub async fn get_settings(
     Json(current).into_response()
 }
 
-/// PUT /api/v1/settings — replace all settings (admin only).
+/// PUT /api/v1/settings — update settings (admin only).
+///
+/// The body is merged over the current settings document: fields present in
+/// the request (including explicit `null`) replace the stored value; absent
+/// fields keep theirs. A partial body therefore updates exactly the fields it
+/// names — it can no longer silently reset everything it omits to defaults
+/// (a partial PUT once nulled `default_docker_repo` in production and broke
+/// every bare `/v2` docker pull until diagnosed).
 #[utoipa::path(
     put,
     path = "/api/v1/settings",
@@ -47,11 +54,35 @@ pub async fn get_settings(
 pub async fn put_settings(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Json(new_settings): Json<Settings>,
+    Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Err(e) = state.auth.backend.require_admin(&user.0).await {
         return e.into_response();
     }
+
+    let Some(patch) = body.as_object() else {
+        return DepotError::BadRequest("settings body must be a JSON object".into())
+            .into_response();
+    };
+
+    // Merge over the current document, then re-validate the whole thing.
+    let current = (**state.settings.load()).clone();
+    let mut merged = match serde_json::to_value(&current) {
+        Ok(serde_json::Value::Object(obj)) => obj,
+        _ => {
+            return DepotError::Internal("failed to serialize current settings".into())
+                .into_response();
+        }
+    };
+    for (k, v) in patch {
+        merged.insert(k.clone(), v.clone());
+    }
+    let new_settings: Settings = match serde_json::from_value(serde_json::Value::Object(merged)) {
+        Ok(s) => s,
+        Err(e) => {
+            return DepotError::BadRequest(format!("invalid settings: {e}")).into_response();
+        }
+    };
 
     if let Err(errors) = new_settings.validate() {
         return DepotError::BadRequest(format!("invalid settings: {}", errors.join("; ")))

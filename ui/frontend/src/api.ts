@@ -15,7 +15,6 @@ export interface Repo {
   cleanup_max_age_days?: number
   cleanup_max_unaccessed_days?: number
   cleanup_untagged_manifests?: boolean
-  apt_components?: string[]
   upstream_auth?: { username: string; password?: string }
   content_disposition?: 'attachment' | 'inline'
   repodata_depth?: number
@@ -37,7 +36,6 @@ export interface CreateRepoRequest {
   cleanup_max_age_days?: number
   cleanup_max_unaccessed_days?: number
   cleanup_untagged_manifests?: boolean
-  apt_components?: string[]
   upstream_auth?: { username: string; password?: string }
   content_disposition?: 'attachment' | 'inline'
   repodata_depth?: number
@@ -55,7 +53,6 @@ export interface UpdateRepoRequest {
   write_member?: string | null
   listen?: string | null
   cleanup_untagged_manifests?: boolean | null
-  apt_components?: string[] | null
   cleanup_max_age_days?: number | null
   cleanup_max_unaccessed_days?: number | null
   content_disposition?: 'attachment' | 'inline' | null

@@ -78,18 +78,6 @@ test('docker-specific fields appear for docker format', async ({ authedPage: pag
   await expect(page.locator('#listen')).not.toBeVisible()
 })
 
-test('apt component field appears for apt format', async ({ authedPage: page }) => {
-  await page.goto('/repositories/new')
-
-  await expect(page.locator('#apt_comp')).not.toBeVisible()
-
-  await page.locator('#format').selectOption('apt')
-  await expect(page.locator('#apt_comp')).toBeVisible()
-
-  await page.locator('#format').selectOption('raw')
-  await expect(page.locator('#apt_comp')).not.toBeVisible()
-})
-
 test('raw content disposition field appears for raw format', async ({ authedPage: page }) => {
   await page.goto('/repositories/new')
 

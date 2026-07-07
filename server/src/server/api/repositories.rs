@@ -482,14 +482,29 @@ async fn load_apt_repo(
     Ok(config)
 }
 
+/// Distinguish an absent field (outer `None`: keep the current value) from an
+/// explicit `null` (`Some(None)`: clear the value). Plain `Option<T>` folds
+/// both cases together, which is how partial update bodies used to wipe
+/// `upstream_auth` and the cleanup policies.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
+/// Partial update: absent fields keep their current value; an explicit `null`
+/// clears nullable fields (`upstream_auth`, the cleanup policies).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateRepoRequest {
     #[serde(default)]
     pub upstream_url: Option<String>,
     #[serde(default)]
     pub cache_ttl_secs: Option<u64>,
-    #[serde(default)]
-    pub upstream_auth: Option<UpstreamAuth>,
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<UpstreamAuth>)]
+    pub upstream_auth: Option<Option<UpstreamAuth>>,
     #[serde(default)]
     pub members: Option<Vec<String>>,
     #[serde(default)]
@@ -498,10 +513,12 @@ pub struct UpdateRepoRequest {
     pub listen: Option<String>,
     #[serde(default)]
     pub cleanup_untagged_manifests: Option<bool>,
-    #[serde(default)]
-    pub cleanup_max_age_days: Option<u64>,
-    #[serde(default)]
-    pub cleanup_max_unaccessed_days: Option<u64>,
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<u64>)]
+    pub cleanup_max_age_days: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<u64>)]
+    pub cleanup_max_unaccessed_days: Option<Option<u64>>,
     #[serde(default)]
     pub content_disposition: Option<ContentDisposition>,
     #[serde(default)]
@@ -537,10 +554,10 @@ pub async fn update_repo(
             return DepotError::BadRequest("repodata_depth must be 0-5".into()).into_response();
         }
     }
-    if req.cleanup_max_age_days == Some(0) {
+    if req.cleanup_max_age_days == Some(Some(0)) {
         return DepotError::BadRequest("cleanup_max_age_days must be >= 1".into()).into_response();
     }
-    if req.cleanup_max_unaccessed_days == Some(0) {
+    if req.cleanup_max_unaccessed_days == Some(Some(0)) {
         return DepotError::BadRequest("cleanup_max_unaccessed_days must be >= 1".into())
             .into_response();
     }
@@ -562,15 +579,18 @@ pub async fn update_repo(
             cache_ttl_secs,
             upstream_auth,
         } => {
-            // Preserve existing password if the sentinel "********" is sent back.
             let new_auth = match req.upstream_auth {
-                Some(mut auth) => {
+                // Absent: keep the existing credentials.
+                None => upstream_auth,
+                // Explicit null: clear them.
+                Some(None) => None,
+                // Preserve existing password if the sentinel "********" is sent back.
+                Some(Some(mut auth)) => {
                     if auth.password.as_deref() == Some("********") {
                         auth.password = upstream_auth.as_ref().and_then(|a| a.password.clone());
                     }
                     Some(auth)
                 }
-                None => None,
             };
             RepoKind::Cache {
                 upstream_url: req.upstream_url.unwrap_or(upstream_url),
@@ -627,6 +647,8 @@ pub async fn update_repo(
                 content_disposition
             },
         },
+        // apt_components is a retired field (`skip_serializing` in the record;
+        // no code path reads it), so there is nothing to carry over.
         FormatConfig::Apt { .. } => FormatConfig::Apt {
             apt_components: None,
         },
@@ -640,9 +662,13 @@ pub async fn update_repo(
         other => other,
     };
 
-    // Update shared cleanup fields.
-    config.cleanup_max_age_days = req.cleanup_max_age_days;
-    config.cleanup_max_unaccessed_days = req.cleanup_max_unaccessed_days;
+    // Update shared cleanup fields (absent: keep; null: clear).
+    if let Some(v) = req.cleanup_max_age_days {
+        config.cleanup_max_age_days = v;
+    }
+    if let Some(v) = req.cleanup_max_unaccessed_days {
+        config.cleanup_max_unaccessed_days = v;
+    }
 
     // Detect repodata_depth change and trigger rebuild.
     let depth_changed = config.format_config.repodata_depth() != old_repodata_depth;

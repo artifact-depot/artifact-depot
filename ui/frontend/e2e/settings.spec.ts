@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { test, expect } from './fixtures'
+import { apiHeaders } from './helpers'
 
 test('settings page loads and shows all fieldsets', async ({ authedPage: page, snapshotA11y, uiScreenshot }) => {
   await page.locator('nav a', { hasText: 'Settings' }).click()
@@ -142,6 +143,32 @@ test('gc start time saves and persists across reload', async ({ authedPage: page
   await page.reload()
   await expect(page.locator('form')).toBeVisible()
   await expect(startTime).toHaveValue('')
+})
+
+test('saving settings preserves fields the form does not render', async ({ authedPage: page }) => {
+  const headers = await apiHeaders(page)
+
+  // Seed base_url via the API — the settings form has no input for it, so a
+  // UI save used to silently reset it to null.
+  let resp = await page.request.put('/api/v1/settings', {
+    headers,
+    data: { base_url: 'https://depot-e2e.example.com' },
+  })
+  expect(resp.ok()).toBeTruthy()
+
+  await page.goto('/settings')
+  await expect(page.locator('form')).toBeVisible()
+  await page.locator('button[type="submit"]', { hasText: /save/i }).click()
+  await expect(page.locator('.success', { hasText: 'Settings saved' })).toBeVisible()
+
+  resp = await page.request.get('/api/v1/settings', { headers })
+  expect((await resp.json()).base_url).toBe('https://depot-e2e.example.com')
+
+  // Restore: clear base_url again.
+  resp = await page.request.put('/api/v1/settings', { headers, data: { base_url: null } })
+  expect(resp.ok()).toBeTruthy()
+  resp = await page.request.get('/api/v1/settings', { headers })
+  expect((await resp.json()).base_url).toBeNull()
 })
 
 test('reset button restores original values', async ({ authedPage: page }) => {
