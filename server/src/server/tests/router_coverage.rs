@@ -182,6 +182,7 @@ async fn test_router_with_default_docker_repo() {
                 crate::server::infra::event_bus::MaterializedModel::empty(),
             )),
             scan_trigger: Arc::new(tokio::sync::Notify::new()),
+            request_stream: Arc::new(crate::server::infra::request_stream::RequestStream::new()),
         },
         settings: Arc::new(SettingsHandle::new(Settings {
             access_log: false,
@@ -333,6 +334,7 @@ async fn test_router_with_access_log() {
                 crate::server::infra::event_bus::MaterializedModel::empty(),
             )),
             scan_trigger: Arc::new(tokio::sync::Notify::new()),
+            request_stream: Arc::new(crate::server::infra::request_stream::RequestStream::new()),
         },
         settings: Arc::new(SettingsHandle::new(Settings {
             access_log: true,
@@ -500,6 +502,7 @@ const MANAGEMENT_ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/tasks/{id}", &["get", "delete"]),
     // Streaming
     ("/api/v1/events/stream", &["get"]),
+    ("/api/v1/requests/stream", &["get"]),
 ];
 
 /// Verify every management API route is documented in the OpenAPI spec and

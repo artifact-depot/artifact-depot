@@ -193,6 +193,8 @@ pub struct BackgroundServices {
     /// Wakes the state scanner immediately on user-initiated KV writes so
     /// the UI doesn't have to wait for the next periodic scan tick.
     pub scan_trigger: Arc<tokio::sync::Notify>,
+    /// Live request feed for the admin Activity view.
+    pub request_stream: Arc<crate::server::infra::request_stream::RequestStream>,
 }
 
 #[derive(Clone)]
@@ -324,6 +326,7 @@ impl AppState {
                 event_bus,
                 model: Arc::new(ModelHandle::new(MaterializedModel::empty())),
                 scan_trigger: Arc::new(tokio::sync::Notify::new()),
+                request_stream: Arc::new(crate::server::infra::request_stream::RequestStream::new()),
             },
             settings: Arc::new(SettingsHandle::new(settings)),
             default_scheme: "https",

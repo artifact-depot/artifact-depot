@@ -149,6 +149,7 @@ async fn app_with_cors(cors: Option<CorsConfig>) -> axum::Router {
                 crate::server::infra::event_bus::MaterializedModel::empty(),
             )),
             scan_trigger: Arc::new(tokio::sync::Notify::new()),
+            request_stream: Arc::new(crate::server::infra::request_stream::RequestStream::new()),
         },
         settings: Arc::new(SettingsHandle::new(Settings {
             access_log: false,
