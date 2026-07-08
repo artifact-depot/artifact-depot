@@ -281,6 +281,35 @@ pub async fn set_stale_flag(kv: &dyn KvStore, repo: &str) -> error::Result<()> {
 // service::propagate_staleness(), called from the API layer.
 
 impl<'a> HelmStore<'a> {
+    /// List `(name, version)` for every chart version in this repository,
+    /// optionally filtered to a single chart `name`. Used by the staging
+    /// endpoints to expand a name-only criterion into concrete versions
+    /// (the Helm analogue of `DockerStore::list_tags`).
+    pub async fn list_chart_versions(
+        &self,
+        name: Option<&str>,
+    ) -> error::Result<Vec<(String, String)>> {
+        service::fold_all_artifacts(
+            self.kv,
+            self.repo,
+            "",
+            Vec::<(String, String)>::new,
+            |acc, _sk, record| {
+                if let ArtifactKind::HelmChart { helm } = &record.kind {
+                    if name.is_none_or(|n| n == helm.name) {
+                        acc.push((helm.name.clone(), helm.version.clone()));
+                    }
+                }
+                Ok(())
+            },
+            |mut a, b| {
+                a.extend(b);
+                a
+            },
+        )
+        .await
+    }
+
     /// Store a chart package (.tgz), parse its metadata, and set the stale flag.
     pub async fn put_chart(&self, data: &[u8]) -> error::Result<ArtifactRecord> {
         let sha256_hash = hex::encode(Sha256::digest(data));

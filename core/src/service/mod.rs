@@ -13,6 +13,7 @@ mod blob;
 mod directory;
 mod meta;
 pub mod pagination;
+pub mod promote;
 mod repo;
 pub mod scan;
 mod store;

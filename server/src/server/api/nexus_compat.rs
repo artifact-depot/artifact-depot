@@ -924,10 +924,14 @@ pub struct StagingParams {
     /// Docker image tag (e.g. `1.2.3`).
     #[serde(rename = "docker.imageTag")]
     pub docker_image_tag: Option<String>,
-    /// Component tag — accepted as an alias for `docker.imageTag`.
+    /// Component tag — accepted as an alias for `docker.imageTag` (Docker) and
+    /// for `version` (Helm).
     pub tag: Option<String>,
-    /// Component name — accepted as an alias for `docker.imageName`.
+    /// Component name — accepted as an alias for `docker.imageName` (Docker) and
+    /// the chart name (Helm).
     pub name: Option<String>,
+    /// Helm chart version (e.g. `1.2.3`). Alias: `tag`.
+    pub version: Option<String>,
     /// Replace an existing destination tag. Defaults to false.
     pub overwrite: Option<bool>,
     /// Delete the source tag after a successful copy (copy endpoint only).
@@ -950,8 +954,9 @@ pub struct StagingResponse {
     pub components: Vec<StagingComponent>,
 }
 
-/// Look up a repository and require it to be a Docker repository.
-async fn load_docker_repo(
+/// Look up a repository and require it to be a staging-capable format
+/// (Docker or Helm).
+async fn load_staging_repo(
     state: &FormatState,
     name: &str,
 ) -> Result<depot_core::store::kv::RepoConfig, Response> {
@@ -964,14 +969,33 @@ async fn load_docker_repo(
         }
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     };
-    if cfg.format() != ArtifactFormat::Docker {
+    if !matches!(cfg.format(), ArtifactFormat::Docker | ArtifactFormat::Helm) {
         return Err(DepotError::BadRequest(format!(
-            "staging operations currently support only Docker repositories; '{name}' is {}",
+            "staging operations currently support only Docker and Helm repositories; \
+             '{name}' is {}",
             cfg.format()
         ))
         .into_response());
     }
     Ok(cfg)
+}
+
+/// Require the source and destination repositories to share a format, and
+/// return it. Cross-format staging is meaningless (a chart is not an image).
+#[allow(clippy::result_large_err)]
+fn require_same_format(
+    source: &depot_core::store::kv::RepoConfig,
+    dest: &depot_core::store::kv::RepoConfig,
+) -> Result<ArtifactFormat, Response> {
+    if source.format() != dest.format() {
+        return Err(DepotError::BadRequest(format!(
+            "staging requires matching formats: source is {}, destination is {}",
+            source.format(),
+            dest.format()
+        ))
+        .into_response());
+    }
+    Ok(source.format())
 }
 
 /// Resolve the `(image, tag)` criteria, requiring at least one so a
@@ -1027,6 +1051,84 @@ async fn enumerate_targets(
     Ok(tags.into_iter().map(|t| (image.clone(), t)).collect())
 }
 
+/// Resolve the `(chart_name, version)` criteria for a Helm staging operation,
+/// requiring at least one so a criteria-less request can't sweep an entire
+/// repository by accident. `version` accepts `tag` as an alias.
+fn staging_helm_criteria(
+    params: &StagingParams,
+) -> Result<(Option<String>, Option<String>), DepotError> {
+    let name = params.name.clone();
+    let version = params.version.clone().or_else(|| params.tag.clone());
+    if name.is_none() && version.is_none() {
+        return Err(DepotError::BadRequest(
+            "specify at least name (chart) or version; refusing to act on all components".into(),
+        ));
+    }
+    Ok((name, version))
+}
+
+/// Expand Helm criteria into concrete `(chart_name, version)` pairs. With an
+/// explicit name+version this is a single pair; with only a name it is every
+/// version of that chart; with only a version it is that version across every
+/// chart in the repo.
+async fn enumerate_helm_targets(
+    state: &FormatState,
+    repo: &depot_core::store::kv::RepoConfig,
+    name: Option<String>,
+    version: Option<String>,
+) -> Result<Vec<(String, String)>, Response> {
+    if let (Some(n), Some(v)) = (&name, &version) {
+        return Ok(vec![(n.clone(), v.clone())]);
+    }
+    let blobs = state
+        .blob_store(&repo.store)
+        .await
+        .map_err(|e| e.into_response())?;
+    let store = depot_format_helm::HelmStore {
+        repo: &repo.name,
+        kv: state.kv.as_ref(),
+        blobs: blobs.as_ref(),
+        store: &repo.store,
+        updater: &state.updater,
+    };
+    let all = store
+        .list_chart_versions(name.as_deref())
+        .await
+        .map_err(|e| e.into_response())?;
+    // Filter by version if that was the only criterion given.
+    Ok(all
+        .into_iter()
+        .filter(|(_, v)| version.as_ref().is_none_or(|want| want == v))
+        .collect())
+}
+
+/// Run a Helm staging move/copy loop over the resolved targets, returning the
+/// Nexus-style component payload. `delete_source` distinguishes move (true) /
+/// copy (false); the [`CopyTarget`] the caller supplies picks same-store
+/// (verbatim) vs cross-store (blob restream).
+async fn run_helm_promote(
+    target: &depot_core::service::promote::CopyTarget<'_>,
+    destination: &str,
+    targets: Vec<(String, String)>,
+    delete_source: bool,
+    overwrite: bool,
+) -> Result<Vec<StagingComponent>, Response> {
+    let mut components = Vec::new();
+    for (name, version) in targets {
+        match depot_format_helm::move_chart(target, &name, &version, delete_source, overwrite).await
+        {
+            Ok(_) => components.push(StagingComponent {
+                repository: destination.to_string(),
+                format: "helm".into(),
+                name,
+                version,
+            }),
+            Err(e) => return Err(e.into_response()),
+        }
+    }
+    Ok(components)
+}
+
 /// `POST /service/rest/v1/staging/move/{destination}`
 ///
 /// Moves Docker components matching the criteria from the source `repository`
@@ -1062,12 +1164,16 @@ pub async fn staging_move(
         return (StatusCode::FORBIDDEN, e.to_string()).into_response();
     }
 
-    let source_cfg = match load_docker_repo(&state, &source).await {
+    let source_cfg = match load_staging_repo(&state, &source).await {
         Ok(c) => c,
         Err(r) => return r,
     };
-    let dest_cfg = match load_docker_repo(&state, &destination).await {
+    let dest_cfg = match load_staging_repo(&state, &destination).await {
         Ok(c) => c,
+        Err(r) => return r,
+    };
+    let format = match require_same_format(&source_cfg, &dest_cfg) {
+        Ok(f) => f,
         Err(r) => return r,
     };
     if dest_cfg.repo_type() != RepoType::Hosted {
@@ -1085,14 +1191,6 @@ pub async fn staging_move(
         .into_response();
     }
 
-    let (image, tag) = match staging_criteria(&params) {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
     let blobs = match state.blob_store(&source_cfg.store).await {
         Ok(b) => b,
         Err(e) => return e.into_response(),
@@ -1100,7 +1198,7 @@ pub async fn staging_move(
     let overwrite = params.overwrite.unwrap_or(false);
 
     // Same-store move: source and destination share the blob store.
-    let target = depot_format_docker::CopyTarget {
+    let target = depot_core::service::promote::CopyTarget {
         kv: state.kv.as_ref(),
         updater: &state.updater,
         source_repo: &source,
@@ -1111,20 +1209,54 @@ pub async fn staging_move(
         dest_blobs: blobs.as_ref(),
     };
 
-    let mut components = Vec::new();
-    for (image, tag) in targets {
-        let name = image.clone().unwrap_or_else(|| source.clone());
-        match depot_format_docker::copy_tag(&target, image.as_deref(), &tag, true, overwrite).await
-        {
-            Ok(_) => components.push(StagingComponent {
-                repository: destination.clone(),
-                format: "docker".into(),
-                name,
-                version: tag,
-            }),
-            Err(e) => return e.into_response(),
+    let components = match format {
+        ArtifactFormat::Helm => {
+            let (name, version) = match staging_helm_criteria(&params) {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            let targets = match enumerate_helm_targets(&state, &source_cfg, name, version).await {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            match run_helm_promote(&target, &destination, targets, true, overwrite).await {
+                Ok(c) => c,
+                Err(r) => return r,
+            }
         }
-    }
+        _ => {
+            let (image, tag) = match staging_criteria(&params) {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut components = Vec::new();
+            for (image, tag) in targets {
+                let name = image.clone().unwrap_or_else(|| source.clone());
+                match depot_format_docker::copy_tag(
+                    &target,
+                    image.as_deref(),
+                    &tag,
+                    true,
+                    overwrite,
+                )
+                .await
+                {
+                    Ok(_) => components.push(StagingComponent {
+                        repository: destination.clone(),
+                        format: "docker".into(),
+                        name,
+                        version: tag,
+                    }),
+                    Err(e) => return e.into_response(),
+                }
+            }
+            components
+        }
+    };
 
     Json(StagingResponse { components }).into_response()
 }
@@ -1172,12 +1304,16 @@ pub async fn staging_copy(
         return (StatusCode::FORBIDDEN, e.to_string()).into_response();
     }
 
-    let source_cfg = match load_docker_repo(&state, &source).await {
+    let source_cfg = match load_staging_repo(&state, &source).await {
         Ok(c) => c,
         Err(r) => return r,
     };
-    let dest_cfg = match load_docker_repo(&state, &destination).await {
+    let dest_cfg = match load_staging_repo(&state, &destination).await {
         Ok(c) => c,
+        Err(r) => return r,
+    };
+    let format = match require_same_format(&source_cfg, &dest_cfg) {
+        Ok(f) => f,
         Err(r) => return r,
     };
     if dest_cfg.repo_type() != RepoType::Hosted {
@@ -1187,14 +1323,6 @@ pub async fn staging_copy(
         .into_response();
     }
 
-    let (image, tag) = match staging_criteria(&params) {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
     let source_blobs = match state.blob_store(&source_cfg.store).await {
         Ok(b) => b,
         Err(e) => return e.into_response(),
@@ -1205,7 +1333,7 @@ pub async fn staging_copy(
     };
     let overwrite = params.overwrite.unwrap_or(false);
 
-    let target = depot_format_docker::CopyTarget {
+    let target = depot_core::service::promote::CopyTarget {
         kv: state.kv.as_ref(),
         updater: &state.updater,
         source_repo: &source,
@@ -1216,27 +1344,54 @@ pub async fn staging_copy(
         dest_blobs: dest_blobs.as_ref(),
     };
 
-    let mut components = Vec::new();
-    for (image, tag) in targets {
-        let name = image.clone().unwrap_or_else(|| source.clone());
-        match depot_format_docker::copy_tag(
-            &target,
-            image.as_deref(),
-            &tag,
-            delete_source,
-            overwrite,
-        )
-        .await
-        {
-            Ok(_) => components.push(StagingComponent {
-                repository: destination.clone(),
-                format: "docker".into(),
-                name,
-                version: tag,
-            }),
-            Err(e) => return e.into_response(),
+    let components = match format {
+        ArtifactFormat::Helm => {
+            let (name, version) = match staging_helm_criteria(&params) {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            let targets = match enumerate_helm_targets(&state, &source_cfg, name, version).await {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            match run_helm_promote(&target, &destination, targets, delete_source, overwrite).await {
+                Ok(c) => c,
+                Err(r) => return r,
+            }
         }
-    }
+        _ => {
+            let (image, tag) = match staging_criteria(&params) {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut components = Vec::new();
+            for (image, tag) in targets {
+                let name = image.clone().unwrap_or_else(|| source.clone());
+                match depot_format_docker::copy_tag(
+                    &target,
+                    image.as_deref(),
+                    &tag,
+                    delete_source,
+                    overwrite,
+                )
+                .await
+                {
+                    Ok(_) => components.push(StagingComponent {
+                        repository: destination.clone(),
+                        format: "docker".into(),
+                        name,
+                        version: tag,
+                    }),
+                    Err(e) => return e.into_response(),
+                }
+            }
+            components
+        }
+    };
 
     Json(StagingResponse { components }).into_response()
 }
@@ -1267,41 +1422,78 @@ pub async fn staging_delete(
         return (StatusCode::FORBIDDEN, e.to_string()).into_response();
     }
 
-    let source_cfg = match load_docker_repo(&state, &source).await {
+    let source_cfg = match load_staging_repo(&state, &source).await {
         Ok(c) => c,
-        Err(r) => return r,
-    };
-    let (image, tag) = match staging_criteria(&params) {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
-        Ok(t) => t,
         Err(r) => return r,
     };
 
-    let mut components = Vec::new();
-    for (image, tag) in targets {
-        let name = image.clone().unwrap_or_else(|| source.clone());
-        match depot_format_docker::delete_tag(
-            state.kv.as_ref(),
-            &state.updater,
-            &source,
-            image.as_deref(),
-            &tag,
-        )
-        .await
-        {
-            Ok(true) => components.push(StagingComponent {
-                repository: source.clone(),
-                format: "docker".into(),
-                name,
-                version: tag,
-            }),
-            Ok(false) => {}
-            Err(e) => return e.into_response(),
+    let components = match source_cfg.format() {
+        ArtifactFormat::Helm => {
+            let (name, version) = match staging_helm_criteria(&params) {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            let targets = match enumerate_helm_targets(&state, &source_cfg, name, version).await {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut components = Vec::new();
+            for (name, version) in targets {
+                match depot_format_helm::delete_chart(
+                    state.kv.as_ref(),
+                    &state.updater,
+                    &source,
+                    &name,
+                    &version,
+                )
+                .await
+                {
+                    Ok(true) => components.push(StagingComponent {
+                        repository: source.clone(),
+                        format: "helm".into(),
+                        name,
+                        version,
+                    }),
+                    Ok(false) => {}
+                    Err(e) => return e.into_response(),
+                }
+            }
+            components
         }
-    }
+        _ => {
+            let (image, tag) = match staging_criteria(&params) {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            let targets = match enumerate_targets(&state, &source_cfg, image, tag).await {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut components = Vec::new();
+            for (image, tag) in targets {
+                let name = image.clone().unwrap_or_else(|| source.clone());
+                match depot_format_docker::delete_tag(
+                    state.kv.as_ref(),
+                    &state.updater,
+                    &source,
+                    image.as_deref(),
+                    &tag,
+                )
+                .await
+                {
+                    Ok(true) => components.push(StagingComponent {
+                        repository: source.clone(),
+                        format: "docker".into(),
+                        name,
+                        version: tag,
+                    }),
+                    Ok(false) => {}
+                    Err(e) => return e.into_response(),
+                }
+            }
+            components
+        }
+    };
 
     Json(StagingResponse { components }).into_response()
 }

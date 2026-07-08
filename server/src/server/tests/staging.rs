@@ -676,3 +676,238 @@ async fn reconcile_store_stats_corrects_drift() {
         "1000 + 2000, dup not double-counted"
     );
 }
+
+// ===========================================================================
+// Helm staging move / delete
+// ===========================================================================
+
+/// PUT a synthetic chart into a hosted helm repo at its canonical root path.
+async fn put_helm_chart(app: &TestApp, repo: &str, name: &str, version: &str) {
+    let chart = depot_format_helm::store::build_synthetic_chart(name, version, "test chart")
+        .expect("build synthetic chart");
+    let token = app.admin_token();
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/repository/{repo}/{name}-{version}.tgz"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .body(Body::from(chart))
+        .unwrap();
+    let (status, _) = app.call(req).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "upload {name}-{version} to {repo}"
+    );
+}
+
+/// Fetch a repo's index.yaml as a string (triggers lazy rebuild).
+async fn helm_index(app: &TestApp, repo: &str) -> String {
+    let token = app.admin_token();
+    let req = app.auth_request(
+        Method::GET,
+        &format!("/repository/{repo}/index.yaml"),
+        &token,
+    );
+    let (status, body) = app.call_raw(req).await;
+    assert_eq!(status, StatusCode::OK, "GET index.yaml for {repo}");
+    String::from_utf8(body).unwrap()
+}
+
+/// A single explicit chart version moves; the destination index gains it and
+/// the source index loses it (the stale-flag rebuild on both repos).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn helm_staging_move_single_version() {
+    let app = TestApp::new().await;
+    app.create_helm_repo("hsrc").await;
+    app.create_helm_repo("hdst").await;
+    put_helm_chart(&app, "hsrc", "myriad", "1.4.2").await;
+
+    // Sanity: source has it, dest doesn't.
+    assert!(helm_index(&app, "hsrc").await.contains("1.4.2"));
+    assert!(!helm_index(&app, "hdst").await.contains("myriad"));
+
+    let (status, body) = post(
+        &app,
+        "/service/rest/v1/staging/move/hdst?repository=hsrc&name=myriad&version=1.4.2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["components"][0]["format"], "helm");
+    assert_eq!(body["components"][0]["name"], "myriad");
+    assert_eq!(body["components"][0]["version"], "1.4.2");
+
+    // Destination gained the chart; it is pullable.
+    let dst = helm_index(&app, "hdst").await;
+    assert!(dst.contains("myriad"), "dest index missing chart: {dst}");
+    assert!(dst.contains("1.4.2"));
+    let token = app.admin_token();
+    let req = app.auth_request(Method::GET, "/repository/hdst/myriad-1.4.2.tgz", &token);
+    assert_eq!(
+        app.call_raw(req).await.0,
+        StatusCode::OK,
+        "chart pullable from dest"
+    );
+
+    // Source lost it (index rebuilt via stale flag).
+    let src = helm_index(&app, "hsrc").await;
+    assert!(
+        !src.contains("1.4.2"),
+        "source index still lists moved chart: {src}"
+    );
+}
+
+/// A name-only criterion moves every version of that chart, leaving other
+/// charts in the source untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn helm_staging_move_all_versions_of_chart() {
+    let app = TestApp::new().await;
+    app.create_helm_repo("hsrc2").await;
+    app.create_helm_repo("hdst2").await;
+    put_helm_chart(&app, "hsrc2", "myriad", "1.0.0").await;
+    put_helm_chart(&app, "hsrc2", "myriad", "1.1.0").await;
+    put_helm_chart(&app, "hsrc2", "observability", "2.0.0").await;
+
+    let (status, body) = post(
+        &app,
+        "/service/rest/v1/staging/move/hdst2?repository=hsrc2&name=myriad",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let moved = body["components"].as_array().unwrap();
+    assert_eq!(moved.len(), 2, "both myriad versions moved: {body}");
+
+    let dst = helm_index(&app, "hdst2").await;
+    assert!(dst.contains("1.0.0") && dst.contains("1.1.0"));
+    // Untouched other chart stays in source; myriad is gone from source.
+    let src = helm_index(&app, "hsrc2").await;
+    assert!(
+        src.contains("observability"),
+        "unrelated chart should remain: {src}"
+    );
+    assert!(
+        !src.contains("myriad"),
+        "all myriad versions should be gone: {src}"
+    );
+}
+
+/// Staging delete removes a matched chart version and rebuilds the index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn helm_staging_delete() {
+    let app = TestApp::new().await;
+    app.create_helm_repo("hdel").await;
+    put_helm_chart(&app, "hdel", "myriad", "0.9.0-deleteme").await;
+    put_helm_chart(&app, "hdel", "myriad", "1.0.0").await;
+
+    let (status, body) = post(
+        &app,
+        "/service/rest/v1/staging/delete?repository=hdel&name=myriad&version=0.9.0-deleteme",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["components"].as_array().unwrap().len(), 1);
+
+    let idx = helm_index(&app, "hdel").await;
+    assert!(
+        !idx.contains("deleteme"),
+        "junk version should be gone: {idx}"
+    );
+    assert!(idx.contains("1.0.0"), "kept version should remain");
+}
+
+/// Cross-store helm move is rejected by the move endpoint (points at copy).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn helm_staging_move_cross_store_rejected() {
+    let app = TestApp::new().await;
+    let _tmp = create_file_store(&app, "other").await;
+    app.create_helm_repo("hsrc3").await;
+    // Destination on a different store.
+    let token = app.admin_token();
+    let (status, _) = app
+        .call(app.json_request(
+            Method::POST,
+            "/api/v1/repositories",
+            &token,
+            json!({"name": "hdst3", "format": "helm", "repo_type": "hosted", "store": "other"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    put_helm_chart(&app, "hsrc3", "myriad", "1.0.0").await;
+
+    let (status, _) = post(
+        &app,
+        "/service/rest/v1/staging/move/hdst3?repository=hsrc3&name=myriad&version=1.0.0",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "cross-store move must be rejected"
+    );
+}
+
+/// Cross-store helm copy streams the blob into the destination store; the
+/// chart is pullable there and (with deleteSource) removed from the source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn helm_staging_copy_cross_store() {
+    let app = TestApp::new().await;
+    let _tmp = create_file_store(&app, "other2").await;
+    app.create_helm_repo("hsrc4").await;
+    let token = app.admin_token();
+    let (status, _) = app
+        .call(app.json_request(
+            Method::POST,
+            "/api/v1/repositories",
+            &token,
+            json!({"name": "hdst4", "format": "helm", "repo_type": "hosted", "store": "other2"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    put_helm_chart(&app, "hsrc4", "myriad", "1.0.0").await;
+
+    let (status, body) = post(
+        &app,
+        "/service/rest/v1/staging/copy/hdst4?repository=hsrc4&name=myriad&version=1.0.0&deleteSource=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Pullable from the different-store destination.
+    let req = app.auth_request(Method::GET, "/repository/hdst4/myriad-1.0.0.tgz", &token);
+    assert_eq!(
+        app.call_raw(req).await.0,
+        StatusCode::OK,
+        "chart pullable from cross-store dest"
+    );
+    // deleteSource removed it from the source.
+    assert!(!helm_index(&app, "hsrc4").await.contains("1.0.0"));
+}
+
+/// A criteria-less helm staging request is refused (no accidental repo sweep).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn helm_staging_requires_criteria() {
+    let app = TestApp::new().await;
+    app.create_helm_repo("hsrc5").await;
+    app.create_helm_repo("hdst5").await;
+    let (status, _) = post(&app, "/service/rest/v1/staging/move/hdst5?repository=hsrc5").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Cross-format staging (helm source, docker dest) is rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_cross_format_rejected() {
+    let app = TestApp::new().await;
+    app.create_helm_repo("hsrc6").await;
+    app.create_docker_repo("ddst6").await;
+    put_helm_chart(&app, "hsrc6", "myriad", "1.0.0").await;
+    let (status, _) = post(
+        &app,
+        "/service/rest/v1/staging/move/ddst6?repository=hsrc6&name=myriad&version=1.0.0",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "helm→docker move must be rejected"
+    );
+}
