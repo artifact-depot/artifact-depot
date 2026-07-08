@@ -1,0 +1,92 @@
+# SPDX-FileCopyrightText: 2026 Artifact Depot Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Example Helm chart reorganization rules for `depot-bench reorg-helm`.
+#
+# Drains first-party charts out of the wrong repositories by version class,
+# leaving third-party charts (cilium, ingress-nginx, minio, …) untouched.
+# Dry-run by default; `--apply move,delete,verify-delete` executes.
+#
+#   depot-bench reorg-helm --url https://depot.example.com \
+#     --username admin --password ... --rules helm-reorg.example.toml
+#   # review the plan, then:
+#   depot-bench reorg-helm ... --rules helm-reorg.example.toml --apply move,delete
+
+# Chart names starting with any of these prefixes are first-party and in scope.
+# Everything else is third-party and is never moved, deleted, or verified.
+first_party = [
+    "myriad",
+    "myriad-uui",
+    "quantum-orchestrator",
+    "observability",
+    "cba-client",
+    "flexsync",
+    "garage",
+    "perfsuite",
+    "nextgen",
+    "qkp-ds-kvgen",
+]
+
+# Release authority for the `delete-if-on-authority` action. A released (x.y.z)
+# chart is dropped from a source repo only if this UPSTREAM registry already
+# serves the identical digest. It is queried DIRECTLY — never via a local cache
+# repo, which would give an incomplete answer and warm the cache (forbidden:
+# caches are usage records). Credentials come from the UPSTREAM_USERNAME /
+# UPSTREAM_PASSWORD environment variables when `--apply verify-delete` runs.
+[authority]
+url = "https://insight.example.com"
+repo = "helm-release"
+
+# Named version-class regexes, matched against the chart version.
+[patterns]
+released   = '^\d+\.\d+\.\d+$'
+prerelease = '^\d+\.\d+\.\d+-(dev|rc)\.\d+$'
+branch     = '^\d+\.\d+\.\d+-(develop|main|master)$'
+# Obvious throwaway versions to delete outright.
+junk       = '(deleteme|^1\.0\.0-0-9-0$)'
+
+# --- helm-external: the de-facto dumping ground -----------------------------
+# First-party prereleases go to helm-prerelease; branch tags likewise; released
+# versions are dropped locally once confirmed on the authority; junk deleted.
+# (CI / developer-branch builds like `1.0.0-jss-dev-4` match no rule and land
+# in the UNCLASSIFIED bucket — reported, never touched.)
+[[groups]]
+source = "helm-external"
+
+  [[groups.rules]]
+  class = "junk"
+  action = "delete"
+
+  [[groups.rules]]
+  class = "released"
+  action = "delete-if-on-authority"
+
+  [[groups.rules]]
+  class = "prerelease"
+  dest = "helm-prerelease"
+
+  [[groups.rules]]
+  class = "branch"
+  dest = "helm-prerelease"
+
+# --- helm-internal: misfiled prereleases; drain then retire -----------------
+[[groups]]
+source = "helm-internal"
+retire = true
+
+  [[groups.rules]]
+  class = "prerelease"
+  dest = "helm-prerelease"
+
+  [[groups.rules]]
+  class = "branch"
+  dest = "helm-prerelease"
+
+# --- helm-development: mostly correct; sweep out stray prereleases ----------
+[[groups]]
+source = "helm-development"
+
+  [[groups.rules]]
+  class = "prerelease"
+  dest = "helm-prerelease"

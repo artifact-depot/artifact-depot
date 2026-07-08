@@ -6,4 +6,5 @@ pub mod audit;
 pub mod client;
 pub mod demo;
 pub mod reorg;
+pub mod reorg_helm;
 pub mod runner;

@@ -1332,6 +1332,57 @@ impl DepotClient {
         Ok(())
     }
 
+    /// `POST /service/rest/v1/staging/move/{dest}` — move a Helm chart
+    /// `name` at `version` from `source` into `dest` (same blob store).
+    pub async fn helm_staging_move(
+        &self,
+        source: &str,
+        dest: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<()> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .post(format!(
+                "{}/service/rest/v1/staging/move/{}",
+                self.base_url, dest
+            ))
+            .bearer_auth(&token)
+            .query(&[("repository", source), ("name", name), ("version", version)])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "helm staging move {source}/{name}:{version} -> {dest} failed ({status}): {body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `POST /service/rest/v1/staging/delete` — delete a Helm chart
+    /// `name` at `version` from `source`.
+    pub async fn helm_staging_delete(&self, source: &str, name: &str, version: &str) -> Result<()> {
+        let token = self.bearer_token().await?;
+        let resp = self
+            .http
+            .post(format!("{}/service/rest/v1/staging/delete", self.base_url))
+            .bearer_auth(&token)
+            .query(&[("repository", source), ("name", name), ("version", version)])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "helm staging delete {source}/{name}:{version} failed ({status}): {body}"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn docker_push_manifest_raw(
         &self,
         repo: &str,

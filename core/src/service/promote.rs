@@ -138,3 +138,15 @@ pub fn delta(new_size: u64, old_size: Option<u64>) -> (i64, i64) {
         None => (1, new_size as i64),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_new_vs_existing() {
+        assert_eq!(delta(100, None), (1, 100));
+        assert_eq!(delta(100, Some(40)), (0, 60));
+        assert_eq!(delta(0, Some(0)), (0, 0));
+    }
+}

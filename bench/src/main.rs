@@ -5,9 +5,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-use depot_bench::{audit, client, demo, reorg, runner};
+use depot_bench::{audit, client, demo, reorg, reorg_helm, runner};
 
 #[derive(Parser)]
 #[command(
@@ -188,6 +189,35 @@ enum Command {
         verbose: bool,
     },
 
+    /// Re-file Helm charts into the right repositories by version class, per a
+    /// rules file (the Helm analogue of `reorg`)
+    ReorgHelm {
+        /// Base URL of the depot instance
+        #[arg(long, default_value = "http://localhost:8080")]
+        url: String,
+
+        /// Username for authentication
+        #[arg(long, default_value = "admin")]
+        username: String,
+
+        /// Password for authentication
+        #[arg(long, default_value = "admin")]
+        password: String,
+
+        /// Skip TLS certificate verification
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
+
+        /// Path to the TOML helm rules file
+        #[arg(long)]
+        rules: String,
+
+        /// Action groups to execute, comma-separated: any of `move`, `delete`,
+        /// `verify-delete`, or `all`. Omit for a dry run that prints the plan.
+        #[arg(long)]
+        apply: Option<String>,
+    },
+
     /// Audit a group repo for tags cloaked by an earlier member (shadowing)
     AuditShadow {
         /// Base URL of the depot instance
@@ -349,6 +379,39 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await?;
+        }
+
+        Command::ReorgHelm {
+            url,
+            username,
+            password,
+            insecure,
+            rules,
+            apply,
+        } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "depot=info".into()),
+                )
+                .init();
+
+            let c = client::DepotClient::new(&url, &username, &password, insecure)?;
+            let text = std::fs::read_to_string(&rules)
+                .with_context(|| format!("read helm rules file '{rules}'"))?;
+            let file: reorg_helm::HelmRulesFile =
+                toml::from_str(&text).with_context(|| format!("parse helm rules '{rules}'"))?;
+            let compiled = reorg_helm::Compiled::compile(file)?;
+            let plan = reorg_helm::plan(&c, &compiled).await?;
+            reorg_helm::print_plan(&plan, &compiled);
+
+            match apply {
+                Some(spec) => {
+                    let sel = reorg_helm::ApplySelection::parse(&spec);
+                    reorg_helm::apply(&c, &plan, &compiled, &sel, insecure).await?;
+                }
+                None => println!("\nDry run — no changes made."),
+            }
         }
 
         Command::AuditShadow {
