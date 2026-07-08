@@ -207,6 +207,26 @@ pub fn validate_token(token: &str, secret: &[u8]) -> Result<Claims, jsonwebtoken
     Ok(data.claims)
 }
 
+/// Response-extension set by [`resolve_identity`] on every response that
+/// passes through it: the resolved username on success, or the *attempted*
+/// username on a rejected request (`"unknown"` when no name could be
+/// extracted from the credentials). The request-event middleware is layered
+/// outside the auth layer so rejected requests still reach the access log
+/// and the live Activity feed — this extension is how it learns who the
+/// request claimed to be, since `AuthenticatedUser` is never inserted on
+/// the rejection path.
+#[derive(Clone)]
+pub struct ResolvedIdentity(pub String);
+
+/// Build the 401 for a rejected request, tagged with the attempted identity.
+fn rejected(suppress_www_authenticate: bool, attempted: &str) -> Response {
+    let mut response = unauthorized_response(suppress_www_authenticate);
+    response
+        .extensions_mut()
+        .insert(ResolvedIdentity(attempted.to_string()));
+    response
+}
+
 /// Unified identity middleware: resolves Bearer JWT, Basic Auth, or anonymous.
 ///
 /// - Valid credentials → inserts `AuthenticatedUser(username)`
@@ -250,7 +270,7 @@ pub async fn resolve_identity(
                     tracing::warn!("audit: malformed JWT token");
                     counter!("auth_attempts_total", "method" => "jwt", "result" => "rejected")
                         .increment(1);
-                    return unauthorized_response(suppress);
+                    return rejected(suppress, "unknown");
                 }
             };
 
@@ -261,7 +281,7 @@ pub async fn resolve_identity(
                     tracing::warn!(username = %claims.sub, "audit: JWT for unknown/deleted user");
                     counter!("auth_attempts_total", "method" => "jwt", "result" => "rejected")
                         .increment(1);
-                    return unauthorized_response(suppress);
+                    return rejected(suppress, &claims.sub);
                 }
             };
 
@@ -277,10 +297,10 @@ pub async fn resolve_identity(
                 counter!("auth_attempts_total", "method" => "jwt", "result" => "ok").increment(1);
                 claims.sub
             } else {
-                tracing::warn!("audit: invalid JWT token");
+                tracing::warn!(username = %claims.sub, "audit: invalid JWT token");
                 counter!("auth_attempts_total", "method" => "jwt", "result" => "rejected")
                     .increment(1);
-                return unauthorized_response(suppress);
+                return rejected(suppress, &claims.sub);
             }
         }
         Some(h) if h.starts_with("Basic ") => {
@@ -289,7 +309,7 @@ pub async fn resolve_identity(
                 None => {
                     counter!("auth_attempts_total", "method" => "basic", "result" => "rejected")
                         .increment(1);
-                    return unauthorized_response(is_xhr);
+                    return rejected(is_xhr, "unknown");
                 }
             };
             match state.auth.backend.authenticate(&user, &pass).await {
@@ -302,7 +322,7 @@ pub async fn resolve_identity(
                     tracing::warn!(username = %user, "audit: basic auth failed");
                     counter!("auth_attempts_total", "method" => "basic", "result" => "rejected")
                         .increment(1);
-                    return unauthorized_response(is_xhr);
+                    return rejected(is_xhr, &user);
                 }
             }
         }
@@ -310,7 +330,7 @@ pub async fn resolve_identity(
             tracing::warn!("audit: unknown auth scheme");
             counter!("auth_attempts_total", "method" => "unknown", "result" => "rejected")
                 .increment(1);
-            return unauthorized_response(is_xhr);
+            return rejected(is_xhr, "unknown");
         }
         None => {
             counter!("auth_attempts_total", "method" => "anonymous", "result" => "ok").increment(1);
@@ -319,8 +339,11 @@ pub async fn resolve_identity(
     };
 
     tracing::Span::current().record("enduser.id", &username);
-    req.extensions_mut().insert(AuthenticatedUser(username));
-    next.run(req).await
+    req.extensions_mut()
+        .insert(AuthenticatedUser(username.clone()));
+    let mut response = next.run(req).await;
+    response.extensions_mut().insert(ResolvedIdentity(username));
+    response
 }
 
 /// Middleware that rejects anonymous (unauthenticated) requests.

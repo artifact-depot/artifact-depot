@@ -4,7 +4,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { getToken } from '../api'
+import { clearToken, getToken } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import ResponsiveTable from '../components/ResponsiveTable.vue'
 import { formatBytes, formatTime } from '../composables/useFormatters'
@@ -120,6 +120,13 @@ async function connect() {
       signal: controller.signal,
     })
 
+    if (response.status === 401) {
+      // Stale/invalid session token — same treatment as every API call:
+      // clear it and bounce to login rather than silently retrying.
+      clearToken()
+      window.location.href = '/login'
+      return
+    }
     if (response.status === 403) {
       connection.value = 'forbidden'
       return

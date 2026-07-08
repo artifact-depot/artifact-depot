@@ -50,12 +50,6 @@ pub async fn request_event_middleware(
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let username = request
-        .extensions()
-        .get::<AuthenticatedUser>()
-        .map(|u| u.0.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-
     let bytes_recv = request
         .headers()
         .get("content-length")
@@ -63,9 +57,26 @@ pub async fn request_event_middleware(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // Capture the identity from the request side as a fallback; this
+    // middleware is layered outside `resolve_identity`, so on the normal
+    // path the username arrives via the `ResolvedIdentity` response
+    // extension instead (which also carries the *attempted* username on
+    // auth-rejected requests).
+    let request_user = request
+        .extensions()
+        .get::<AuthenticatedUser>()
+        .map(|u| u.0.clone());
+
     let start = Instant::now();
     let response = next.run(request).await;
     let elapsed_ns = start.elapsed().as_nanos() as u64;
+
+    let username = response
+        .extensions()
+        .get::<crate::server::auth::ResolvedIdentity>()
+        .map(|r| r.0.clone())
+        .or(request_user)
+        .unwrap_or_else(|| "unknown".to_string());
 
     let status = response.status().as_u16();
     let action = log_export::classify_action(&method, &path);

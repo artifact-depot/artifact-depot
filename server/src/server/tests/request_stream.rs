@@ -145,6 +145,54 @@ fn request_stream_ring_caps_and_sequences() {
     assert!(snapshot.windows(2).all(|w| w[1].seq == w[0].seq + 1));
 }
 
+/// Requests rejected by the identity middleware (401) must still appear in
+/// the feed, attributed to the *attempted* username — an operator watching
+/// the Activity view (or reading the access log) needs to see expired CI
+/// tokens and failed Basic-auth attempts, not have them vanish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_stream_includes_auth_rejected_requests() {
+    use base64::Engine as _;
+
+    let app = TestApp::new().await;
+
+    // A malformed Bearer token: no username can be extracted.
+    let req = app.auth_request(Method::GET, "/api/v1/repositories", "not-a-jwt");
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Basic auth with a wrong password: the attempted username is known.
+    let mut req = app.request(Method::GET, "/api/v1/stores");
+    let basic = base64::engine::general_purpose::STANDARD.encode("admin:wrong-password");
+    req.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Basic {basic}").parse().unwrap(),
+    );
+    let resp = app.call_resp(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let token = app.admin_token();
+    let req = app.auth_request(Method::GET, "/api/v1/requests/stream", &token);
+    let resp = app.call_resp(req).await;
+    let mut body = resp.into_body();
+    let snapshot = read_sse_event(&mut body, "snapshot").await;
+    let events = snapshot.as_array().expect("snapshot is an array");
+
+    let bearer = events
+        .iter()
+        .find(|e| e["path"] == "/api/v1/repositories" && e["status"] == 401)
+        .expect("rejected Bearer request should be in the feed");
+    assert_eq!(bearer["username"], "unknown");
+
+    let basic = events
+        .iter()
+        .find(|e| e["path"] == "/api/v1/stores" && e["status"] == 401)
+        .expect("rejected Basic request should be in the feed");
+    assert_eq!(
+        basic["username"], "admin",
+        "failed Basic auth should record the attempted username"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_stream_excludes_ui_and_noise() {
     let app = TestApp::new().await;
