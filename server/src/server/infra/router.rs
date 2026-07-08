@@ -496,13 +496,18 @@ pub fn build_router(state: AppState, metrics_handle: Option<PrometheusHandle>) -
         .merge(docker_routes)
         .merge(nexus_upload_routes)
         .fallback(root_fallback)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::server::infra::audit::request_event_middleware,
-        ))
+        // resolve_identity is layered INSIDE request_event_middleware so
+        // that requests it rejects (401 for bad credentials) still reach
+        // the access log and the live Activity feed; the event middleware
+        // learns the (attempted) username from the ResolvedIdentity
+        // response extension.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::server::auth::resolve_identity,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::server::infra::audit::request_event_middleware,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -580,13 +585,15 @@ pub fn build_docker_port_router(state: AppState, repo_name: String) -> Router {
     let public_docker_routes: Router = public_docker_routes.with_state(state.clone());
 
     docker_routes
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::server::infra::audit::request_event_middleware,
-        ))
+        // Same ordering rationale as build_router: auth inside the event
+        // middleware so rejected requests are still logged.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::server::auth::resolve_identity,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::server::infra::audit::request_event_middleware,
         ))
         .merge(public_docker_routes)
         .layer(middleware::from_fn_with_state(
