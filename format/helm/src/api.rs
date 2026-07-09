@@ -293,10 +293,8 @@ async fn index_as_json(state: &FormatState, config: &RepoConfig) -> Response {
     // Map the YAML document into a JSON value (strings/maps/seqs/scalars).
     match serde_yml::from_slice::<serde_json::Value>(&yaml) {
         Ok(value) => Json(value).into_response(),
-        Err(e) => {
-            DepotError::Internal(format!("failed to convert helm index to JSON: {e}"))
-                .into_response()
-        }
+        Err(e) => DepotError::Internal(format!("failed to convert helm index to JSON: {e}"))
+            .into_response(),
     }
 }
 

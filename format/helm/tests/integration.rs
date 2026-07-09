@@ -93,7 +93,11 @@ async fn test_index_json_for_ui() {
     let versions = json["entries"]["myriad-uui"]
         .as_array()
         .expect("myriad-uui grouped under its full name, not split on the dash");
-    assert_eq!(versions.len(), 2, "both versions grouped under the chart name");
+    assert_eq!(
+        versions.len(),
+        2,
+        "both versions grouped under the chart name"
+    );
     // Each entry carries the sha256 digest the UI shows (not BLAKE3).
     for e in versions {
         let d = e["digest"].as_str().unwrap_or_default();

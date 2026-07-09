@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { ref, computed, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, isAdmin, type Artifact, type DirInfo, type TaskInfo } from '../api'
+import { api, isAdmin, type Artifact, type DirInfo, type TaskInfo, type HelmIndexEntry } from '../api'
 import { useSettingsStore } from '../stores/settingsStore'
 import BaseModal from './BaseModal.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
@@ -26,9 +26,16 @@ const prefix = computed(() => (route.query.path as string) || '')
 // hidden in the default view, and at an image level the _tags/ contents are
 // shown as tag rows. Expert view reveals the raw storage tree instead.
 const isDocker = computed(() => props.format === 'docker')
+// Helm repos browse charts-first: charts are flat `{name}-{version}.tgz` files,
+// so the friendly view groups them by chart name (from the index) and drills
+// into versions. The only real bookkeeping is `_helm/` (stored index +
+// stale flag), which expert view reveals — there is no raw storage tree to
+// expose, unlike Docker's digest-addressed dirs.
+const isHelm = computed(() => props.format === 'helm')
+const HELM_BOOKKEEPING = '_helm'
 // Expert view (raw storage + delete) is admin-only; gate the toggle on the
 // roles embedded in the JWT. Non-admins only ever see the default browse.
-const canExpert = computed(() => isDocker.value && isAdmin())
+const canExpert = computed(() => (isDocker.value || isHelm.value) && isAdmin())
 const expert = ref(false)
 const BOOKKEEPING = ['_manifests', '_blobs', '_tags']
 // Set when the current prefix is a Docker image (its listing contains _tags/);
@@ -63,6 +70,42 @@ function dockerType(item: DisplayItem): string {
   if (!item.isDir) return item.content_type || 'file'
   if (BOOKKEEPING.includes(item.name)) return 'storage'
   return dockerImageSet.value.has(item.path.replace(/\/+$/, '')) ? 'image' : 'namespace'
+}
+
+// Helm charts-first browse. In BOTH modes the chart list / version list comes
+// from the repo's index (one cached JSON fetch). Expert adds the `_helm/`
+// bookkeeping dir. Charts-first applies whenever browsing (not searching).
+const helmDefault = computed(() => isHelm.value && !isSearchMode.value)
+// The repo's index: chart name → version entries. Fetched once per repo.
+const helmIndex = ref<Record<string, HelmIndexEntry[]>>({})
+let helmIndexFetchedFor = ''
+async function ensureHelmIndex() {
+  if (!isHelm.value || helmIndexFetchedFor === props.repoName) return
+  try {
+    helmIndex.value = await api.getHelmIndex(props.repoName)
+    helmIndexFetchedFor = props.repoName
+  } catch {
+    /* leave empty — the charts list just shows nothing */
+  }
+}
+// The chart we're drilled into (prefix minus trailing slash), or '' at root.
+const helmChartName = computed(() => prefix.value.replace(/\/+$/, ''))
+// True when drilled into a chart that exists in the index (showing versions).
+const atChart = computed(
+  () => helmDefault.value && !!helmIndex.value[helmChartName.value],
+)
+// True when in the `_helm/` bookkeeping subtree (expert only).
+const inHelmBookkeeping = computed(() => prefix.value.startsWith(HELM_BOOKKEEPING))
+// Semver-ish descending sort so newest versions surface first.
+function compareVersionsDesc(a: string, b: string): number {
+  const na = a.split(/[.+-]/).map(s => parseInt(s, 10))
+  const nb = b.split(/[.+-]/).map(s => parseInt(s, 10))
+  for (let i = 0; i < Math.max(na.length, nb.length); i++) {
+    const x = na[i], y = nb[i]
+    if (Number.isNaN(x) || Number.isNaN(y)) return b.localeCompare(a)
+    if (x !== y) return y - x
+  }
+  return b.localeCompare(a)
 }
 
 // `docker pull` is available through the default docker group (host-root
@@ -113,6 +156,11 @@ async function downloadManifest(item: DisplayItem, e: Event) {
 function canDelete(item: DisplayItem): boolean {
   if (!isAdmin()) return false
   if (item.kind === 'tag') return expert.value
+  // Helm chart-name rows are a synthetic grouping, not a real directory —
+  // never offer a folder bulk-delete on them (it would wipe every version).
+  // Individual chart versions are deletable by an admin.
+  if (item.kind === 'chart') return false
+  if (item.kind === 'chart-version') return true
   if (item.isDir) return !isDocker.value || expert.value
   return true
 }
@@ -305,7 +353,9 @@ interface DisplayItem {
   created_at?: string
   artifact_count?: number
   total_bytes?: number
-  kind?: 'tag'
+  kind?: 'tag' | 'chart' | 'chart-version'
+  /** Present on helm `chart-version` rows: the index entry (sha256, metadata). */
+  helmEntry?: HelmIndexEntry
 }
 
 const breadcrumbs = computed(() => {
@@ -379,6 +429,72 @@ const displayItems = computed((): DisplayItem[] => {
       .map(toDir)
   }
 
+  // Helm charts-first: chart names at root, versions when drilled into a chart.
+  // Expert reveals the `_helm/` bookkeeping dir (and its raw records on drill-in).
+  if (helmDefault.value) {
+    const toDir = (d: DirInfo): DisplayItem => ({
+      name: d.name,
+      path: prefix.value + d.name + '/',
+      isDir: true,
+      size: d.total_bytes,
+      content_type: '',
+      updated_at: d.last_modified_at,
+      last_accessed_at: d.last_accessed_at,
+      artifact_count: d.artifact_count,
+      total_bytes: d.total_bytes,
+    })
+    // Expert drill-in under `_helm/`: show the raw stored records.
+    if (expert.value && inHelmBookkeeping.value) {
+      const dItems = dirs.value.map(toDir)
+      const fItems: DisplayItem[] = artifacts.value.map(a => ({
+        name: a.path,
+        path: prefix.value + a.path,
+        isDir: false,
+        size: a.size,
+        content_type: a.content_type,
+        updated_at: a.updated_at,
+        last_accessed_at: a.last_accessed_at,
+        created_at: a.created_at,
+      }))
+      return [...dItems, ...fItems]
+    }
+    // Drilled into a chart → its versions (newest first).
+    if (atChart.value) {
+      const entries = [...helmIndex.value[helmChartName.value]]
+      entries.sort((a, b) => compareVersionsDesc(a.version, b.version))
+      return entries.map(e => ({
+        name: e.version,
+        path: `${e.name}-${e.version}.tgz`,
+        isDir: false,
+        size: 0,
+        content_type: 'helm chart',
+        updated_at: e.created || '',
+        created_at: e.created,
+        kind: 'chart-version' as const,
+        helmEntry: e,
+      }))
+    }
+    // Root: one row per chart name (drill-in), sorted alphabetically.
+    const chartRows: DisplayItem[] = Object.keys(helmIndex.value)
+      .sort()
+      .map(name => ({
+        name,
+        path: name + '/',
+        isDir: true,
+        size: 0,
+        content_type: '',
+        updated_at: '',
+        artifact_count: helmIndex.value[name].length,
+        kind: 'chart' as const,
+      }))
+    // Expert: also surface the `_helm/` bookkeeping dir.
+    if (expert.value) {
+      const helmDir = dirs.value.find(d => d.name === HELM_BOOKKEEPING)
+      if (helmDir) chartRows.push(toDir(helmDir))
+    }
+    return chartRows
+  }
+
   const dirItems: DisplayItem[] = dirs.value.map(d => ({
     name: d.name,
     path: prefix.value + d.name + '/',
@@ -428,6 +544,10 @@ function onRowClick(item: DisplayItem) {
     openTagDetail(item)
     return
   }
+  if (item.kind === 'chart-version') {
+    openHelmVersionDetail(item)
+    return
+  }
   if (item.isDir) {
     navigateTo(item.path)
   } else {
@@ -444,6 +564,64 @@ function onRowClick(item: DisplayItem) {
 function closeDetail() {
   selectedArtifact.value = null
   showDetailModal.value = false
+}
+
+// --- Helm chart-version detail ---
+// The index entry already carries everything a user wants (sha256 digest,
+// appVersion, description, created). Size / BLAKE3 / blob-id are storage
+// detail, fetched lazily from the artifact record when the panel opens.
+const showHelmDetail = ref(false)
+const helmDetail = ref<HelmIndexEntry | null>(null)
+const helmDetailChart = ref('')
+const helmDetailSize = ref<number | null>(null)
+const helmDetailBlake3 = ref('')
+const helmDetailBlobId = ref('')
+
+async function openHelmVersionDetail(item: DisplayItem) {
+  if (!item.helmEntry) return
+  helmDetail.value = item.helmEntry
+  helmDetailChart.value = item.helmEntry.name
+  helmDetailSize.value = null
+  helmDetailBlake3.value = ''
+  helmDetailBlobId.value = ''
+  showHelmDetail.value = true
+  // Storage detail (size, blake3, blob-id) lives on the artifact record, not
+  // the index — fetch it once for the panel, best-effort.
+  try {
+    const resp = await api.listArtifacts(props.repoName, { prefix: item.path, limit: 1 })
+    const rec = resp.artifacts.find(a => a.path === item.path || a.path === item.name)
+    if (rec) {
+      helmDetailSize.value = rec.size
+      helmDetailBlake3.value = rec.content_hash || ''
+      helmDetailBlobId.value = rec.blob_id || ''
+    }
+  } catch {
+    /* leave storage detail blank */
+  }
+}
+
+function closeHelmDetail() {
+  showHelmDetail.value = false
+  helmDetail.value = null
+}
+
+function deleteHelmVersion() {
+  if (!helmDetail.value) return
+  // Charts live at the repo root, so the path is just the filename.
+  deleteTarget.value = `${helmDetail.value.name}-${helmDetail.value.version}.tgz`
+  closeHelmDetail()
+  showDeleteDialog.value = true
+}
+
+function helmDownloadUrl(): string {
+  if (!helmDetail.value) return '#'
+  return downloadUrl(`${helmDetail.value.name}-${helmDetail.value.version}.tgz`)
+}
+
+function helmPullCommand(): string {
+  if (!helmDetail.value) return ''
+  const host = window.location.host
+  return `helm pull oci://${host}/${props.repoName}/${helmDetail.value.name} --version ${helmDetail.value.version}`
 }
 
 function deleteFromDetail() {
@@ -507,6 +685,7 @@ async function load() {
   loading.value = true
   try {
     await ensureCatalog()
+    await ensureHelmIndex()
     if (isSearchMode.value && search.value) {
       const resp = await api.listArtifacts(props.repoName, { q: search.value })
       dirs.value = resp.dirs
@@ -570,7 +749,8 @@ const showingTo = computed(() => Math.min(pageOffset.value + pageLimit.value, to
 const hasPrev = computed(() => pageOffset.value > 0)
 const hasNext = computed(() => pageOffset.value + pageLimit.value < totalArtifacts.value)
 const showPagination = computed(() =>
-  !isSearchMode.value && totalArtifacts.value > pageSizeOptions[0]
+  // Helm charts-first is rendered from the one-shot index, not server-paged.
+  !isSearchMode.value && !helmDefault.value && totalArtifacts.value > pageSizeOptions[0]
 )
 
 function goToPage(n: number) {
@@ -616,6 +796,8 @@ async function doDelete() {
   try {
     await api.deleteArtifact(props.repoName, deleteTarget.value)
     showDeleteDialog.value = false
+    // A helm delete changes the index; drop the cache so load() refetches.
+    helmIndexFetchedFor = ''
     await load()
   } catch (e: any) {
     deleteError.value = e.message || 'Delete failed'
@@ -872,7 +1054,13 @@ watch(
               {{ item.name }}
             </td>
             <td>
-              <template v-if="item.isDir">
+              <template v-if="item.kind === 'chart'">
+                <span class="dir-count">{{ item.artifact_count }} version{{ item.artifact_count === 1 ? '' : 's' }}</span>
+              </template>
+              <template v-else-if="item.kind === 'chart-version'">
+                <span class="size-dash" title="Open for size and digest">&mdash;</span>
+              </template>
+              <template v-else-if="item.isDir">
                 <span v-if="isDocker" class="size-dash" title="Docker layers are content-addressed and shared across images at the repo level, so they aren't counted per image — open an image to see its size">&mdash;</span>
                 <template v-else>
                   {{ formatSize(item.total_bytes || 0) }}
@@ -888,6 +1076,8 @@ watch(
             </td>
             <td>
               <span v-if="isDocker" class="type-label">{{ dockerType(item) }}</span>
+              <span v-else-if="item.kind === 'chart'" class="type-label">chart</span>
+              <span v-else-if="item.kind === 'chart-version'" class="type-label">chart version</span>
               <template v-else>{{ item.isDir ? 'Folder' : item.content_type }}</template>
             </td>
             <td>{{ formatDate(item.updated_at) }}</td>
@@ -905,7 +1095,7 @@ watch(
                   @click="copyPull(item, $event)"
                 >{{ copiedTag === item.name ? 'Copied ✓' : 'Copy pull' }}</button>
                 <button v-if="item.kind === 'tag'" class="act-link" title="Download manifest" @click="downloadManifest(item, $event)">Download</button>
-                <button v-else-if="item.isDir && !isDocker" class="act-link" title="Download directory" @click="confirmDirDownload(item, $event)">Download</button>
+                <button v-else-if="item.isDir && !isDocker && item.kind !== 'chart'" class="act-link" title="Download directory" @click="confirmDirDownload(item, $event)">Download</button>
                 <a v-else-if="!item.isDir" :href="downloadUrl(item.path)" target="_blank" class="act-link" title="Download" @click.stop>Download</a>
                 <button v-if="canDelete(item)" class="act-link act-delete" :title="item.isDir ? 'Delete directory' : 'Delete'" @click="deleteItem(item, $event)">Delete</button>
               </div>
@@ -974,6 +1164,41 @@ watch(
       <template #footer>
         <a :href="downloadUrl(detailFullPath())" target="_blank" class="btn btn-download">Download</a>
         <button class="btn btn-danger" @click="deleteFromDetail">Delete</button>
+      </template>
+    </BaseModal>
+
+    <!-- Helm chart-version detail -->
+    <BaseModal v-if="showHelmDetail && helmDetail" max-width="560px" content-class="modal-detail" :show-close="true" @close="closeHelmDetail">
+      <h3 class="mono">{{ helmDetailChart }} {{ helmDetail.version }}</h3>
+      <dl class="detail-list">
+        <dt>Digest (SHA-256)</dt>
+        <dd class="mono">{{ helmDetail.digest || 'N/A' }}</dd>
+        <dt v-if="helmDetail.appVersion">App version</dt>
+        <dd v-if="helmDetail.appVersion">{{ helmDetail.appVersion }}</dd>
+        <dt v-if="helmDetail.description">Description</dt>
+        <dd v-if="helmDetail.description">{{ helmDetail.description }}</dd>
+        <dt>Size</dt>
+        <dd>{{ helmDetailSize !== null ? formatSize(helmDetailSize) : '…' }}</dd>
+        <dt>Created</dt>
+        <dd>{{ helmDetail.created ? formatDate(helmDetail.created) : '—' }}</dd>
+        <template v-if="helmDetail.deprecated">
+          <dt>Deprecated</dt>
+          <dd>yes</dd>
+        </template>
+        <!-- Internal storage detail (BLAKE3 blob key) — secondary. -->
+        <template v-if="helmDetailBlake3">
+          <dt class="detail-secondary">BLAKE3 (blob)</dt>
+          <dd class="mono detail-secondary">{{ helmDetailBlake3 }}</dd>
+        </template>
+        <template v-if="helmDetailBlobId">
+          <dt class="detail-secondary">Blob ID</dt>
+          <dd class="mono detail-secondary">{{ helmDetailBlobId }}</dd>
+        </template>
+      </dl>
+      <p class="helm-pull mono">{{ helmPullCommand() }}</p>
+      <template #footer>
+        <a :href="helmDownloadUrl()" target="_blank" class="btn btn-download">Download</a>
+        <button v-if="isAdmin()" class="btn btn-danger" @click="deleteHelmVersion">Delete</button>
       </template>
     </BaseModal>
 
@@ -1351,6 +1576,20 @@ th:nth-child(5), td:nth-child(5) {
 .detail-list .mono {
   font-family: monospace;
   font-size: 0.85rem;
+}
+/* Internal storage fields (BLAKE3/blob-id): de-emphasized below the
+   user-facing helm metadata. */
+.detail-list .detail-secondary {
+  opacity: 0.6;
+  font-size: 0.8rem;
+}
+.helm-pull {
+  background: var(--color-bg-secondary, rgba(127, 127, 127, 0.08));
+  border-radius: 4px;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+  word-break: break-all;
+  margin: 0.5rem 0 0;
 }
 .manifest-section {
   margin: 1rem 0 0.4rem;
