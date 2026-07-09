@@ -127,6 +127,23 @@ export interface BrowseResponse {
   entries: BrowseEntry[]
 }
 
+/** One version entry from a Helm repo's index.json (mirrors the index.yaml
+ *  entry). `digest` is the SHA-256 helm clients verify against. */
+export interface HelmIndexEntry {
+  name: string
+  version: string
+  appVersion?: string
+  description?: string
+  digest?: string
+  created?: string
+  type?: string
+  keywords?: string[]
+  home?: string
+  sources?: string[]
+  deprecated?: boolean
+  urls?: string[]
+}
+
 export interface StoreCheckResult {
   ok: boolean
   error?: string
@@ -579,6 +596,21 @@ export const api = {
     if (!resp.ok) return []
     const data = await resp.json()
     return Array.isArray(data?.repositories) ? data.repositories : []
+  },
+
+  /** The repo's Helm index as JSON (one call), so the browser can group charts
+   *  by name using the authoritative name/version split from the index rather
+   *  than parsing ambiguous `{name}-{version}.tgz` filenames. Returns the
+   *  entries map: chart name → list of version entries (version, appVersion,
+   *  description, digest = sha256, created, …). Empty on any failure. */
+  async getHelmIndex(repo: string): Promise<Record<string, HelmIndexEntry[]>> {
+    const resp = await fetch(`/repository/${encodeURIComponent(repo)}/index.json`, {
+      headers: { ...authHeaders(), 'X-Depot-No-Atime': '1' },
+    })
+    if (!resp.ok) return {}
+    const data = await resp.json()
+    const entries = data?.entries
+    return entries && typeof entries === 'object' ? entries : {}
   },
 
   async deleteArtifact(repo: string, path: string): Promise<void> {

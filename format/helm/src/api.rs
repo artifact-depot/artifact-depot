@@ -11,6 +11,7 @@ use axum::{
     body::Body,
     http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use std::collections::BTreeMap;
 use tokio_util::io::ReaderStream;
@@ -179,6 +180,14 @@ pub async fn try_handle_repository_path(
             RepoType::Proxy => proxy_get_index(state, config).await,
         });
     }
+    // `index.json` is a depot convenience for the web UI: the same index the
+    // `index.yaml` route serves, converted to JSON so the browser can group
+    // charts by name (the authoritative name/version split lives in the index,
+    // not in the ambiguous `{name}-{version}.tgz` filenames). Not part of the
+    // Helm client protocol.
+    if path == "index.json" {
+        return Some(index_as_json(state, config).await);
+    }
     // Charts live at the repo root: any `*.tgz` is a chart download.
     if path.ends_with(".tgz") {
         return Some(match config.repo_type() {
@@ -243,6 +252,51 @@ async fn hosted_get_index(state: &FormatState, config: &RepoConfig) -> Response 
             }
         }
         Err(e) => e.into_response(),
+    }
+}
+
+// =============================================================================
+// index.json (web UI convenience)
+// =============================================================================
+
+/// Serve the repo's Helm index as JSON. Freshens the same way `index.yaml`
+/// would (hosted: rebuild if stale; cache: TTL refresh), then converts the
+/// stored index YAML to JSON. Proxy repos serve their last-built stored index.
+async fn index_as_json(state: &FormatState, config: &RepoConfig) -> Response {
+    let blobs = match state.blob_store(&config.store).await {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let store = helm_store_from_config(config, state, blobs.as_ref());
+
+    // Freshen using each type's normal path so the JSON matches index.yaml.
+    match config.repo_type() {
+        RepoType::Hosted => {
+            if store.is_metadata_stale().await.unwrap_or(false) {
+                if let Err(e) = store.rebuild_index().await {
+                    return e.into_response();
+                }
+            }
+        }
+        RepoType::Cache => {
+            let _ = refresh_cache_index(state, config).await;
+        }
+        RepoType::Proxy => {}
+    }
+
+    let yaml = match store.get_index().await {
+        Ok(Some(data)) => data,
+        Ok(None) => b"apiVersion: v1\nentries: {}\n".to_vec(),
+        Err(e) => return e.into_response(),
+    };
+
+    // Map the YAML document into a JSON value (strings/maps/seqs/scalars).
+    match serde_yml::from_slice::<serde_json::Value>(&yaml) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => {
+            DepotError::Internal(format!("failed to convert helm index to JSON: {e}"))
+                .into_response()
+        }
     }
 }
 

@@ -69,6 +69,39 @@ async fn test_upload_and_index() {
     assert!(index.contains("urls:"), "missing urls field");
 }
 
+/// The web UI's `index.json` returns the same index as JSON, grouped by chart
+/// name, with the sha256 digest — so the browser can group charts without a
+/// YAML parser or ambiguous filename splitting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_index_json_for_ui() {
+    let app = TestApp::new().await;
+    app.create_helm_repo("helm-json").await;
+    let token = app.admin_token();
+
+    // Two versions of a dashed-name chart (the case filename-splitting breaks).
+    for v in ["1.4.2", "1.6.0-dev.5"] {
+        let chart = build_synthetic_chart("myriad-uui", v, "UI").unwrap();
+        let req = helm_upload_request("helm-json", &format!("myriad-uui-{v}.tgz"), &chart, &token);
+        assert_eq!(app.call(req).await.0, StatusCode::OK);
+    }
+
+    let req = app.auth_request(Method::GET, "/repository/helm-json/index.json", &token);
+    let (status, body) = app.call_raw(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let versions = json["entries"]["myriad-uui"]
+        .as_array()
+        .expect("myriad-uui grouped under its full name, not split on the dash");
+    assert_eq!(versions.len(), 2, "both versions grouped under the chart name");
+    // Each entry carries the sha256 digest the UI shows (not BLAKE3).
+    for e in versions {
+        let d = e["digest"].as_str().unwrap_or_default();
+        assert!(d.starts_with("sha256:"), "digest should be sha256: {d}");
+        assert_eq!(e["name"], "myriad-uui");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_upload_and_download() {
     let app = TestApp::new().await;
