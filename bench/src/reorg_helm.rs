@@ -111,6 +111,15 @@ pub struct HelmRulesFile {
     /// First-party chart-name prefixes. Charts whose name does not start with
     /// one of these are third-party and are never touched.
     pub first_party: Vec<String>,
+    /// Retired chart names (exact match): a chart that was renamed away (e.g.
+    /// `orchestrator` → `quantum-orchestrator`). Every version under a retired
+    /// name is deleted, in every source repo, regardless of version class —
+    /// the Helm analogue of the docker reorg's `retired_prefixes`. Checked
+    /// ahead of the first-party gate, because a retired name usually is NOT in
+    /// the first-party prefix list (so it would otherwise be mistaken for a
+    /// third-party chart and silently left behind).
+    #[serde(default)]
+    pub retired_names: Vec<String>,
     /// Upstream authority for `delete-if-on-authority` (queried directly — see
     /// [`AuthorityConfig`]). Required only if a rule uses that action.
     #[serde(default)]
@@ -151,6 +160,7 @@ pub fn parse_index(yaml: &[u8]) -> Result<Vec<ChartVersion>> {
 pub struct Compiled {
     patterns: BTreeMap<String, Regex>,
     first_party: Vec<String>,
+    retired_names: BTreeSet<String>,
     authority: Option<AuthorityConfig>,
     groups: Vec<CompiledGroup>,
 }
@@ -208,6 +218,7 @@ impl Compiled {
         Ok(Self {
             patterns,
             first_party: file.first_party,
+            retired_names: file.retired_names.into_iter().collect(),
             authority: file.authority,
             groups,
         })
@@ -216,6 +227,11 @@ impl Compiled {
     /// Is this chart name first-party?
     fn is_first_party(&self, name: &str) -> bool {
         self.first_party.iter().any(|p| name.starts_with(p))
+    }
+
+    /// Is this chart name retired (renamed away)?
+    fn is_retired(&self, name: &str) -> bool {
+        self.retired_names.contains(name)
     }
 
     /// Find the first rule whose class pattern matches the version.
@@ -266,6 +282,20 @@ pub async fn plan(client: &DepotClient, compiled: &Compiled) -> Result<Plan> {
             .with_context(|| format!("fetch index.yaml for '{}'", group.source))?;
         let versions = parse_index(&index)?;
         for cv in versions {
+            // Retired names are purged wholesale, checked before the
+            // first-party gate (a retired name is usually not a first-party
+            // prefix, so it would otherwise look third-party and be skipped).
+            if compiled.is_retired(&cv.name) {
+                plan.ops.push(PlannedOp {
+                    source: group.source.clone(),
+                    name: cv.name.clone(),
+                    version: cv.version.clone(),
+                    digest: cv.digest.clone(),
+                    class: "retired-name".to_string(),
+                    action: HelmAction::Delete,
+                });
+                continue;
+            }
             if !compiled.is_first_party(&cv.name) {
                 plan.third_party_skipped += 1;
                 continue;
@@ -293,10 +323,12 @@ pub fn print_plan(plan: &Plan, compiled: &Compiled) {
     use std::collections::BTreeMap as Map;
     let mut moves: Map<String, usize> = Map::new();
     let mut deletes = 0usize;
+    let mut retired_deletes = 0usize;
     let mut verify_deletes = 0usize;
     for op in &plan.ops {
         match &op.action {
             HelmAction::Move { dest } => *moves.entry(dest.clone()).or_default() += 1,
+            HelmAction::Delete if op.class == "retired-name" => retired_deletes += 1,
             HelmAction::Delete => deletes += 1,
             HelmAction::DeleteIfOnAuthority => verify_deletes += 1,
         }
@@ -307,6 +339,11 @@ pub fn print_plan(plan: &Plan, compiled: &Compiled) {
     }
     if deletes > 0 {
         println!("  DELETE {deletes:>4} chart-versions (junk/superseded)");
+    }
+    if retired_deletes > 0 {
+        println!(
+            "  DELETE {retired_deletes:>4} chart-versions under RETIRED (renamed) chart names"
+        );
     }
     if verify_deletes > 0 {
         let auth = compiled
@@ -566,10 +603,10 @@ mod tests {
 
         // Mirror the plan() routing for a swept group.
         let index = [
-            ("myriad", "1.6.0-dev.1"),      // prerelease → move (op)
-            ("cba-client", "1.0.0-ci-x-9"), // no match, swept → retained
-            ("cba-client", "1.0.0-jss-dev"),// no match, swept → retained
-            ("cilium", "1.15.0"),           // third-party → skip
+            ("myriad", "1.6.0-dev.1"),       // prerelease → move (op)
+            ("cba-client", "1.0.0-ci-x-9"),  // no match, swept → retained
+            ("cba-client", "1.0.0-jss-dev"), // no match, swept → retained
+            ("cilium", "1.15.0"),            // third-party → skip
         ];
         let mut plan = Plan::default();
         for (n, v) in index {
@@ -588,14 +625,22 @@ mod tests {
                 }),
                 None if g.drain => plan.unclassified.push((
                     g.source.clone(),
-                    ChartVersion { name: n.into(), version: v.into(), digest: String::new() },
+                    ChartVersion {
+                        name: n.into(),
+                        version: v.into(),
+                        digest: String::new(),
+                    },
                 )),
                 None => *plan.retained.entry(g.source.clone()).or_default() += 1,
             }
         }
         assert_eq!(plan.ops.len(), 1, "only the prerelease is an op");
         assert_eq!(plan.unclassified.len(), 0, "swept repo flags nothing");
-        assert_eq!(plan.retained.get("helm-development"), Some(&2), "two CI/dev builds retained");
+        assert_eq!(
+            plan.retained.get("helm-development"),
+            Some(&2),
+            "two CI/dev builds retained"
+        );
         assert_eq!(plan.third_party_skipped, 1);
     }
 
@@ -763,6 +808,82 @@ entries:
             Compiled::compile(file).is_err(),
             "unknown pattern must error"
         );
+    }
+
+    #[test]
+    fn retired_name_deletes_all_versions_before_first_party_gate() {
+        let rules = r#"
+            first_party = ["quantum-orchestrator"]
+            retired_names = ["orchestrator"]
+            [patterns]
+            released = '^\d+\.\d+\.\d+$'
+            [[groups]]
+            source = "helm-external"
+              [[groups.rules]]
+              class = "released"
+              dest = "helm-release"
+        "#;
+        let file: HelmRulesFile = toml::from_str(rules).unwrap();
+        let c = Compiled::compile(file).unwrap();
+        assert!(c.is_retired("orchestrator"));
+        assert!(!c.is_retired("quantum-orchestrator"));
+
+        // A retired-name chart is NOT first-party by prefix, yet must be
+        // deleted, not skipped as third-party.
+        assert!(!c.is_first_party("orchestrator"));
+
+        let g = &c.groups[0];
+        let index = [
+            ("orchestrator", "1.4.0"),         // retired → delete
+            ("orchestrator", "1.0.0-dev.1"),   // retired → delete (any version)
+            ("quantum-orchestrator", "1.5.0"), // current first-party → its own rule
+            ("cilium", "1.15.0"),              // third-party → skip
+        ];
+        let mut plan = Plan::default();
+        for (n, v) in index {
+            if c.is_retired(n) {
+                plan.ops.push(PlannedOp {
+                    source: g.source.clone(),
+                    name: n.into(),
+                    version: v.into(),
+                    digest: String::new(),
+                    class: "retired-name".into(),
+                    action: HelmAction::Delete,
+                });
+                continue;
+            }
+            if !c.is_first_party(n) {
+                plan.third_party_skipped += 1;
+                continue;
+            }
+            if let Some((class, action)) = c.classify(g, v) {
+                plan.ops.push(PlannedOp {
+                    source: g.source.clone(),
+                    name: n.into(),
+                    version: v.into(),
+                    digest: String::new(),
+                    class,
+                    action,
+                });
+            }
+        }
+        let retired: Vec<_> = plan
+            .ops
+            .iter()
+            .filter(|o| o.class == "retired-name")
+            .collect();
+        assert_eq!(
+            retired.len(),
+            2,
+            "both orchestrator versions retired-deleted"
+        );
+        assert!(retired.iter().all(|o| o.action == HelmAction::Delete));
+        assert_eq!(plan.third_party_skipped, 1, "cilium skipped");
+        // quantum-orchestrator:1.5.0 classified by its own released rule.
+        assert!(plan
+            .ops
+            .iter()
+            .any(|o| o.name == "quantum-orchestrator" && o.class == "released"));
     }
 }
 

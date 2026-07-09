@@ -28,6 +28,15 @@ first_party = [
     "qkp-ds-kvgen",
 ]
 
+# Retired chart names (exact match): charts renamed away, whose old-name copies
+# are stale and should be purged wholesale — every version, every source repo,
+# regardless of version class. The Helm analogue of the docker reorg's
+# `retired_prefixes`. Checked ahead of the first-party gate, since a retired
+# name is usually not in the first-party prefix list above (so it would
+# otherwise be mistaken for a third-party chart and left behind). Empty here:
+# the current data has only `quantum-orchestrator`, no leftover `orchestrator`.
+retired_names = []
+
 # Release authority for the `delete-if-on-authority` action. A released (x.y.z)
 # chart is dropped from a source repo only if this UPSTREAM registry already
 # serves the identical digest. It is queried DIRECTLY — never via a local cache
