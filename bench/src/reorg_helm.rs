@@ -63,6 +63,11 @@ pub struct HelmRule {
     pub action: Option<String>,
 }
 
+/// Whether every first-party chart is expected to leave a source repo.
+fn default_drain() -> bool {
+    true
+}
+
 /// Per-source-repo rule block.
 #[derive(Debug, Deserialize)]
 pub struct HelmGroup {
@@ -73,6 +78,14 @@ pub struct HelmGroup {
     /// Retire (expect empty afterwards) — informational only.
     #[serde(default)]
     pub retire: bool,
+    /// `true` (default): a **drained** repo — every first-party chart is
+    /// supposed to leave, so any first-party version no rule matched is a real
+    /// gap and is reported in the UNCLASSIFIED bucket (needs attention).
+    /// `false`: a **swept** repo — only the versions a rule matches leave; the
+    /// rest are meant to stay (e.g. CI builds in a development repo), so
+    /// unmatched first-party versions are counted as RETAINED, not flagged.
+    #[serde(default = "default_drain")]
+    pub drain: bool,
 }
 
 /// Where to check that a released chart already exists before deleting the
@@ -146,6 +159,7 @@ struct CompiledGroup {
     source: String,
     rules: Vec<(String, HelmAction)>, // (class name, action)
     retire: bool,
+    drain: bool,
 }
 
 impl Compiled {
@@ -188,6 +202,7 @@ impl Compiled {
                 source: g.source,
                 rules,
                 retire: g.retire,
+                drain: g.drain,
             });
         }
         Ok(Self {
@@ -231,8 +246,12 @@ pub struct PlannedOp {
 #[derive(Debug, Default)]
 pub struct Plan {
     pub ops: Vec<PlannedOp>,
-    /// First-party versions no rule matched (nothing is done to these).
+    /// First-party versions no rule matched in a **drained** repo — a real gap
+    /// that needs attention (nothing is done to these).
     pub unclassified: Vec<(String, ChartVersion)>,
+    /// First-party versions no rule matched in a **swept** (`drain = false`)
+    /// repo — expected to stay (CI/dev builds), counted per source repo.
+    pub retained: BTreeMap<String, usize>,
     /// Third-party charts skipped by name (informational count only).
     pub third_party_skipped: usize,
 }
@@ -260,7 +279,8 @@ pub async fn plan(client: &DepotClient, compiled: &Compiled) -> Result<Plan> {
                     class,
                     action,
                 }),
-                None => plan.unclassified.push((group.source.clone(), cv)),
+                None if group.drain => plan.unclassified.push((group.source.clone(), cv)),
+                None => *plan.retained.entry(group.source.clone()).or_default() += 1,
             }
         }
     }
@@ -303,21 +323,21 @@ pub fn print_plan(plan: &Plan, compiled: &Compiled) {
         "  SKIP  {:>5} third-party chart-versions (untouched)",
         plan.third_party_skipped
     );
-    if !plan.unclassified.is_empty() {
+    for (src, n) in &plan.retained {
         println!(
-            "\n  UNCLASSIFIED ({}) — first-party but no rule matched; NOTHING will be done:",
-            plan.unclassified.len()
+            "  RETAINED {n:>4} first-party in {src} (swept repo — unmatched versions stay by design)"
         );
-        let mut shown = 0;
-        for (src, cv) in &plan.unclassified {
-            if shown < 40 {
-                println!("    {src}: {}:{}", cv.name, cv.version);
-            }
-            shown += 1;
-        }
-        if shown > 40 {
-            println!("    … and {} more", shown - 40);
-        }
+    }
+    println!(
+        "\n  UNCLASSIFIED ({}) — first-party in a drained repo that no rule matched; \
+         NOTHING will be done, but these need a decision:",
+        plan.unclassified.len()
+    );
+    for (src, cv) in plan.unclassified.iter().take(40) {
+        println!("    {src}: {}:{}", cv.name, cv.version);
+    }
+    if plan.unclassified.len() > 40 {
+        println!("    … and {} more", plan.unclassified.len() - 40);
     }
     for g in &compiled.groups {
         if g.retire {
@@ -520,6 +540,63 @@ mod tests {
         assert_eq!(c.authority.as_ref().unwrap().repo, "helm-release");
         // helm-external: junk→delete, released→verify, prerelease/branch→move
         assert_eq!(c.groups[0].rules.len(), 4);
+        // drain defaults to true when unspecified.
+        assert!(c.groups[0].drain, "helm-external drains by default");
+    }
+
+    #[test]
+    fn swept_repo_retains_unmatched_instead_of_flagging() {
+        // A drain=false group: unmatched first-party versions are RETAINED
+        // (counted), not pushed into the unclassified bucket.
+        let rules = r#"
+            first_party = ["myriad", "cba-client"]
+            [patterns]
+            prerelease = '^\d+\.\d+\.\d+-(dev|rc)\.\d+$'
+            [[groups]]
+            source = "helm-development"
+            drain = false
+              [[groups.rules]]
+              class = "prerelease"
+              dest = "helm-prerelease"
+        "#;
+        let file: HelmRulesFile = toml::from_str(rules).unwrap();
+        let c = Compiled::compile(file).unwrap();
+        let g = &c.groups[0];
+        assert!(!g.drain, "explicit drain = false honored");
+
+        // Mirror the plan() routing for a swept group.
+        let index = [
+            ("myriad", "1.6.0-dev.1"),      // prerelease → move (op)
+            ("cba-client", "1.0.0-ci-x-9"), // no match, swept → retained
+            ("cba-client", "1.0.0-jss-dev"),// no match, swept → retained
+            ("cilium", "1.15.0"),           // third-party → skip
+        ];
+        let mut plan = Plan::default();
+        for (n, v) in index {
+            if !c.is_first_party(n) {
+                plan.third_party_skipped += 1;
+                continue;
+            }
+            match c.classify(g, v) {
+                Some((class, action)) => plan.ops.push(PlannedOp {
+                    source: g.source.clone(),
+                    name: n.into(),
+                    version: v.into(),
+                    digest: String::new(),
+                    class,
+                    action,
+                }),
+                None if g.drain => plan.unclassified.push((
+                    g.source.clone(),
+                    ChartVersion { name: n.into(), version: v.into(), digest: String::new() },
+                )),
+                None => *plan.retained.entry(g.source.clone()).or_default() += 1,
+            }
+        }
+        assert_eq!(plan.ops.len(), 1, "only the prerelease is an op");
+        assert_eq!(plan.unclassified.len(), 0, "swept repo flags nothing");
+        assert_eq!(plan.retained.get("helm-development"), Some(&2), "two CI/dev builds retained");
+        assert_eq!(plan.third_party_skipped, 1);
     }
 
     #[test]

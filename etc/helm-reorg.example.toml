@@ -43,8 +43,10 @@ repo = "helm-release"
 released   = '^\d+\.\d+\.\d+$'
 prerelease = '^\d+\.\d+\.\d+-(dev|rc)\.\d+$'
 branch     = '^\d+\.\d+\.\d+-(develop|main|master)$'
-# Obvious throwaway versions to delete outright.
-junk       = '(deleteme|^1\.0\.0-0-9-0$)'
+# Obvious throwaway versions to delete outright: the `deleteme` markers, the
+# `-0-9-0` mangling, `dryrun` test tags, and malformed CI double-versions like
+# `1.0.0-0.9.1-dev.14` (a released base with another version string appended).
+junk       = '(deleteme|dryrun|^1\.0\.0-0-9-0$|^\d+\.\d+\.\d+-\d+\.\d+\.\d+-(dev|rc)\.\d+$)'
 
 # --- helm-external: the de-facto dumping ground -----------------------------
 # First-party prereleases go to helm-prerelease; branch tags likewise; released
@@ -71,9 +73,16 @@ source = "helm-external"
   dest = "helm-prerelease"
 
 # --- helm-internal: misfiled prereleases; drain then retire -----------------
+# A drained repo destined for retirement: it must end empty of first-party
+# charts, so it needs the junk rule too (catches the leftover dryrun tag) or
+# retirement stays blocked by an unclassified straggler.
 [[groups]]
 source = "helm-internal"
 retire = true
+
+  [[groups.rules]]
+  class = "junk"
+  action = "delete"
 
   [[groups.rules]]
   class = "prerelease"
@@ -84,9 +93,18 @@ retire = true
   dest = "helm-prerelease"
 
 # --- helm-development: mostly correct; sweep out stray prereleases ----------
+# drain = false: this is a SWEPT repo, not drained. Only versions a rule matches
+# (stray prereleases) leave; the CI and developer-branch builds that make up the
+# bulk of this repo are meant to stay, so they are counted as RETAINED rather
+# than flagged as unclassified.
 [[groups]]
 source = "helm-development"
+drain = false
 
   [[groups.rules]]
   class = "prerelease"
   dest = "helm-prerelease"
+
+  [[groups.rules]]
+  class = "junk"
+  action = "delete"
