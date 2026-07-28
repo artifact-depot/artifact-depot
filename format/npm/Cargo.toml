@@ -19,7 +19,7 @@ uuid = { version = "1", features = ["v4"] }
 blake3 = "1"
 sha1 = "0.10"
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"], default-features = false }
 urlencoding = "2"
 
@@ -27,6 +27,6 @@ urlencoding = "2"
 depot-test-support = { path = "../../test-support" }
 tokio = { version = "1", features = ["full", "test-util"] }
 http-body-util = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 axum = "0.8"
 wiremock = "0.6"
