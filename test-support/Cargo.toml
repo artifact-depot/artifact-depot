@@ -26,5 +26,5 @@ tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 arc-swap = "1"
 reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"], default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.10"
