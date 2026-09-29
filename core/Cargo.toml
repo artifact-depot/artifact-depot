@@ -13,7 +13,7 @@ path = "src/lib.rs"
 anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -33,10 +33,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Optional heavy deps — only pulled in by feature-gated error conversions
 # and shared repo infrastructure.
 axum = { version = "0.8", features = ["multipart"], optional = true }
-opentelemetry = { version = "0.32", optional = true }
-tracing-opentelemetry = { version = "0.33", optional = true }
+opentelemetry = { version = "0.33", optional = true }
+tracing-opentelemetry = { version = "0.34", optional = true }
 reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"], default-features = false, optional = true }
-utoipa = { version = "5", features = ["axum_extras"], optional = true }
+utoipa = { version = "6", features = ["axum_extras"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
